@@ -93,10 +93,60 @@ class ConversationalMemory:
         self.metadata_file = metadata_file
         self.embeddings = embeddings
         self.memory_vectorstore = None
-        self.memory_counter = 0
-       
+        
         # Load existing memory vectorstore or create new one
         self.load_memory_vectorstore()
+
+    def load_memory_vectorstore(self):
+        """Loads the FAISS index from disk or creates a new one if it doesn't exist."""
+        if os.path.exists(self.vectorstore_path):
+            try:
+                self.memory_vectorstore = FAISS.load_local(
+                    self.vectorstore_path, 
+                    self.embeddings, 
+                    allow_dangerous_deserialization=True
+                )
+                logger.info("✅ Memory vectorstore loaded.")
+            except Exception as e:
+                logger.error(f"Error loading memory: {e}")
+                self._create_new_vectorstore()
+        else:
+            self._create_new_vectorstore()
+
+    def _create_new_vectorstore(self):
+        """Initializes an empty FAISS vectorstore."""
+        # We create a dummy document to initialize FAISS
+        initial_doc = Document(page_content="Initial memory", metadata={"user": "system"})
+        self.memory_vectorstore = FAISS.from_documents([initial_doc], self.embeddings)
+        self.memory_vectorstore.save_local(self.vectorstore_path)
+        logger.info("Created new memory vectorstore.")
+
+    def retrieve_relevant_memories(self, username: str, query: str, k: int = 3):
+        """Retrieves past interactions for a specific user."""
+        if not self.memory_vectorstore:
+            return []
+        
+        # Search with a filter for the specific user
+        docs = self.memory_vectorstore.similarity_search(
+            query, 
+            k=k, 
+            filter={"username": username}
+        )
+        return [{"content": d.page_content, "timestamp": d.metadata.get("timestamp")} for d in docs]
+
+    def add_conversation_turn(self, username: str, question: str, answer: str):
+        """Saves the current interaction to the vectorstore."""
+        timestamp = datetime.now().isoformat()
+        memory_text = f"User: {question}\nAssistant: {answer}"
+        
+        doc = Document(
+            page_content=memory_text,
+            metadata={"username": username, "timestamp": timestamp}
+        )
+        
+        if self.memory_vectorstore:
+            self.memory_vectorstore.add_documents([doc])
+            self.memory_vectorstore.save_local(self.vectorstore_path)
 
 def load_csv_as_document(file_path: str) -> List[Document]:
     """Load CSV file and convert to documents"""
