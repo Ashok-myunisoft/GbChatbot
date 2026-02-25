@@ -3,7 +3,7 @@ import os
 import logging
 import traceback
 import pandas as pd
-from langchain_ollama import ChatOllama
+# RunPodLLM via shared_resources — ChatOllama no longer used
 from typing import List, Dict, Any
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
@@ -106,6 +106,8 @@ def load_and_split_documents(documents_dir: str) -> List[Document]:
     return all_docs
 
 # Load documents
+# Always initialize embeddings regardless of document availability
+embeddings = ai_resources.embeddings
 all_docs = load_and_split_documents(DOCUMENTS_DIR)
 text_chunks, retriever = None, None
 
@@ -117,13 +119,6 @@ if all_docs:
     text_chunks = text_splitter.split_documents(all_docs)
     logger.info(f"Loaded {len(all_docs)} docs, split into {len(text_chunks)} chunks.")
 
-    try:
-        from langchain_huggingface import HuggingFaceEmbeddings
-    except ImportError:
-        from langchain_community.embeddings import HuggingFaceEmbeddings
-        logger.warning("Using deprecated HuggingFaceEmbeddings.")
-
-    embeddings = ai_resources.embeddings
     vectorstore = FAISS.from_documents(text_chunks, embeddings)
     retriever = vectorstore.as_retriever(search_kwargs={"k": 50})
     logger.info("FAISS retriever ready.")
@@ -336,7 +331,8 @@ async def project_chat(message: Message, Login: str = Header(...)):
             })
         else:
             fallback_prompt = f"Only answer based on data context. Human: {user_input}\nAssistant:"
-            answer = llm.invoke(fallback_prompt).content
+            raw = llm.invoke(fallback_prompt)
+            answer = raw.content if hasattr(raw, 'content') else str(raw)
 
         cleaned_answer = clean_response(answer)
         formatted_answer = format_as_points(cleaned_answer)

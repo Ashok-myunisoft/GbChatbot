@@ -1,4 +1,6 @@
 fastapi
+python-dotenv
+requests
 uvicorn
 pydantic
 pandas
@@ -10,6 +12,5 @@ faiss-cpu
 langchain-ollama
 jq
 numpy<2.0  # <--- ADD THIS LINE
-# --- GCP Libraries ---
-google-cloud-firestore
-google-cloud-storage
+# --- PostgreSQL ---
+psycopg2-binary

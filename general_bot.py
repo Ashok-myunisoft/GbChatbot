@@ -5,7 +5,7 @@ import traceback
 import re
 from typing import List, Dict
 from datetime import datetime
-from langchain_ollama import ChatOllama
+# RunPodLLM via shared_resources — ChatOllama no longer used
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -568,7 +568,8 @@ async def chat(message: Message, Login: str = Header(...)):
        
         # Generate response
         logger.info("🤖 Generating response with LLM...")
-        answer = llm.invoke(prompt_text).content
+        raw = llm.invoke(prompt_text)
+        answer = raw.content if hasattr(raw, 'content') else str(raw)
  
         # Clean and format response
         cleaned_answer = clean_response(answer)
@@ -619,3 +620,5 @@ async def get_memory_stats(Login: str = Header(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8085)
+
+    

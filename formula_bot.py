@@ -5,7 +5,7 @@ import traceback
 import re
 import pandas as pd
 from datetime import datetime
-from langchain_ollama import ChatOllama
+# RunPodLLM via shared_resources — ChatOllama no longer used
 from typing import List, Dict
 from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
@@ -255,6 +255,9 @@ all_docs = load_and_split_documents(DOCUMENTS_DIR)
 text_chunks = None
 retriever = None
 
+# Always initialize embeddings regardless of document availability
+embeddings = ai_resources.embeddings
+
 if all_docs:
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1500,
@@ -263,7 +266,6 @@ if all_docs:
     )
     text_chunks = text_splitter.split_documents(all_docs)
     logger.info(f"Loaded {len(all_docs)} docs, split into {len(text_chunks)} chunks.")
-    embeddings = ai_resources.embeddings
     vectorstore = FAISS.from_documents(text_chunks, embeddings)
     retriever = vectorstore.as_retriever(
         search_type="similarity",
@@ -506,7 +508,8 @@ async def chat(message: Message, Login: str = Header(...)):
             question=user_input
         )
         
-        answer = llm.invoke(prompt_text).content
+        raw = llm.invoke(prompt_text)
+        answer = raw.content if hasattr(raw, 'content') else str(raw)
         cleaned_answer = clean_response(answer)
 
         # Add to conversational memory

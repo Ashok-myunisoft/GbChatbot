@@ -4,7 +4,7 @@ import logging
 import traceback
 import pandas as pd
 from datetime import datetime
-from langchain_ollama import ChatOllama
+# RunPodLLM via shared_resources — ChatOllama no longer used
 from typing import List, Dict, Any
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
@@ -93,60 +93,75 @@ class ConversationalMemory:
         self.metadata_file = metadata_file
         self.embeddings = embeddings
         self.memory_vectorstore = None
-        
+        self.memory_counter = 0
+
         # Load existing memory vectorstore or create new one
         self.load_memory_vectorstore()
 
     def load_memory_vectorstore(self):
-        """Loads the FAISS index from disk or creates a new one if it doesn't exist."""
-        if os.path.exists(self.vectorstore_path):
-            try:
+        """Load existing FAISS memory vectorstore or create a new empty one."""
+        try:
+            if os.path.exists(self.vectorstore_path):
                 self.memory_vectorstore = FAISS.load_local(
-                    self.vectorstore_path, 
-                    self.embeddings, 
+                    self.vectorstore_path,
+                    self.embeddings,
                     allow_dangerous_deserialization=True
                 )
-                logger.info("✅ Memory vectorstore loaded.")
-            except Exception as e:
-                logger.error(f"Error loading memory: {e}")
-                self._create_new_vectorstore()
-        else:
-            self._create_new_vectorstore()
+                logger.info(f"Loaded existing memory vectorstore from {self.vectorstore_path}")
+            else:
+                # Create a placeholder document to initialise an empty vectorstore
+                placeholder = Document(
+                    page_content="Memory initialised.",
+                    metadata={"username": "__system__", "timestamp": datetime.utcnow().isoformat()}
+                )
+                self.memory_vectorstore = FAISS.from_documents([placeholder], self.embeddings)
+                logger.info("Created new memory vectorstore")
+        except Exception as e:
+            logger.error(f"Error loading memory vectorstore: {e}")
+            placeholder = Document(
+                page_content="Memory initialised.",
+                metadata={"username": "__system__", "timestamp": datetime.utcnow().isoformat()}
+            )
+            self.memory_vectorstore = FAISS.from_documents([placeholder], self.embeddings)
 
-    def _create_new_vectorstore(self):
-        """Initializes an empty FAISS vectorstore."""
-        # We create a dummy document to initialize FAISS
-        initial_doc = Document(page_content="Initial memory", metadata={"user": "system"})
-        self.memory_vectorstore = FAISS.from_documents([initial_doc], self.embeddings)
-        self.memory_vectorstore.save_local(self.vectorstore_path)
-        logger.info("Created new memory vectorstore.")
-
-    def retrieve_relevant_memories(self, username: str, query: str, k: int = 3):
-        """Retrieves past interactions for a specific user."""
+    def retrieve_relevant_memories(self, username: str, query: str, k: int = 3) -> List[Dict]:
+        """Retrieve the most relevant past conversation turns for this user."""
         if not self.memory_vectorstore:
             return []
-        
-        # Search with a filter for the specific user
-        docs = self.memory_vectorstore.similarity_search(
-            query, 
-            k=k, 
-            filter={"username": username}
-        )
-        return [{"content": d.page_content, "timestamp": d.metadata.get("timestamp")} for d in docs]
+        try:
+            docs = self.memory_vectorstore.similarity_search(query, k=k * 2)
+            # Filter to this user's memories only
+            user_docs = [d for d in docs if d.metadata.get("username") == username]
+            results = []
+            for doc in user_docs[:k]:
+                results.append({
+                    "content": doc.page_content,
+                    "timestamp": doc.metadata.get("timestamp", ""),
+                })
+            return results
+        except Exception as e:
+            logger.error(f"Error retrieving memories: {e}")
+            return []
 
-    def add_conversation_turn(self, username: str, question: str, answer: str):
-        """Saves the current interaction to the vectorstore."""
-        timestamp = datetime.now().isoformat()
-        memory_text = f"User: {question}\nAssistant: {answer}"
-        
-        doc = Document(
-            page_content=memory_text,
-            metadata={"username": username, "timestamp": timestamp}
-        )
-        
-        if self.memory_vectorstore:
+    def add_conversation_turn(self, username: str, user_input: str, bot_response: str):
+        """Store a conversation turn in the memory vectorstore."""
+        if not self.memory_vectorstore:
+            return
+        try:
+            timestamp = datetime.utcnow().isoformat()
+            content = f"User: {user_input}\nAssistant: {bot_response}"
+            doc = Document(
+                page_content=content,
+                metadata={"username": username, "timestamp": timestamp}
+            )
             self.memory_vectorstore.add_documents([doc])
-            self.memory_vectorstore.save_local(self.vectorstore_path)
+            self.memory_counter += 1
+            # Persist every 5 turns to avoid constant disk writes
+            if self.memory_counter % 5 == 0:
+                self.memory_vectorstore.save_local(self.vectorstore_path)
+                logger.info(f"Memory vectorstore saved ({self.memory_counter} turns)")
+        except Exception as e:
+            logger.error(f"Error adding conversation turn to memory: {e}")
 
 def load_csv_as_document(file_path: str) -> List[Document]:
     """Load CSV file and convert to documents"""
@@ -197,6 +212,9 @@ def load_and_split_documents(documents_dir: str) -> List[Document]:
 
     return all_docs
 
+# Always initialize embeddings regardless of document availability
+embeddings = ai_resources.embeddings
+
 # Load documents
 all_docs = load_and_split_documents(DOCUMENTS_DIR)
 text_chunks, retriever = None, None
@@ -209,13 +227,6 @@ if all_docs:
     text_chunks = text_splitter.split_documents(all_docs)
     logger.info(f"✅ Loaded {len(all_docs)} docs, split into {len(text_chunks)} chunks.")
 
-    try:
-        from langchain_huggingface import HuggingFaceEmbeddings
-    except ImportError:
-        from langchain_community.embeddings import HuggingFaceEmbeddings
-        logger.warning("Using deprecated HuggingFaceEmbeddings.")
-
-    embeddings = ai_resources.embeddings
     vectorstore = FAISS.from_documents(text_chunks, embeddings)
     retriever = vectorstore.as_retriever(search_kwargs={"k": 50})
     logger.info("✅ FAISS retriever ready.")
@@ -435,10 +446,12 @@ async def report_chat(message: Message, Login: str = Header(...)):
                 question=user_input
             )
             
-            answer = llm.invoke(prompt_text).content
+            raw = llm.invoke(prompt_text)
+            answer = raw.content if hasattr(raw, 'content') else str(raw)
         else:
             fallback_prompt = f"Only answer based on data context. Human: {user_input}\nAssistant:"
-            answer = llm.invoke(fallback_prompt).content
+            raw = llm.invoke(fallback_prompt)
+            answer = raw.content if hasattr(raw, 'content') else str(raw)
         
         logger.info(f"✅ Generated answer: {len(answer)} chars")
 

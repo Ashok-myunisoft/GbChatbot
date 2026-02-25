@@ -3,7 +3,7 @@ import os
 import logging
 import traceback
 import pandas as pd
-from langchain_ollama import ChatOllama
+# RunPodLLM via shared_resources — ChatOllama no longer used
 from typing import List, Dict, Any
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
@@ -108,6 +108,8 @@ def load_and_split_documents(documents_dir: str) -> List[Document]:
 
     return all_docs
  
+# Always initialize embeddings regardless of document availability
+embeddings = ai_resources.embeddings
 all_docs = load_and_split_documents(DOCUMENTS_DIR)
 text_chunks = None
 retriever = None
@@ -126,7 +128,6 @@ if all_docs:
         from langchain_community.embeddings import HuggingFaceEmbeddings
         logger.warning("Using deprecated HuggingFaceEmbeddings.")
    
-    embeddings = ai_resources.embeddings
     vectorstore = FAISS.from_documents(text_chunks, embeddings)
     retriever = vectorstore.as_retriever(search_kwargs={"k": 50})
     logger.info("✅ FAISS vectorstore and retriever initialized.")
@@ -320,13 +321,15 @@ async def chat(message: Message, Login: str = Header(...)):
                 question=user_input
             )
             
-            answer = llm.invoke(prompt_text).content
+            raw = llm.invoke(prompt_text)
+            answer = raw.content if hasattr(raw, 'content') else str(raw)
         else:
             system_prompt = """You are a helpful AI assistant. Provide natural, conversational responses to user questions.
             Be friendly, informative, and honest about what you can and cannot help with."""
            
             full_prompt = f"{system_prompt}\n\nConversation history:\n{history_str}\nHuman: {user_input}\nAssistant:"
-            answer = llm.invoke(full_prompt).content
+            raw = llm.invoke(full_prompt)
+            answer = raw.content if hasattr(raw, 'content') else str(raw)
         
         logger.info(f"✅ Generated answer: {len(answer)} chars")
        

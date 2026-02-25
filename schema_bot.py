@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from fastapi import Header
 from pydantic import BaseModel
-from langchain_ollama import ChatOllama
+# RunPodLLM via shared_resources — ChatOllama no longer used
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
@@ -408,7 +408,8 @@ async def chat(message, Login: str = None):
                 question=user_input
             )
             
-            answer = llm.invoke(full_prompt).content
+            raw = llm.invoke(full_prompt)
+            answer = raw.content if hasattr(raw, 'content') else str(raw)
         else:
             # Fallback response if no retriever available
             fallback_prompt = f"""
@@ -417,7 +418,8 @@ You help users understand GoodBooks database structures, tables, relationships, 
 
 User: {user_input}
 Assistant:"""
-            answer = llm.invoke(fallback_prompt).content
+            raw = llm.invoke(fallback_prompt)
+            answer = raw.content if hasattr(raw, 'content') else str(raw)
         
         # Clean and format response
         cleaned_answer = answer.strip()

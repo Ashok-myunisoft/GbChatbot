@@ -13,13 +13,14 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
-from langchain_ollama import ChatOllama
+# RunPodLLM via shared_resources — ChatOllama no longer used
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
-from google.cloud import firestore
-from google.cloud import storage
 from concurrent.futures import ThreadPoolExecutor
+import psycopg2
+import psycopg2.extras
+from db_setup import get_pg_conn, create_tables
 from shared_resources import ai_resources
 
 # Import bot modules
@@ -66,14 +67,6 @@ except ImportError as e:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# GCP Configuration
-GCP_PROJECT_ID = os.environ.get('GCP_PROJECT_ID')
-GCS_BUCKET_NAME = os.environ.get('GCS_BUCKET_NAME')
-db = firestore.Client(project=GCP_PROJECT_ID)
-storage_client = storage.Client(project=GCP_PROJECT_ID)
-bucket = storage_client.bucket(GCS_BUCKET_NAME)
-
-logger.info(f"Connected to GCP Project: {GCP_PROJECT_ID}, Bucket: {GCS_BUCKET_NAME}")
 
 # ===========================
 # EXECUTOR (FOR BLOCKING I/O ONLY)
@@ -514,44 +507,75 @@ class ConversationHistoryManager:
     def __init__(self):
         self.threads = {}
         self.load_threads()
-    
+
     def load_threads(self):
         try:
-            logger.info("Loading recent threads from Firestore...")
-            threads_ref = db.collection('conversation_threads')
-            
-            # Load only recent 100 threads to speed up startup
-            # Older threads will be loaded on-demand when accessed
-            docs = threads_ref.order_by('updated_at', direction=firestore.Query.DESCENDING).limit(100).stream()
-            
-            for doc in docs:
-                thread_data = doc.to_dict()
-                if not thread_data: 
-                    continue
+            logger.info("Loading recent threads from PostgreSQL...")
+            conn = get_pg_conn()
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT * FROM conversation_threads
+                    ORDER BY updated_at DESC
+                    LIMIT 100
+                """)
+                rows = cur.fetchall()
+            conn.close()
+
+            for row in rows:
                 thread = ConversationThread(
-                    thread_data.get("thread_id"), 
-                    thread_data.get("username"), 
-                    thread_data.get("title")
+                    row["thread_id"],
+                    row["username"],
+                    row["title"]
                 )
-                thread.created_at = thread_data.get("created_at")
-                thread.updated_at = thread_data.get("updated_at")
-                thread.messages = thread_data.get("messages", [])
-                thread.is_active = thread_data.get("is_active", True)
-                thread.user_role = thread_data.get("user_role")
-                thread.user_name = thread_data.get("user_name")
-                self.threads[thread_data.get("thread_id")] = thread
-            logger.info(f"✅ Loaded {len(self.threads)} recent threads from Firestore")
+                thread.created_at = row["created_at"]
+                thread.updated_at = row["updated_at"]
+                thread.messages = row["messages"] if row["messages"] else []
+                thread.is_active = row["is_active"]
+                thread.user_role = row["user_role"]
+                thread.user_name = row["user_name"]
+                self.threads[row["thread_id"]] = thread
+
+            logger.info(f"✅ Loaded {len(self.threads)} recent threads from PostgreSQL")
         except Exception as e:
-            logger.error(f"Failed to load threads from Firestore: {e}", exc_info=True)
+            logger.error(f"Failed to load threads from PostgreSQL: {e}", exc_info=True)
             self.threads = {}
 
-    def save_threads(self):
+    def _upsert_thread(self, thread: 'ConversationThread'):
+        """Upsert a single thread to PostgreSQL."""
         try:
-            for thread_id, thread in self.threads.items():
-                thread_ref = db.collection('conversation_threads').document(thread_id)
-                thread_ref.set(thread.to_dict())
+            conn = get_pg_conn()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO conversation_threads
+                        (thread_id, username, title, created_at, updated_at,
+                         messages, is_active, user_role, user_name)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (thread_id) DO UPDATE SET
+                        title      = EXCLUDED.title,
+                        updated_at = EXCLUDED.updated_at,
+                        messages   = EXCLUDED.messages,
+                        is_active  = EXCLUDED.is_active,
+                        user_role  = EXCLUDED.user_role,
+                        user_name  = EXCLUDED.user_name
+                """, (
+                    thread.thread_id,
+                    thread.username,
+                    thread.title,
+                    thread.created_at,
+                    thread.updated_at,
+                    psycopg2.extras.Json(thread.messages),
+                    thread.is_active,
+                    thread.user_role,
+                    thread.user_name,
+                ))
+            conn.commit()
+            conn.close()
         except Exception as e:
-            logger.error(f"Error saving threads to Firestore: {e}")
+            logger.error(f"Error upserting thread {thread.thread_id}: {e}")
+
+    def save_threads(self):
+        for thread in self.threads.values():
+            self._upsert_thread(thread)
 
     def create_new_thread(self, username: str, initial_message: str = None) -> str:
         thread_id = str(uuid.uuid4())
@@ -559,57 +583,63 @@ class ConversationHistoryManager:
         if initial_message:
             thread.title = thread._generate_title_from_message(initial_message)
         self.threads[thread_id] = thread
-        self.save_threads()
+        self._upsert_thread(thread)
         logger.info(f"Created new thread {thread_id} for {username}")
         return thread_id
 
     def add_message_to_thread(self, thread_id: str, user_message: str, bot_response: str, bot_type: str):
         if thread_id in self.threads:
             self.threads[thread_id].add_message(user_message, bot_response, bot_type)
-            self.save_threads()
-    
+            self._upsert_thread(self.threads[thread_id])
+
     def get_user_threads(self, username: str, limit: int = 50) -> List[Dict]:
         user_threads = [
-            thread.to_dict() for thread in self.threads.values() 
+            thread.to_dict() for thread in self.threads.values()
             if thread.username == username and thread.is_active
         ]
         user_threads.sort(key=lambda x: x["updated_at"], reverse=True)
         return user_threads[:limit]
-    
+
     def get_thread(self, thread_id: str) -> Optional[ConversationThread]:
         return self.threads.get(thread_id)
-    
+
     def delete_thread(self, thread_id: str, username: str) -> bool:
         if thread_id in self.threads and self.threads[thread_id].username == username:
             self.threads[thread_id].is_active = False
-            self.save_threads()
+            self._upsert_thread(self.threads[thread_id])
             return True
         return False
-    
+
     def rename_thread(self, thread_id: str, username: str, new_title: str) -> bool:
         if thread_id in self.threads and self.threads[thread_id].username == username:
             self.threads[thread_id].title = new_title
             self.threads[thread_id].updated_at = datetime.now().isoformat()
-            self.save_threads()
+            self._upsert_thread(self.threads[thread_id])
             return True
         return False
-    
+
     def cleanup_old_threads(self, days_to_keep: int = 90):
         cutoff_date = datetime.now() - timedelta(days=days_to_keep)
         cutoff_iso = cutoff_date.isoformat()
-        deleted_count = 0
-        threads_to_delete = []
-        
-        for thread_id, thread in self.threads.items():
-            if not thread.is_active and thread.updated_at < cutoff_iso:
-                threads_to_delete.append(thread_id)
-        
+        threads_to_delete = [
+            tid for tid, t in self.threads.items()
+            if not t.is_active and t.updated_at < cutoff_iso
+        ]
         if threads_to_delete:
-            for thread_id in threads_to_delete:
-                del self.threads[thread_id]
-                db.collection('conversation_threads').document(thread_id).delete()
-                deleted_count += 1
-            logger.info(f"Cleaned up {deleted_count} old threads")
+            try:
+                conn = get_pg_conn()
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "DELETE FROM conversation_threads WHERE thread_id = ANY(%s)",
+                        (threads_to_delete,)
+                    )
+                conn.commit()
+                conn.close()
+                for tid in threads_to_delete:
+                    del self.threads[tid]
+                logger.info(f"Cleaned up {len(threads_to_delete)} old threads")
+            except Exception as e:
+                logger.error(f"Error cleaning up old threads: {e}")
 
 # Initialize as None - will be loaded at startup
 history_manager = None
@@ -625,78 +655,104 @@ class EnhancedConversationalMemory:
         self.memory_vectorstore = None
         self.memory_counter = 0
         self.load_memory_vectorstore()
-    
+
     def load_memory_vectorstore(self):
+        """Load past conversation turns from PostgreSQL and rebuild FAISS in-memory."""
         try:
-            faiss_index_blob = bucket.blob(f"{self.vectorstore_path}.faiss")
-            pkl_index_blob = bucket.blob(f"{self.vectorstore_path}.pkl")
+            conn = get_pg_conn()
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT content, memory_id, username, user_role, bot_type, thread_id, user_message, bot_response, created_at FROM memory_vectors ORDER BY created_at ASC")
+                rows = cur.fetchall()
+            conn.close()
 
-            if faiss_index_blob.exists() and pkl_index_blob.exists():
-                logger.info("Downloading FAISS index from Cloud Storage...")
-                os.makedirs(self.vectorstore_path, exist_ok=True)
-                faiss_index_blob.download_to_filename(f"{self.vectorstore_path}.faiss")
-                pkl_index_blob.download_to_filename(f"{self.vectorstore_path}.pkl")
-
-                self.memory_vectorstore = FAISS.load_local(
-                    self.vectorstore_path,
-                    self.embeddings,
-                    allow_dangerous_deserialization=True
-                )
-                logger.info("Loaded memory from GCS.")
+            if rows:
+                docs = []
+                for row in rows:
+                    docs.append(Document(
+                        page_content=row["content"],
+                        metadata={
+                            "memory_id":    row["memory_id"],
+                            "username":     row["username"],
+                            "user_role":    row["user_role"],
+                            "bot_type":     row["bot_type"],
+                            "thread_id":    row["thread_id"],
+                            "user_message": row["user_message"],
+                            "bot_response": row["bot_response"],
+                            "timestamp":    str(row["created_at"]),
+                        }
+                    ))
+                self.memory_vectorstore = FAISS.from_documents(docs, self.embeddings)
+                logger.info(f"✅ Rebuilt FAISS memory from {len(docs)} PostgreSQL rows.")
             else:
-                raise FileNotFoundError("FAISS index not found in GCS bucket.")
-
+                dummy_doc = Document(page_content="Memory system initialized", metadata={"memory_id": "init"})
+                self.memory_vectorstore = FAISS.from_documents([dummy_doc], self.embeddings)
+                logger.info("✅ Created fresh FAISS memory vectorstore.")
         except Exception as e:
-            logger.error(f"Error loading memory from GCS, creating new one: {e}")
-            dummy_doc = Document(page_content="Memory system initialized")
+            logger.error(f"Error loading memory from PostgreSQL, creating new one: {e}")
+            dummy_doc = Document(page_content="Memory system initialized", metadata={"memory_id": "init"})
             self.memory_vectorstore = FAISS.from_documents([dummy_doc], self.embeddings)
-    
+
     def store_conversation_turn(self, username: str, user_message: str, bot_response: str, bot_type: str, user_role: str, thread_id: str = None):
         try:
             timestamp = datetime.now().isoformat()
             memory_id = f"{username}_{self.memory_counter}_{int(datetime.now().timestamp())}"
-            
+
             conversation_context = f"User ({user_role}): {user_message} | Bot ({bot_type}): {bot_response[:1000]}"
-            
+
             memory_doc = Document(
                 page_content=conversation_context,
                 metadata={
-                    "memory_id": memory_id,
-                    "username": username,
-                    "user_role": user_role,
-                    "timestamp": timestamp,
+                    "memory_id":    memory_id,
+                    "username":     username,
+                    "user_role":    user_role,
+                    "timestamp":    timestamp,
                     "user_message": user_message,
                     "bot_response": bot_response[:500],
-                    "bot_type": bot_type,
-                    "thread_id": thread_id
+                    "bot_type":     bot_type,
+                    "thread_id":    thread_id
                 }
             )
-            
             self.memory_vectorstore.add_documents([memory_doc])
-            
+
             conversational_memory_metadata[memory_id] = {
-                "username": username,
-                "user_role": user_role,
-                "timestamp": timestamp,
+                "username":     username,
+                "user_role":    user_role,
+                "timestamp":    timestamp,
                 "user_message": user_message,
                 "bot_response": bot_response[:1000],
-                "bot_type": bot_type,
-                "thread_id": thread_id
+                "bot_type":     bot_type,
+                "thread_id":    thread_id
             }
-            
-            self.memory_counter += 1
-            if self.memory_counter % 20 == 0:
-                logger.info("Saving FAISS index to Cloud Storage...")
-                self.memory_vectorstore.save_local(self.vectorstore_path)
 
-                faiss_blob = bucket.blob(f"{self.vectorstore_path}.faiss")
-                pkl_blob = bucket.blob(f"{self.vectorstore_path}.pkl")
-                faiss_blob.upload_from_filename(f"{self.vectorstore_path}.faiss")
-                pkl_blob.upload_from_filename(f"{self.vectorstore_path}.pkl")
-                logger.info("Successfully saved FAISS index to GCS.")
+            # Persist to PostgreSQL immediately (replaces GCS upload)
+            conn = get_pg_conn()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO memory_vectors
+                        (memory_id, username, user_role, bot_type, thread_id,
+                         content, user_message, bot_response)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (memory_id) DO NOTHING
+                """, (
+                    memory_id,
+                    username,
+                    user_role,
+                    bot_type,
+                    thread_id,
+                    conversation_context,
+                    user_message,
+                    bot_response[:500],
+                ))
+            conn.commit()
+            conn.close()
+
+            self.memory_counter += 1
+            logger.debug(f"Stored memory turn #{self.memory_counter} for {username}")
+
         except Exception as e:
             logger.error(f"Error storing conversation turn: {e}")
-    
+
+
     def retrieve_contextual_memories(self, username: str, query: str, k: int = 3, thread_id: str = None, thread_isolation: bool = False) -> List[Dict]:
         try:
             # Enhanced memory retrieval with multiple strategies
@@ -1490,7 +1546,7 @@ class AIOrchestrationAgent:
                 timeout=10.0
             )
             
-            intent = response.content.strip().lower()
+            intent = (response.content if hasattr(response, 'content') else str(response)).strip().lower()
             logger.info(f"🎯 AI raw response: {intent}")
             
             valid_intents = ["general", "formula", "report", "menu", "project"]
@@ -1555,7 +1611,7 @@ class AIOrchestrationAgent:
                 timeout=10.0
             )
             
-            generated = response.content.strip()
+            generated = (response.content if hasattr(response, 'content') else str(response)).strip()
             logger.info(f"✅ Out-of-scope response generated: {generated[:100]}")
             return generated
             
@@ -1603,7 +1659,7 @@ Rewritten Answer:"""
                 timeout=15.0
             )
             
-            role_adapted = response.content.strip()
+            role_adapted = (response.content if hasattr(response, 'content') else str(response)).strip()
             
             if role_adapted and len(role_adapted) > 20:
                 logger.info(f"✅ Role perspective applied successfully ({len(role_adapted)} chars)")
@@ -1936,32 +1992,68 @@ def parse_name_and_role(message: str) -> tuple[str, str]:
     return name, role
 
 def update_user_session(username: str, name: str = None, current_role: str = None):
-    """Update user session - now non-blocking"""
+    """Update user session in PostgreSQL — non-blocking."""
     try:
         current_time = datetime.now().isoformat()
+        conn = get_pg_conn()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            # Ensure user_sessions table exists (also done in create_tables at startup)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS user_sessions (
+                    username            TEXT PRIMARY KEY,
+                    first_seen          TEXT,
+                    last_activity       TEXT,
+                    session_count       INTEGER DEFAULT 1,
+                    total_interactions  INTEGER DEFAULT 1,
+                    name                TEXT,
+                    user_role           TEXT
+                )
+            """)
+            cur.execute("SELECT * FROM user_sessions WHERE username = %s", (username,))
+            row = cur.fetchone()
 
-        session_ref = db.collection('user_sessions').document(username)
-        session_doc = session_ref.get()
+            if row is None:
+                user_session_data = {
+                    "username":           username,
+                    "first_seen":         current_time,
+                    "last_activity":      current_time,
+                    "session_count":      1,
+                    "total_interactions": 1,
+                    "name":               name,
+                    "user_role":          current_role
+                }
+                cur.execute("""
+                    INSERT INTO user_sessions
+                        (username, first_seen, last_activity, session_count, total_interactions, name, user_role)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (
+                    username, current_time, current_time, 1, 1, name, current_role
+                ))
+            else:
+                user_session_data = dict(row)
+                user_session_data["last_activity"] = current_time
+                user_session_data["total_interactions"] = (user_session_data.get("total_interactions") or 0) + 1
+                if name is not None:
+                    user_session_data["name"] = name
+                if current_role is not None:
+                    user_session_data["user_role"] = current_role
+                cur.execute("""
+                    UPDATE user_sessions SET
+                        last_activity      = %s,
+                        total_interactions = %s,
+                        name               = %s,
+                        user_role          = %s
+                    WHERE username = %s
+                """, (
+                    current_time,
+                    user_session_data["total_interactions"],
+                    user_session_data["name"],
+                    user_session_data["user_role"],
+                    username
+                ))
 
-        if not session_doc.exists:
-            user_session_data = {
-                "first_seen": current_time,
-                "last_activity": current_time,
-                "session_count": 1,
-                "total_interactions": 1,
-                "name": name,
-                "current_role": current_role
-            }
-        else:
-            user_session_data = session_doc.to_dict()
-            user_session_data["last_activity"] = current_time
-            user_session_data["total_interactions"] = user_session_data.get("total_interactions", 0) + 1
-            if name is not None:
-                user_session_data["name"] = name
-            if current_role is not None:
-                user_session_data["current_role"] = current_role
-
-        session_ref.set(user_session_data)
+        conn.commit()
+        conn.close()
         user_sessions[username] = user_session_data
     except Exception as e:
         logger.error(f"Error saving user session: {e}")
@@ -1991,6 +2083,13 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+@app.on_event("startup")
+async def init_db_tables():
+    """Create PostgreSQL tables on startup (runs before embeddings are loaded)."""
+    logger.info("🚀 Starting up — initialising PostgreSQL schema...")
+    create_tables()
+
 
 # ===========================
 # Pydantic Models
@@ -2710,11 +2809,15 @@ async def startup_event():
         )
         logger.info("✅ Embeddings loaded")
         
-        logger.info("💾 Loading conversation memory from GCS...")
-        enhanced_memory = EnhancedConversationalMemory(MEMORY_VECTORSTORE_PATH, "metadata.json", embeddings)
+        logger.info("💾 Loading conversation memory from PostgreSQL...")
+        enhanced_memory = EnhancedConversationalMemory(
+            vectorstore_path="memory_store",
+            metadata_file="memory_meta.json",
+            embeddings=embeddings
+        )
         logger.info("✅ Memory loaded")
-        
-        logger.info("📚 Loading conversation threads from Firestore...")
+
+        logger.info("📚 Loading conversation threads from PostgreSQL...")
         history_manager = ConversationHistoryManager()
         logger.info("✅ Threads loaded")
         
@@ -2723,14 +2826,20 @@ async def startup_event():
         logger.info("✅ Orchestrator ready")
 
         # --------------------------------------------------
-        # 🔥 WARM OLLAMA MODELS (GPU LOAD)
+        # 🔥 WARM RUNPOD MODELS (optional — non-fatal)
         # --------------------------------------------------
         logger.info("🔥 Warming models in parallel...")
-        await asyncio.gather(
-            ai_orchestrator.routing_llm.ainvoke("hello"),
-            ai_orchestrator.response_llm.ainvoke("Reply OK")
-        )
-        logger.info("✅ Ollama models warmed")
+        try:
+            await asyncio.gather(
+                ai_orchestrator.routing_llm.ainvoke("hello"),
+                ai_orchestrator.response_llm.ainvoke("Reply OK")
+            )
+            logger.info("✅ RunPod models warmed")
+        except Exception as warm_err:
+            logger.warning(
+                f"⚠️ Model warm-up skipped (RunPod unreachable or API key issue): {warm_err}"
+            )
+            logger.warning("⚠️ App will still start — warm-up is optional.")
 
         # --------------------------------------------------
         # 📦 FORCE FAISS INTO MEMORY (if exists)
