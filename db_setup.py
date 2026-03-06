@@ -9,6 +9,7 @@ import os
 import logging
 import psycopg2
 import psycopg2.extras
+import psycopg2.pool
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -17,10 +18,30 @@ logger = logging.getLogger(__name__)
 
 POSTGRES_URL = os.environ.get("POSTGRES_URL")
 
+# Connection pool — reuses connections instead of opening a new TCP socket per query
+_pool: psycopg2.pool.ThreadedConnectionPool = None
+
+
+def _get_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    global _pool
+    if _pool is None:
+        _pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=2,
+            maxconn=10,
+            dsn=POSTGRES_URL,
+        )
+        logger.info("PostgreSQL connection pool created (min=2, max=10).")
+    return _pool
+
 
 def get_pg_conn():
-    """Return a new psycopg2 connection to the PostgreSQL database."""
-    return psycopg2.connect(POSTGRES_URL)
+    """Acquire a connection from the pool."""
+    return _get_pool().getconn()
+
+
+def release_pg_conn(conn):
+    """Return a connection to the pool. Call this instead of conn.close()."""
+    _get_pool().putconn(conn)
 
 
 def create_tables():
@@ -110,7 +131,7 @@ def create_tables():
         conn.rollback()
         raise
     finally:
-        conn.close()
+        release_pg_conn(conn)
 
 
 # Allow running directly to set up the database
