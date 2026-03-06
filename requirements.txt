@@ -11,6 +11,9 @@ sentence-transformers
 faiss-cpu
 langchain-ollama
 jq
-numpy<2.0  # <--- ADD THIS LINE
+numpy<2.0
 # --- PostgreSQL ---
 psycopg2-binary
+# --- Structured knowledge base ---
+duckdb
+openpyxl

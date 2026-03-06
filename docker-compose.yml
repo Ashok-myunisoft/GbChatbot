@@ -10,47 +10,8 @@ services:
     container_name: goodbooks_chatbot_app
     ports:
       - "8010:8010"
+    env_file:
+      - .env
     volumes:
       - ./data:/app/data
-      - ./data/conversational_memory_vectorstore:/app/conversational_memory_vectorstore
-      - ./data/conversational_memory_metadata.json:/app/conversational_memory_metadata.json
-      - ./data/user_sessions.json:/app/user_sessions.json
-      - ./data/conversation_threads.json:/app/conversation_threads.json
-      - ./data/role_context_mapping.json:/app/role_context_mapping.json
-      - ./data/chats.json:/app/chats.json
-    depends_on:
-      ollama:
-        condition: service_healthy
     restart: always
-
-  # -----------------------------
-  # Ollama (GPU + Keep Alive)
-  # -----------------------------
-  ollama:
-    image: ollama/ollama
-    container_name: ollama_service
-    environment:
-      - OLLAMA_KEEP_ALIVE=24h   # 🔥 KEEP MODEL HOT
-    volumes:
-      - ollama_data:/root/.ollama
-    ports:
-      - "11434:11434"
-    restart: always
-
-    # ✅ GPU ACCESS (REQUIRED)
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              capabilities: [gpu]
-
-    # ✅ HEALTHCHECK (IMPORTANT)
-    healthcheck:
-      test: ["CMD", "ollama", "ps"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
-volumes:
-  ollama_data:

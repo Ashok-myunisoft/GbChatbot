@@ -2,26 +2,17 @@ import json
 import os
 import logging
 import traceback
-import pandas as pd
 from datetime import datetime
-# RunPodLLM via shared_resources — ChatOllama no longer used
 from typing import List, Dict, Any
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from langchain_community.document_loaders import TextLoader, PyPDFLoader
-from langchain_community.document_loaders import UnstructuredExcelLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
 from fastapi.middleware.cors import CORSMiddleware
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
 from shared_resources import ai_resources
 from fastapi import Header
-import pickle
+import db_query
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -163,81 +154,11 @@ class ConversationalMemory:
         except Exception as e:
             logger.error(f"Error adding conversation turn to memory: {e}")
 
-def load_csv_as_document(file_path: str) -> List[Document]:
-    """Load CSV file and convert to documents"""
-    docs = []
-    try:
-        df = pd.read_csv(file_path, encoding='cp1252')
-
-        # Convert each row to document
-        for idx, row in df.iterrows():
-            row_content = f"Record {idx + 1}:\n"
-            for col in df.columns:
-                row_content += f"- {col}: {row[col]}\n"
-            doc = Document(
-                page_content=row_content,
-                metadata={"source": file_path, "row_index": idx}
-            )
-            docs.append(doc)
-
-        # Add dataset summary
-        summary_content = f"Dataset Summary for {os.path.basename(file_path)}:\n"
-        summary_content += f"Total records: {len(df)}\n"
-        summary_content += f"Columns: {', '.join(df.columns.tolist())}\n\n"
-        summary_content += "Sample data:\n"
-        summary_content += df.head().to_string(index=False)
-
-        summary_doc = Document(
-            page_content=summary_content,
-            metadata={"source": file_path, "type": "summary"}
-        )
-        docs.append(summary_doc)
-
-    except Exception as e:
-        logger.error(f"Error loading CSV {file_path}: {e}")
-
-    return docs
-
-def load_and_split_documents(documents_dir: str) -> List[Document]:
-    all_docs = []
-    
-    report_docs_path = os.path.join(documents_dir, "MREPORT.csv")
-    if os.path.exists(report_docs_path):
-        logger.info(f"Loading file: {report_docs_path}")
-        csv_docs = load_csv_as_document(report_docs_path)
-        all_docs.extend(csv_docs)
-        logger.info(f"✅ Loaded {len(csv_docs)} documents from CSV: {report_docs_path}")
-    else:
-        logger.warning(f"⚠️ {report_docs_path} not found.")
-
-    return all_docs
-
-# Always initialize embeddings regardless of document availability
-embeddings = ai_resources.embeddings
-
-# Load documents
-all_docs = load_and_split_documents(DOCUMENTS_DIR)
-text_chunks, retriever = None, None
-
-if all_docs:
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1500,
-        chunk_overlap=300
-    )
-    text_chunks = text_splitter.split_documents(all_docs)
-    logger.info(f"✅ Loaded {len(all_docs)} docs, split into {len(text_chunks)} chunks.")
-
-    vectorstore = FAISS.from_documents(text_chunks, embeddings)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 50})
-    logger.info("✅ FAISS retriever ready.")
-else:
-    logger.warning("⚠️ No documents loaded. RAG not available.")
-
 # Initialize conversational memory
 conversational_memory = ConversationalMemory(
     MEMORY_VECTORSTORE_PATH,
     MEMORY_METADATA_FILE,
-    embeddings
+    ai_resources.embeddings
 )
 
 # Role-based system prompts for report bot
@@ -377,17 +298,10 @@ CONTEXT-AWARE REPORT RESPONSE (Synthesize all available information):
 """
 
 
-prompt = prompt_template
-
-if retriever:
-    # No chain needed
-    pass
-
 @app.post("/gbaiapi/Report-chat", tags=["Goodbooks Ai Api"])
 async def report_chat(message: Message, Login: str = Header(...)):
     user_input = message.content.strip()
 
-    # Parse login header
     try:
         login_dto = json.loads(Login)
         username = login_dto.get("UserName", "anonymous")
@@ -396,8 +310,7 @@ async def report_chat(message: Message, Login: str = Header(...)):
         return JSONResponse(status_code=400, content={"response": "Invalid login header"})
 
     user_input = spell_check(user_input)
-    
-    # ✅ FIX: Get orchestrator context
+
     orchestrator_context = getattr(message, 'context', '')
     logger.info(f"📚 Received orchestrator context: {len(orchestrator_context)} chars")
 
@@ -407,51 +320,37 @@ async def report_chat(message: Message, Login: str = Header(...)):
         return {"response": formatted_answer}
 
     try:
-        history_str = ""
-        
-        # ✅ FIX: Log retrieval
-        if retriever:
-            logger.info(f"🔍 Searching report knowledge base for: {user_input[:100]}")
-            docs = retriever.invoke(user_input)
-            logger.info(f"📚 Retrieved {len(docs)} documents")
-            context_str = "\n".join([doc.page_content for doc in docs]) if docs else "No relevant documents found"
-            
-            # Get role-specific system prompt
-            role_system_prompt = ROLE_SYSTEM_PROMPTS_REPORT.get(user_role, ROLE_SYSTEM_PROMPTS_REPORT["client"])
+        logger.info(f"🔍 Searching report DuckDB for: {user_input[:100]}")
+        context_str = db_query.query_table("MREPORT", user_input)
+        logger.info(f"📚 Report context: {len(context_str)} chars")
 
-            # Extract cross-bot context from orchestrator_context if available
-            cross_bot_context = ""
-            if orchestrator_context and "=== Cross-Bot Context" in orchestrator_context:
-                # Extract the cross-bot context section
-                cross_bot_start = orchestrator_context.find("=== Cross-Bot Context")
-                if cross_bot_start != -1:
-                    cross_bot_end = orchestrator_context.find("===", cross_bot_start + 1)
-                    if cross_bot_end == -1:
-                        cross_bot_context = orchestrator_context[cross_bot_start:]
-                    else:
-                        cross_bot_context = orchestrator_context[cross_bot_start:cross_bot_end]
-                # Remove cross-bot context from orchestrator_context to avoid duplication
-                orchestrator_context = orchestrator_context.replace(cross_bot_context, "").strip()
+        role_system_prompt = ROLE_SYSTEM_PROMPTS_REPORT.get(user_role, ROLE_SYSTEM_PROMPTS_REPORT["client"])
 
-            # Retrieve relevant memories from past conversations
-            relevant_memories = conversational_memory.retrieve_relevant_memories(username, user_input, k=3)
-            formatted_memories = format_memories(relevant_memories)
+        cross_bot_context = ""
+        if orchestrator_context and "=== Cross-Bot Context" in orchestrator_context:
+            cross_bot_start = orchestrator_context.find("=== Cross-Bot Context")
+            if cross_bot_start != -1:
+                cross_bot_end = orchestrator_context.find("===", cross_bot_start + 1)
+                if cross_bot_end == -1:
+                    cross_bot_context = orchestrator_context[cross_bot_start:]
+                else:
+                    cross_bot_context = orchestrator_context[cross_bot_start:cross_bot_end]
+            orchestrator_context = orchestrator_context.replace(cross_bot_context, "").strip()
 
-            prompt_text = prompt_template.format(
-                role_system_prompt=role_system_prompt,
-                cross_bot_context=cross_bot_context if cross_bot_context else "No related context from other bots",
-                orchestrator_context=orchestrator_context if orchestrator_context else "No prior context",
-                relevant_memories=formatted_memories,
-                context=context_str,
-                question=user_input
-            )
-            
-            raw = llm.invoke(prompt_text)
-            answer = raw.content if hasattr(raw, 'content') else str(raw)
-        else:
-            fallback_prompt = f"Only answer based on data context. Human: {user_input}\nAssistant:"
-            raw = llm.invoke(fallback_prompt)
-            answer = raw.content if hasattr(raw, 'content') else str(raw)
+        relevant_memories = conversational_memory.retrieve_relevant_memories(username, user_input, k=3)
+        formatted_memories = format_memories(relevant_memories)
+
+        prompt_text = prompt_template.format(
+            role_system_prompt=role_system_prompt,
+            cross_bot_context=cross_bot_context if cross_bot_context else "No related context from other bots",
+            orchestrator_context=orchestrator_context if orchestrator_context else "No prior context",
+            relevant_memories=formatted_memories,
+            context=context_str,
+            question=user_input
+        )
+
+        raw = llm.invoke(prompt_text)
+        answer = raw.content if hasattr(raw, 'content') else str(raw)
         
         logger.info(f"✅ Generated answer: {len(answer)} chars")
 
@@ -477,12 +376,7 @@ async def report_chat(message: Message, Login: str = Header(...)):
 
 @app.get("/gbaiapi/health", tags=["System"])
 async def health_check():
-    return {
-        "status": "healthy",
-        "documents_loaded": len(all_docs) if all_docs else 0,
-        "chunks_created": len(text_chunks) if text_chunks else 0,
-        "retriever_available": retriever is not None
-    }
+    return {"status": "healthy"}
 
 if __name__ == "__main__":
     import uvicorn

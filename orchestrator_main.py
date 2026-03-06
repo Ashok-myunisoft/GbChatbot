@@ -20,8 +20,9 @@ from langchain_core.documents import Document
 from concurrent.futures import ThreadPoolExecutor
 import psycopg2
 import psycopg2.extras
-from db_setup import get_pg_conn, create_tables
+from db_setup import get_pg_conn, release_pg_conn, create_tables
 from shared_resources import ai_resources
+import knowledge_loader
 
 # Import bot modules
 try:
@@ -63,6 +64,14 @@ try:
 except ImportError as e:
     GENERAL_BOT_AVAILABLE = False
     logging.warning(f"General bot not available: {e}")
+
+try:
+    import schema_bot
+    SCHEMA_BOT_AVAILABLE = True
+    logging.info("Schema bot imported successfully")
+except ImportError as e:
+    SCHEMA_BOT_AVAILABLE = False
+    logging.warning(f"Schema bot not available: {e}")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -425,10 +434,11 @@ ORCHESTRATOR_SYSTEM_PROMPT = """You are a routing assistant for GoodBooks ERP. R
 - report: data analysis, generating reports, charts, graphs, statistics, viewing data
 - menu: navigation help, finding screens, interface guidance, where to find features
 - project: project files, project reports, project management, tasks, milestones
+- schema: database tables, columns, field names, schema structure, table definitions, database design, what fields/columns exist
 
 Examples:
 "What is GoodBooks ERP?" -> general
-"Tell me about inventory module" -> general  
+"Tell me about inventory module" -> general
 "The user asks about leave"-> general
 "Calculate 100 * 5" -> formula
 "What is 20% of 500?" -> formula
@@ -438,10 +448,13 @@ Examples:
 "How do I access invoices?" -> menu
 "Show project status" -> project
 "View project files" -> project
+"What columns are in the customer table?" -> schema
+"List all tables in the database" -> schema
+"What fields does the purchase order table have?" -> schema
 
 Query: {question}
 
-Respond with ONLY ONE WORD (general, formula, report, menu, or project):"""
+Respond with ONLY ONE WORD (general, formula, report, menu, project, or schema):"""
 
 # ===========================
 # AI OUT-OF-SCOPE REFUSAL PROMPT
@@ -519,7 +532,7 @@ class ConversationHistoryManager:
                     LIMIT 100
                 """)
                 rows = cur.fetchall()
-            conn.close()
+            release_pg_conn(conn)
 
             for row in rows:
                 thread = ConversationThread(
@@ -569,7 +582,7 @@ class ConversationHistoryManager:
                     thread.user_name,
                 ))
             conn.commit()
-            conn.close()
+            release_pg_conn(conn)
         except Exception as e:
             logger.error(f"Error upserting thread {thread.thread_id}: {e}")
 
@@ -593,12 +606,40 @@ class ConversationHistoryManager:
             self._upsert_thread(self.threads[thread_id])
 
     def get_user_threads(self, username: str, limit: int = 50) -> List[Dict]:
-        user_threads = [
-            thread.to_dict() for thread in self.threads.values()
-            if thread.username == username and thread.is_active
-        ]
-        user_threads.sort(key=lambda x: x["updated_at"], reverse=True)
-        return user_threads[:limit]
+        try:
+            conn = get_pg_conn()
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT * FROM conversation_threads
+                    WHERE username = %s AND is_active = TRUE
+                    ORDER BY updated_at DESC
+                    LIMIT %s
+                """, (username, limit))
+                rows = cur.fetchall()
+            release_pg_conn(conn)
+
+            result = []
+            for row in rows:
+                thread = ConversationThread(row["thread_id"], row["username"], row["title"])
+                thread.created_at = row["created_at"]
+                thread.updated_at = row["updated_at"]
+                thread.messages = row["messages"] if row["messages"] else []
+                thread.is_active = row["is_active"]
+                thread.user_role = row["user_role"]
+                thread.user_name = row["user_name"]
+                # Keep in-memory cache in sync
+                self.threads[row["thread_id"]] = thread
+                result.append(thread.to_dict())
+            return result
+        except Exception as e:
+            logger.error(f"Error fetching user threads from DB: {e}")
+            # Fallback to in-memory filter
+            user_threads = [
+                t.to_dict() for t in self.threads.values()
+                if t.username == username and t.is_active
+            ]
+            user_threads.sort(key=lambda x: x["updated_at"], reverse=True)
+            return user_threads[:limit]
 
     def get_thread(self, thread_id: str) -> Optional[ConversationThread]:
         return self.threads.get(thread_id)
@@ -634,7 +675,7 @@ class ConversationHistoryManager:
                         (threads_to_delete,)
                     )
                 conn.commit()
-                conn.close()
+                release_pg_conn(conn)
                 for tid in threads_to_delete:
                     del self.threads[tid]
                 logger.info(f"Cleaned up {len(threads_to_delete)} old threads")
@@ -661,9 +702,9 @@ class EnhancedConversationalMemory:
         try:
             conn = get_pg_conn()
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute("SELECT content, memory_id, username, user_role, bot_type, thread_id, user_message, bot_response, created_at FROM memory_vectors ORDER BY created_at ASC")
+                cur.execute("SELECT content, memory_id, username, user_role, bot_type, thread_id, user_message, bot_response, created_at FROM memory_vectors ORDER BY created_at DESC LIMIT 5000")
                 rows = cur.fetchall()
-            conn.close()
+            release_pg_conn(conn)
 
             if rows:
                 docs = []
@@ -744,7 +785,7 @@ class EnhancedConversationalMemory:
                     bot_response[:500],
                 ))
             conn.commit()
-            conn.close()
+            release_pg_conn(conn)
 
             self.memory_counter += 1
             logger.debug(f"Stored memory turn #{self.memory_counter} for {username}")
@@ -1053,6 +1094,21 @@ class EnhancedMessage:
         self.content = content
         self.context = context
 
+def _extract_clean_response(response: str) -> str:
+    """Extract actual content if LLM returned {'output': '...'} wrapped format."""
+    if not response:
+        return response
+    stripped = response.strip()
+    if stripped.startswith("{'output':") or stripped.startswith('{"output":'):
+        try:
+            import ast
+            parsed = ast.literal_eval(stripped)
+            if isinstance(parsed, dict) and "output" in parsed:
+                return str(parsed["output"])
+        except Exception:
+            pass
+    return response
+
 class GeneralBotWrapper:
     @staticmethod
     async def answer(question: str, context: str, user_role: str, username: str = "anonymous") -> str:
@@ -1294,6 +1350,51 @@ class ProjectBot:
             logger.error(f"❌ Project bot error: {e}", exc_info=True)
             return None
 
+class SchemaBot:
+    @staticmethod
+    async def answer(question: str, context: str, user_role: str, username: str = "anonymous") -> str:
+        if not SCHEMA_BOT_AVAILABLE:
+            logger.warning("❌ Schema bot not available")
+            return None
+        try:
+            logger.info(f"📞 Calling schema_bot with question: {question[:100]}")
+            logger.info(f"📚 Passing context: {len(context)} chars")
+
+            message = EnhancedMessage(question, context)
+            login_header = json.dumps({"UserName": username, "Role": user_role})
+
+            result = await schema_bot.chat(message, Login=login_header)
+
+            response = None
+            if isinstance(result, JSONResponse):
+                body = json.loads(result.body.decode())
+                response = body.get("response")
+            elif isinstance(result, dict):
+                response = result.get("response")
+            else:
+                response = str(result) if result else None
+
+            if response:
+                response_lower = response.lower()
+                refusal_patterns = [
+                    "i don't have access", "i do not have access", "unable to provide",
+                    "cannot provide", "don't have information", "do not have information"
+                ]
+                is_refusal = any(pattern in response_lower for pattern in refusal_patterns)
+                if is_refusal:
+                    logger.warning(f"⚠️ Schema bot returned refusal: {response[:150]}")
+                    return None
+                else:
+                    logger.info(f"✅ Schema bot returned valid answer: {response[:100]}")
+                    return response
+            else:
+                logger.warning("⚠️ Schema bot returned empty response")
+                return None
+
+        except Exception as e:
+            logger.error(f"❌ Schema bot error: {e}", exc_info=True)
+            return None
+
 # ===========================
 # build_conversational_context FUNCTION
 # ===========================
@@ -1450,7 +1551,8 @@ class AIOrchestrationAgent:
             "formula": FormulaBot(),
             "report": ReportBot(),
             "menu": MenuBot(),
-            "project": ProjectBot()
+            "project": ProjectBot(),
+            "schema": SchemaBot()
         }
         
         self.intent_cache = {}
@@ -1511,7 +1613,19 @@ class AIOrchestrationAgent:
         if any(word in question_lower for word in project_keywords):
             logger.info("🚀 Fast route: project")
             return "project"
-        
+
+        # Schema bot keywords
+        schema_keywords = [
+            'column', 'columns', 'field', 'fields', 'table', 'tables',
+            'schema', 'database schema', 'db schema', 'table structure',
+            'table definition', 'what columns', 'what fields', 'list tables',
+            'list columns', 'show tables', 'show columns', 'unisoft',
+            'data model', 'entity', 'primary key', 'foreign key'
+        ]
+        if any(word in question_lower for word in schema_keywords):
+            logger.info("🚀 Fast route: schema")
+            return "schema"
+
         # General bot keywords (to avoid routing LLM for common generic questions)
         general_keywords = [
             'what is', 'who is', 'tell me about', 'explain', 'describe',
@@ -1543,13 +1657,13 @@ class AIOrchestrationAgent:
             
             response = await asyncio.wait_for(
                 self.routing_llm.ainvoke(prompt),
-                timeout=10.0
+                timeout=70.0
             )
             
             intent = (response.content if hasattr(response, 'content') else str(response)).strip().lower()
             logger.info(f"🎯 AI raw response: {intent}")
             
-            valid_intents = ["general", "formula", "report", "menu", "project"]
+            valid_intents = ["general", "formula", "report", "menu", "project", "schema"]
             
             for valid_intent in valid_intents:
                 if valid_intent in intent:
@@ -1608,13 +1722,13 @@ class AIOrchestrationAgent:
             
             response = await asyncio.wait_for(
                 self.response_llm.ainvoke(prompt),
-                timeout=10.0
+                timeout=70.0
             )
-            
+
             generated = (response.content if hasattr(response, 'content') else str(response)).strip()
             logger.info(f"✅ Out-of-scope response generated: {generated[:100]}")
             return generated
-            
+
         except asyncio.TimeoutError:
             logger.warning("⏱️ Out-of-scope response timeout")
             return f"I'm your GoodBooks ERP assistant. I specialize in helping with GoodBooks features and functionality. Could you please ask me about something related to GoodBooks ERP?"
@@ -1656,7 +1770,7 @@ Rewritten Answer:"""
             
             response = await asyncio.wait_for(
                 self.response_llm.ainvoke(prompt),
-                timeout=15.0
+                timeout=70.0
             )
             
             role_adapted = (response.content if hasattr(response, 'content') else str(response)).strip()
@@ -1702,7 +1816,7 @@ Rewritten Answer:"""
                     if thread:
                         thread.user_role = user_role
                         thread.user_name = user_name
-                        history_manager.save_threads()
+                        await asyncio.to_thread(history_manager.save_threads)
                     logger.info(f"🎭 User set role to: {user_role}, name: {user_name} for thread {thread_id}")
                     confirmation = f"Hello {user_name if user_name else username}! I've set your role to {user_role}. How can I help you with GoodBooks ERP today?"
                     return {
@@ -1741,7 +1855,7 @@ For example: "Name: John, Role: developer" """
                     logger.warning(f"⚠️ Existing thread {thread_id} has no role set - using login role")
                     user_role = user_role  # Use the provided role
                     thread.user_role = user_role  # Set it for future use
-                    history_manager.save_threads()
+                    await asyncio.to_thread(history_manager.save_threads)
             else:
                 # Thread ID provided but thread not found - create new thread
                 logger.warning(f"⚠️ Thread {thread_id} not found, creating new thread")
@@ -1865,13 +1979,14 @@ For example: "Name: John, Role: developer" """
         else:
             logger.info(f"⚡ Skipping redundant role adaptation - bot handled it in-situ")
             # answer = await self.apply_role_perspective(answer, user_role, question)
-        
-        logger.info("💾 Storing conversation in background...")
-        asyncio.create_task(
-            asyncio.to_thread(
-                update_enhanced_memory,
-                username, question, answer, bot_type, user_role, thread_id
-            )
+
+        # Clean up LLM response if wrapped in {'output': '...'} format
+        answer = _extract_clean_response(answer)
+
+        logger.info("💾 Storing conversation...")
+        await asyncio.to_thread(
+            update_enhanced_memory,
+            username, question, answer, bot_type, user_role, thread_id
         )
         
         elapsed = time.time() - start_time
@@ -1997,18 +2112,6 @@ def update_user_session(username: str, name: str = None, current_role: str = Non
         current_time = datetime.now().isoformat()
         conn = get_pg_conn()
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-            # Ensure user_sessions table exists (also done in create_tables at startup)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS user_sessions (
-                    username            TEXT PRIMARY KEY,
-                    first_seen          TEXT,
-                    last_activity       TEXT,
-                    session_count       INTEGER DEFAULT 1,
-                    total_interactions  INTEGER DEFAULT 1,
-                    name                TEXT,
-                    user_role           TEXT
-                )
-            """)
             cur.execute("SELECT * FROM user_sessions WHERE username = %s", (username,))
             row = cur.fetchone()
 
@@ -2053,7 +2156,7 @@ def update_user_session(username: str, name: str = None, current_role: str = Non
                 ))
 
         conn.commit()
-        conn.close()
+        release_pg_conn(conn)
         user_sessions[username] = user_session_data
     except Exception as e:
         logger.error(f"Error saving user session: {e}")
@@ -2086,9 +2189,12 @@ app.add_middleware(
 
 @app.on_event("startup")
 async def init_db_tables():
-    """Create PostgreSQL tables on startup (runs before embeddings are loaded)."""
+    """Create PostgreSQL tables and load knowledge base on startup."""
     logger.info("🚀 Starting up — initialising PostgreSQL schema...")
     create_tables()
+    logger.info("📚 Loading knowledge base (DuckDB + FAISS)...")
+    await asyncio.to_thread(knowledge_loader.load_all, ai_resources.embeddings)
+    logger.info("✅ Knowledge base ready.")
 
 
 # ===========================
@@ -2142,52 +2248,47 @@ async def ai_role_based_chat(message: Message, Login: str = Header(...)):
         parsed_name, parsed_role = parse_name_and_role(user_input)
         
         if parsed_role:
-            # User provided both name and role in this message
-            user_name = parsed_name or username
+            # Username comes from login_dto — no need to ask for name
             user_role = parsed_role
-            
+
             # ✅ FIX: Save role info to thread IMMEDIATELY
             thread.user_role = user_role
-            thread.user_name = user_name
-            history_manager.save_threads()
-            
-            logger.info(f"🎭 User set role to: {user_role}, name: {user_name} in thread {thread_id}")
-            
-            confirmation = f"Perfect! I've set your profile:\n• Name: {user_name}\n• Role: {user_role}\n\nNow, how can I help you with GoodBooks ERP today?"
-            
+            thread.user_name = username
+            await asyncio.to_thread(history_manager.save_threads)
+
+            logger.info(f"🎭 User set role to: {user_role}, name: {username} in thread {thread_id}")
+
+            confirmation = f"Got it, {username}! You're set as **{user_role}**.\n\nHow can I help you with GoodBooks ERP today?"
+
             # ✅ FIX: Store this setup message in thread
             await asyncio.to_thread(
                 history_manager.add_message_to_thread,
                 thread_id, user_input, confirmation, "role_setup"
             )
-            
+
             # Update session
             session_info["registered"] = True
             session_info["current_role"] = user_role
-            session_info["user_name"] = user_name
+            session_info["user_name"] = username
             session_info["last_thread_id"] = thread_id
             user_sessions[login_dto_str] = session_info
-            
+
             return {
                 "response": confirmation,
                 "bot_type": "role_setup",
                 "thread_id": thread_id,
                 "user_role": user_role,
-                "user_name": user_name,
+                "user_name": username,
                 "sources_used": {
                     "sources_count": 0,
                     "sources": []
                 }
             }
-        
+
         # ✅ FIX: Check if user is already registered
         if not is_registered or user_role == "unknown":
-            # Ask for name and role with helpful examples
-            prompt = """Hello! I'm your GoodBooks ERP assistant. 
-
-To give you the best help, I need to know your name and role. 
-
-"""
+            # Ask only for role — username already known from login_dto
+            prompt = f"Hello {username}! I'm your GoodBooks ERP assistant.\n\nWhich role best describes you?\n\n**developer** | **implementation** | **marketing** | **client** | **admin** | **system admin** | **manager** | **sales**\n\nJust reply with your role to get started."
             
             # Store role request in thread
             await asyncio.to_thread(
@@ -2212,7 +2313,7 @@ To give you the best help, I need to know your name and role.
         # Set thread role if not already set
         if not thread.user_role:
             thread.user_role = user_role
-            history_manager.save_threads()
+            await asyncio.to_thread(history_manager.save_threads)
         
         # Check if it's a greeting
         if is_greeting(user_input):
@@ -2308,53 +2409,44 @@ async def ai_thread_chat(request: ThreadRequest, Login: str = Header(...)):
         parsed_name, parsed_role = parse_name_and_role(user_input)
         
         if parsed_role:
-            # User provided role now
-            user_name = parsed_name or username
+            # Username comes from login_dto — no need to ask for name
             user_role = parsed_role
-            
+
             # ✅ FIX: Save to thread
             thread.user_role = user_role
-            thread.user_name = user_name
-            history_manager.save_threads()
-            
-            logger.info(f"🎭 User set role to: {user_role}, name: {user_name} in thread {thread_id}")
-            
-            confirmation = f"Perfect! I've set your profile:\n• Name: {user_name}\n• Role: {user_role}\n\nNow, how can I help you with GoodBooks ERP today?"
-            
+            thread.user_name = username
+            await asyncio.to_thread(history_manager.save_threads)
+
+            logger.info(f"🎭 User set role to: {user_role}, name: {username} in thread {thread_id}")
+
+            confirmation = f"Got it, {username}! You're set as **{user_role}**.\n\nHow can I help you with GoodBooks ERP today?"
+
             # Store in thread
             await asyncio.to_thread(
                 history_manager.add_message_to_thread,
                 thread_id, user_input, confirmation, "role_setup"
             )
-            
+
             # Update session
             session_info["registered"] = True
             session_info["current_role"] = user_role
-            session_info["user_name"] = user_name
+            session_info["user_name"] = username
             user_sessions[login_dto_str] = session_info
-            
+
             return {
                 "response": confirmation,
                 "bot_type": "role_setup",
                 "thread_id": thread_id,
                 "user_role": user_role,
-                "user_name": user_name,
+                "user_name": username,
                 "sources_used": {
                     "sources_count": 0,
                     "sources": []
                 }
             }
         else:
-            # Still can't parse role, ask again with better format hints
-            prompt = """I couldn't understand your role. Could you please provide it in one of these clearer formats?
-
-**Format examples:**
-1. "Name: Ashok, Role: Developer"
-2. "Ashok, developer"
-3. "I'm Ashok and I'm a developer"
-4. "My name is Ashok, role is developer"
-
-**Available roles:** Developer, Implementation, Marketing, Client, Admin, System Admin, Manager, Sales"""
+            # Still can't parse role, ask again
+            prompt = f"I didn't catch that, {username}. Please reply with just your role:\n\n**developer** | **implementation** | **marketing** | **client** | **admin** | **system admin** | **manager** | **sales**"
             
             await asyncio.to_thread(
                 history_manager.add_message_to_thread,

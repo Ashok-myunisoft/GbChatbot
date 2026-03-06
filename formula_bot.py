@@ -3,24 +3,16 @@ import os
 import logging
 import traceback
 import re
-import pandas as pd
 from datetime import datetime
-# RunPodLLM via shared_resources — ChatOllama no longer used
 from typing import List, Dict
 from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from langchain_community.document_loaders import TextLoader, PyPDFLoader
-from langchain_community.document_loaders import UnstructuredExcelLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
 from fastapi.middleware.cors import CORSMiddleware
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
 from shared_resources import ai_resources
+import db_query
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -213,68 +205,6 @@ app.add_middleware(
 # Use centralized AI resources
 llm = ai_resources.response_llm
 
-def load_csv_as_document(file_path: str) -> Document:
-    try:
-        df = pd.read_csv(file_path)
-        # Convert each formula row into natural language description for better retrieval
-        contents = []
-        for idx, row in df.iterrows():
-            formula_name = row.get("formula_name", f"Formula {idx+1}")
-            formula_expression = row.get("formula_expression", "")
-            description = row.get("description", "")
-            content = (f"Formula Name: {formula_name}\n"
-                       f"Formula Expression: {formula_expression}\n"
-                       f"Description: {description}\n")
-            contents.append(content)
-        full_content = "\n\n".join(contents)
-        return Document(
-            page_content=full_content,
-            metadata={"source": file_path, "type": "csv", "rows": len(df)}
-        )
-    except Exception as e:
-        logger.error(f"Error loading CSV {file_path}: {e}")
-        return None
-
-def load_and_split_documents(documents_dir: str) -> List[Document]:
-    all_docs = []
-    
-    formula_file_path = os.path.join(documents_dir, "MFORMULAFIELD.csv")
-    if os.path.exists(formula_file_path):
-        logger.info(f"Loading file: {formula_file_path}")
-        doc = load_csv_as_document(formula_file_path)
-        if doc:
-            all_docs.append(doc)
-        logger.info(f"Loaded documents from CSV: {formula_file_path}")
-    else:
-        logger.warning(f"{formula_file_path} not found.")
-
-    return all_docs
-
-# Load documents at startup
-all_docs = load_and_split_documents(DOCUMENTS_DIR)
-text_chunks = None
-retriever = None
-
-# Always initialize embeddings regardless of document availability
-embeddings = ai_resources.embeddings
-
-if all_docs:
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1500,
-        chunk_overlap=300,
-        separators=["\n\n", "\n", ".", "!", "?", ",", " ", ""]
-    )
-    text_chunks = text_splitter.split_documents(all_docs)
-    logger.info(f"Loaded {len(all_docs)} docs, split into {len(text_chunks)} chunks.")
-    vectorstore = FAISS.from_documents(text_chunks, embeddings)
-    retriever = vectorstore.as_retriever(
-        search_type="similarity",
-        search_kwargs={"k": 50}
-    )
-    logger.info("FAISS vectorstore and retriever initialized.")
-else:
-    logger.warning("No documents loaded. RAG will not be available.")
-
 # Initialize conversational memory
 conversational_memory = ConversationalMemory(
     MEMORY_VECTORSTORE_PATH,
@@ -419,17 +349,6 @@ CONTEXT-AWARE FORMULA RESPONSE (Synthesize all available information):
 """
 
 
-prompt = prompt_template
-
-if retriever:
-    def format_docs(docs):
-        formatted = []
-        for i, doc in enumerate(docs, 1):
-            content = doc.page_content
-            source = doc.metadata.get('source', 'Unknown source')
-            formatted.append(f"Source {i} ({source}):\n{content}\n")
-        return "\n".join(formatted)
-
 def extract_json_from_answer(answer_text: str):
     try:
         return json.loads(answer_text)
@@ -467,20 +386,15 @@ async def chat(message: Message, Login: str = Header(...)):
         conversational_memory.add_conversation_turn(username, user_input, formatted_answer)
         return {"response": formatted_answer}
     try:
-        if not retriever:
-            return JSONResponse(
-                status_code=503,
-                content={"response": "Formula data is not available. Please ensure the data directory contains your Formula files."}
-            )
-        
         # Retrieve relevant memories from past conversations
         relevant_memories = conversational_memory.retrieve_relevant_memories(username, user_input, k=3)
         formatted_memories = format_memories(relevant_memories)
-        
+
         orchestrator_context = message.context
-        
-        docs = retriever.invoke(user_input)
-        context_str = format_docs(docs) if docs else "No relevant documents found"
+
+        logger.info(f"🔍 Searching formula DuckDB for: {user_input[:100]}")
+        context_str = db_query.query_table("MFORMULAFIELD", user_input)
+        logger.info(f"📚 Formula context: {len(context_str)} chars")
 
         # Get role-specific system prompt
         role_system_prompt = ROLE_SYSTEM_PROMPTS_FORMULA.get(user_role, ROLE_SYSTEM_PROMPTS_FORMULA["client"])
@@ -557,18 +471,13 @@ async def get_memory_stats(Login: str = Header(...)):
         "user_memories": user_memory_count,
         "total_memories": total_memories,
         "memory_enabled": True,
-        "retriever_available": retriever is not None,
-        "documents_loaded": len(all_docs) if all_docs else 0
+        "retriever_available": True,
+        "documents_loaded": -1
     }
 
 @app.get("/gbaiapi/system_status", tags=["Goodbooks Ai Api"])
 async def get_system_status():
-    status = {
-        "rag_available": retriever is not None,
-        "documents_loaded": len(all_docs) if all_docs else 0,
-        "chunks_created": len(text_chunks) if text_chunks else 0,
-    }
-    return status
+    return {"rag_available": True}
 
 if __name__ == "__main__":
     import uvicorn

@@ -2,24 +2,14 @@ import json
 import os
 import logging
 import traceback
-import pandas as pd
-# RunPodLLM via shared_resources — ChatOllama no longer used
 from typing import List, Dict, Any
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from langchain_community.document_loaders import TextLoader, PyPDFLoader
-from langchain_community.document_loaders import UnstructuredExcelLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.documents import Document
 from fastapi.middleware.cors import CORSMiddleware
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
 from shared_resources import ai_resources
 from fastapi import Header
+import db_query
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -55,75 +45,6 @@ app.add_middleware(
 
 # Use centralized AI resources
 llm = ai_resources.response_llm
-
-def load_csv_as_document(file_path: str) -> List[Document]:
-    """Load CSV file and convert to documents"""
-    docs = []
-    try:
-        df = pd.read_csv(file_path, encoding='cp1252')
-
-        # Convert each row to document
-        for idx, row in df.iterrows():
-            row_content = f"Record {idx + 1}:\n"
-            for col in df.columns:
-                row_content += f"- {col}: {row[col]}\n"
-            doc = Document(
-                page_content=row_content,
-                metadata={"source": file_path, "row_index": idx}
-            )
-            docs.append(doc)
-
-        # Add dataset summary
-        summary_content = f"Dataset Summary for {os.path.basename(file_path)}:\n"
-        summary_content += f"Total records: {len(df)}\n"
-        summary_content += f"Columns: {', '.join(df.columns.tolist())}\n\n"
-        summary_content += "Sample data:\n"
-        summary_content += df.head().to_string(index=False)
-
-        summary_doc = Document(
-            page_content=summary_content,
-            metadata={"source": file_path, "type": "summary"}
-        )
-        docs.append(summary_doc)
-
-    except Exception as e:
-        logger.error(f"Error loading CSV {file_path}: {e}")
-
-    return docs
-
-def load_and_split_documents(documents_dir: str) -> List[Document]:
-    all_docs = []
-    
-    project_file_path = os.path.join(documents_dir, "MFILE.csv")
-    if os.path.exists(project_file_path):
-        logger.info(f"Loading file: {project_file_path}")
-        csv_docs = load_csv_as_document(project_file_path)
-        all_docs.extend(csv_docs)
-        logger.info(f"Loaded {len(csv_docs)} documents from CSV: {project_file_path}")
-    else:
-        logger.warning(f"{project_file_path} not found.")
-
-    return all_docs
-
-# Load documents
-# Always initialize embeddings regardless of document availability
-embeddings = ai_resources.embeddings
-all_docs = load_and_split_documents(DOCUMENTS_DIR)
-text_chunks, retriever = None, None
-
-if all_docs:
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1500,
-        chunk_overlap=300
-    )
-    text_chunks = text_splitter.split_documents(all_docs)
-    logger.info(f"Loaded {len(all_docs)} docs, split into {len(text_chunks)} chunks.")
-
-    vectorstore = FAISS.from_documents(text_chunks, embeddings)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 50})
-    logger.info("FAISS retriever ready.")
-else:
-    logger.warning("No documents loaded. RAG not available.")
 
 # Role-based system prompts for project bot
 ROLE_SYSTEM_PROMPTS_PROJECT = {
@@ -253,26 +174,10 @@ Response:
 """
 
 
-prompt = ChatPromptTemplate.from_template(prompt_template)
-
-if retriever:
-    chain = (
-        {
-            "context": lambda x: retriever.invoke(x["question"]),
-            "question": lambda x: x["question"],
-            "history": lambda x: x["history"],
-            "orchestrator_context": lambda x: x["orchestrator_context"]
-        }
-        | prompt
-        | llm
-        | StrOutputParser()
-    )
-
 @app.post("/gbaiapi/Project File-chat", tags=["Goodbooks Ai Api"])
 async def project_chat(message: Message, Login: str = Header(...)):
     user_input = message.content.strip()
 
-    # Parse login header
     try:
         login_dto = json.loads(Login)
         username = login_dto.get("UserName", "anonymous")
@@ -291,48 +196,34 @@ async def project_chat(message: Message, Login: str = Header(...)):
         history_str = ""
         orchestrator_context = message.context
 
-        if retriever:
-            # Get role-specific system prompt
-            role_system_prompt = ROLE_SYSTEM_PROMPTS_PROJECT.get(user_role, ROLE_SYSTEM_PROMPTS_PROJECT["client"])
+        logger.info(f"🔍 Searching project DuckDB for: {user_input[:100]}")
+        context_str = db_query.query_table("MFILE", user_input)
+        logger.info(f"📚 Project context: {len(context_str)} chars")
 
-            # Extract cross-bot context from orchestrator_context if available
-            cross_bot_context = ""
-            if orchestrator_context and "=== Cross-Bot Context" in orchestrator_context:
-                # Extract the cross-bot context section
-                cross_bot_start = orchestrator_context.find("=== Cross-Bot Context")
-                if cross_bot_start != -1:
-                    cross_bot_end = orchestrator_context.find("===", cross_bot_start + 1)
-                    if cross_bot_end == -1:
-                        cross_bot_context = orchestrator_context[cross_bot_start:]
-                    else:
-                        cross_bot_context = orchestrator_context[cross_bot_start:cross_bot_end]
-                # Remove cross-bot context from orchestrator_context to avoid duplication
-                orchestrator_context = orchestrator_context.replace(cross_bot_context, "").strip()
+        role_system_prompt = ROLE_SYSTEM_PROMPTS_PROJECT.get(user_role, ROLE_SYSTEM_PROMPTS_PROJECT["client"])
 
-            # Update the chain with role-specific prompt
-            role_prompt = ChatPromptTemplate.from_template(prompt_template.replace("{role_system_prompt}", role_system_prompt))
-            role_chain = (
-                {
-                    "context": lambda x: retriever.invoke(x["question"]),
-                    "question": lambda x: x["question"],
-                    "history": lambda x: x["history"],
-                    "orchestrator_context": lambda x: x["orchestrator_context"],
-                    "cross_bot_context": lambda x: x["cross_bot_context"]
-                }
-                | role_prompt
-                | llm
-                | StrOutputParser()
-            )
-            answer = role_chain.invoke({
-                "question": user_input,
-                "history": history_str,
-                "orchestrator_context": orchestrator_context,
-                "cross_bot_context": cross_bot_context if cross_bot_context else "No related context from other bots"
-            })
-        else:
-            fallback_prompt = f"Only answer based on data context. Human: {user_input}\nAssistant:"
-            raw = llm.invoke(fallback_prompt)
-            answer = raw.content if hasattr(raw, 'content') else str(raw)
+        cross_bot_context = ""
+        if orchestrator_context and "=== Cross-Bot Context" in orchestrator_context:
+            cross_bot_start = orchestrator_context.find("=== Cross-Bot Context")
+            if cross_bot_start != -1:
+                cross_bot_end = orchestrator_context.find("===", cross_bot_start + 1)
+                if cross_bot_end == -1:
+                    cross_bot_context = orchestrator_context[cross_bot_start:]
+                else:
+                    cross_bot_context = orchestrator_context[cross_bot_start:cross_bot_end]
+            orchestrator_context = orchestrator_context.replace(cross_bot_context, "").strip()
+
+        prompt_text = prompt_template.format(
+            role_system_prompt=role_system_prompt,
+            cross_bot_context=cross_bot_context if cross_bot_context else "No related context from other bots",
+            orchestrator_context=orchestrator_context if orchestrator_context else "No prior context",
+            context=context_str,
+            history=history_str,
+            question=user_input
+        )
+
+        raw = llm.invoke(prompt_text)
+        answer = raw.content if hasattr(raw, 'content') else str(raw)
 
         cleaned_answer = clean_response(answer)
         formatted_answer = format_as_points(cleaned_answer)
@@ -353,12 +244,7 @@ async def project_chat(message: Message, Login: str = Header(...)):
 
 @app.get("/gbaiapi/health", tags=["System"])
 async def health_check():
-    return {
-        "status": "healthy",
-        "documents_loaded": len(all_docs) if all_docs else 0,
-        "chunks_created": len(text_chunks) if text_chunks else 0,
-        "retriever_available": retriever is not None
-    }
+    return {"status": "healthy"}
 
 if __name__ == "__main__":
     import uvicorn
