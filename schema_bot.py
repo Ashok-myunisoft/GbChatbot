@@ -106,23 +106,29 @@ Use the database schema information below as the ONLY source of truth:
 Previous conversation context:
 {history}
 
+[CRITICAL CONSTRAINTS — READ BEFORE ANYTHING ELSE]
+⚠ You have NO ability to execute code, run queries, load data, or call any functions.
+⚠ Do NOT write Python code, SQL scripts, or loader commands under any circumstances.
+⚠ Do NOT suggest that data needs to be "loaded" or "initialized".
+⚠ ALL data available to you is ALREADY provided in [DATABASE SCHEMA CONTEXT] above.
+⚠ If the data is not present in that context — say so. Do not fabricate or simulate retrieval.
+
 [INTENT DETECTION — REQUIRED FIRST STEP]
 Before answering, silently classify the user's request into ONE of these two types:
 
-TYPE A — DATA RETRIEVAL (user wants actual records or values from the database):
+TYPE A — DATA RETRIEVAL (user wants actual records or values):
   Trigger words: list, show, get, fetch, give me, display, find, retrieve, all, what is the [field] of
   Examples: "list all EMPLOYEE_NAME from MEMPLOYEE", "show all tables", "get all records", "what is the moduleId of Finance"
-  → ACTION: Present the actual data rows from [DATABASE SCHEMA CONTEXT] directly as a table or numbered list.
-             Do NOT explain structure. Do NOT describe what the table contains. Just output the data.
+  → ACTION: Look inside [DATABASE SCHEMA CONTEXT] and present whatever rows or values are already there,
+             formatted as a table or numbered list. Do NOT explain structure. Just output the data.
+  → If [DATABASE SCHEMA CONTEXT] is empty or has no matching rows, respond EXACTLY:
+             "No data found for this request in the available context."
 
 TYPE B — SCHEMA / STRUCTURE EXPLANATION (user wants to understand table design):
   Trigger words: what columns, what fields, describe, structure of, definition of, what does this table contain
   Examples: "what columns are in MEMPLOYEE?", "describe the MREPORT table", "what fields does MFILE have?"
-  → ACTION: Explain the table columns, data types, relationships, and purpose.
-
-ANTI-HALLUCINATION RULE:
-  If [DATABASE SCHEMA CONTEXT] contains no matching data rows for a TYPE A request, respond:
-  "I cannot retrieve data from the database for this request." — Never fabricate records or values.
+  → ACTION: Explain the table columns, data types, relationships, and purpose from [DATABASE SCHEMA CONTEXT].
+  → If [DATABASE SCHEMA CONTEXT] is empty, respond: "Schema information is not available for this table."
 
 [REASONING GUIDELINES]
 - Understand the user's intent using orchestrator context and conversation history

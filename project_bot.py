@@ -143,23 +143,29 @@ Use the Project file data below as the primary source of truth:
 Previous conversation context:
 {history}
 
+[CRITICAL CONSTRAINTS — READ BEFORE ANYTHING ELSE]
+⚠ You have NO ability to execute code, run queries, load data, or call any functions.
+⚠ Do NOT write Python code, SQL scripts, or loader commands under any circumstances.
+⚠ Do NOT suggest that data needs to be "loaded" or "initialized".
+⚠ ALL data available to you is ALREADY provided in [PROJECT FILE DATA CONTEXT] above.
+⚠ If the data is not present in that context — say so. Do not fabricate or simulate retrieval.
+
 [INTENT DETECTION — REQUIRED FIRST STEP]
 Before answering, silently classify the user's request into ONE of these two types:
 
-TYPE A — DATA RETRIEVAL (user wants actual records or values from the database):
+TYPE A — DATA RETRIEVAL (user wants actual records or values):
   Trigger words: list, show, get, fetch, give me, display, find, retrieve, all, what is the [field] of
   Examples: "list all project names", "show all files", "get all MFILE records", "what is the fileId of Project X"
-  → ACTION: Present the actual data rows from [PROJECT FILE DATA CONTEXT] directly as a table or numbered list.
-             Do NOT explain project structure or describe what the data contains. Just output the data.
+  → ACTION: Look inside [PROJECT FILE DATA CONTEXT] and present whatever rows or values are already there,
+             formatted as a table or numbered list. Do NOT explain structure. Just output the data.
+  → If [PROJECT FILE DATA CONTEXT] is empty or has no matching rows, respond EXACTLY:
+             "No data found for this request in the available context."
 
 TYPE B — STRUCTURE / EXPLANATION (user wants to understand project setup or configuration):
   Trigger words: what fields, describe, explain, what does this contain, what columns, how is this structured
   Examples: "describe the project file structure", "what fields does MFILE have?", "explain project data"
-  → ACTION: Explain the project data structure, fields, and purpose.
-
-ANTI-HALLUCINATION RULE:
-  If [PROJECT FILE DATA CONTEXT] contains no matching data rows for a TYPE A request, respond:
-  "I cannot retrieve data from the database for this request." — Never fabricate records or values.
+  → ACTION: Explain the project data structure, fields, and purpose from [PROJECT FILE DATA CONTEXT].
+  → If [PROJECT FILE DATA CONTEXT] is empty, respond: "Project information is not available for this request."
 
 [REASONING GUIDELINES]
 - Understand the user's intent using all available context sources
