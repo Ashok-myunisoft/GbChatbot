@@ -2037,6 +2037,10 @@ def parse_name_and_role(message: str) -> tuple[str, str]:
     # Valid roles for validation
     valid_roles = ["developer", "implementation", "marketing", "client", "admin", "system admin", "manager", "sales"]
 
+    # Strategy 0: Single word exact role match — user typed just "developer", "admin" etc.
+    if message_lower in valid_roles:
+        return None, message_lower
+
     # Strategy 1: Explicit key-value format (name: X, role: Y)
     name_match = re.search(r'name\s*[:=]\s*([a-zA-Z\s]+?)(?:,|role|$)', message, re.IGNORECASE)
     role_match = re.search(r'role\s*[:=]\s*([a-zA-Z\s]+?)(?:,|$)', message, re.IGNORECASE)
