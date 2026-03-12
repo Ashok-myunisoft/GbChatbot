@@ -250,11 +250,12 @@ INFORMATION HIERARCHY & UTILIZATION
 ────────────────────────────────────────
 CRITICAL CONSTRAINTS — READ BEFORE ANYTHING ELSE
 ────────────────────────────────────────
-⚠ You have NO ability to execute code, run queries, load data, or call any functions.
-⚠ Do NOT write Python code, SQL scripts, or loader commands under any circumstances.
-⚠ Do NOT suggest that data needs to be "loaded" or "initialized".
-⚠ ALL data available to you is ALREADY provided in REPORT KNOWLEDGE BASE above.
-⚠ If the data is not present in that context — say so. Do not fabricate or simulate retrieval.
+⚠ The data in REPORT KNOWLEDGE BASE has ALREADY been fetched from MSSQL by the backend — present it directly to the user.
+⚠ NEVER say "run this query", "use this SQL", "execute this in your database", or ask the user to run anything manually.
+⚠ Do NOT write Python code or loader commands under any circumstances.
+⚠ Do NOT suggest that data needs to be "loaded" or "initialized" — it is already loaded.
+⚠ If the data is not present in REPORT KNOWLEDGE BASE — say so. Do not fabricate or simulate retrieval.
+⚠ Never show SQL queries in your response unless the user explicitly asks (e.g. "give me the SQL", "show the query", "write a query").
 
 ────────────────────────────────────────
 INTENT DETECTION — REQUIRED FIRST STEP
@@ -264,10 +265,12 @@ Before answering, silently classify the user's request into ONE of these two typ
 TYPE A — DATA RETRIEVAL (user wants actual records or values):
   Trigger words: list, show, get, fetch, give me, display, find, retrieve, all, what is the [field] of
   Examples: "list all report names", "show all MREPORT records", "get report IDs", "what is the reportId of Sales"
-  → ACTION: Look inside REPORT KNOWLEDGE BASE and present whatever rows or values are already there,
-             formatted as a table or numbered list. Do NOT explain structure. Just output the data.
   → If REPORT KNOWLEDGE BASE is empty or has no matching rows, respond EXACTLY:
              "No data found for this request in the available context."
+  → ACTION: Read the fetched data in the context carefully. Extract ONLY the rows and fields
+    that directly answer the user's specific question. Do NOT dump all rows or all columns.
+    Present the relevant information clearly. If the user asked for a specific item, show only
+    that item's details. If the user asked for a list, show only the relevant fields they asked for.
 
 TYPE B — STRUCTURE / EXPLANATION (user wants to understand reports or capabilities):
   Trigger words: what columns, what fields, describe, explain, what does this report show, how does, what is the purpose
@@ -347,6 +350,7 @@ async def report_chat(message: Message, Login: str = Header(...)):
     try:
         logger.info(f"🔍 Searching report DuckDB for: {user_input[:100]}")
         context_str = db_query.query_table("MREPORT", user_input)
+        context_str = context_str[:8000]  # Truncate to prevent GPU OOM on RunPod
         logger.info(f"📚 Report context: {len(context_str)} chars")
 
         role_system_prompt = ROLE_SYSTEM_PROMPTS_REPORT.get(user_role, ROLE_SYSTEM_PROMPTS_REPORT["client"])

@@ -22,8 +22,8 @@ Your identity and style:
 - When the schema contains table names, column names, data types, or keys — state them explicitly and exactly
 - Format schema data as structured lists or tables — developers need precision, not summaries
 - Discuss relationships, indexes, constraints, and integration points with full technical depth
-- Suggest SQL queries or implementation approaches when they help answer the question
-- Mention code examples, SQL DDL, and database best practices when relevant
+- Only show SQL if the user explicitly asks (e.g. "give me the SQL", "show the query", "write a query") — otherwise present the already-fetched data directly
+- Mention database best practices and explain query logic when relevant, but do NOT output raw SQL unless asked
 
 Remember: Be exact. Developers need precise table names, field names, data types, and relationships — never summarize away technical details.""",
 
@@ -107,11 +107,12 @@ Previous conversation context:
 {history}
 
 [CRITICAL CONSTRAINTS — READ BEFORE ANYTHING ELSE]
-⚠ You have NO ability to execute code, run queries, load data, or call any functions.
-⚠ Do NOT write Python code, SQL scripts, or loader commands under any circumstances.
-⚠ Do NOT suggest that data needs to be "loaded" or "initialized".
-⚠ ALL data available to you is ALREADY provided in [DATABASE SCHEMA CONTEXT] above.
-⚠ If the data is not present in that context — say so. Do not fabricate or simulate retrieval.
+⚠ The data in [DATABASE SCHEMA CONTEXT] has ALREADY been fetched from MSSQL by the backend — present it directly to the user.
+⚠ NEVER say "run this query", "use this SQL", "execute this in your database", or ask the user to run anything manually.
+⚠ Do NOT write Python code or loader commands under any circumstances.
+⚠ Do NOT suggest that data needs to be "loaded" or "initialized" — it is already loaded.
+⚠ If the data is not present in [DATABASE SCHEMA CONTEXT] — say so. Do not fabricate or simulate retrieval.
+⚠ Never show SQL queries in your response unless the user explicitly asks (e.g. "give me the SQL", "show the query", "write a query").
 
 [INTENT DETECTION — REQUIRED FIRST STEP]
 Before answering, silently classify the user's request into ONE of these two types:
@@ -119,10 +120,12 @@ Before answering, silently classify the user's request into ONE of these two typ
 TYPE A — DATA RETRIEVAL (user wants actual records or values):
   Trigger words: list, show, get, fetch, give me, display, find, retrieve, all, what is the [field] of
   Examples: "list all EMPLOYEE_NAME from MEMPLOYEE", "show all tables", "get all records", "what is the moduleId of Finance"
-  → ACTION: Look inside [DATABASE SCHEMA CONTEXT] and present whatever rows or values are already there,
-             formatted as a table or numbered list. Do NOT explain structure. Just output the data.
   → If [DATABASE SCHEMA CONTEXT] is empty or has no matching rows, respond EXACTLY:
              "No data found for this request in the available context."
+  → ACTION: Read the fetched data in the context carefully. Extract ONLY the rows and fields
+    that directly answer the user's specific question. Do NOT dump all rows or all columns.
+    Present the relevant information clearly. If the user asked for a specific item, show only
+    that item's details. If the user asked for a list, show only the relevant fields they asked for.
 
 TYPE B — SCHEMA / STRUCTURE EXPLANATION (user wants to understand table design):
   Trigger words: what columns, what fields, describe, structure of, definition of, what does this table contain
@@ -188,8 +191,23 @@ async def chat(message, Login: str = None):
                 )
             }
 
-        # Query DuckDB Unisoft table (loaded from unisoft_all_tables_export.xlsx)
-        context_str       = db_query.query_table("Unisoft", user_input)
+        # Detect the actual MSSQL table name from user input by matching against
+        # real table names in the DB (handles ALL tables, not just M-prefixed ones).
+        # Falls back to None so the LLM gets the full table list as context.
+        target_table = db_query._detect_table_from_question(user_input)
+        if target_table:
+            context_str = db_query.query_table(target_table, user_input)
+        else:
+            all_tables = db_query._get_all_tables()
+            if all_tables:
+                context_str = "Available tables in the database:\n" + "\n".join(all_tables)
+            else:
+                context_str = "No table information available."
+        context_str = context_str[:8000]  # Truncate to prevent GPU OOM on RunPod
+
+        # Always pass fetched data through the LLM so it can extract the exact
+        # relevant answer from the results instead of dumping raw rows to the user.
+
         role_system_prompt = ROLE_SYSTEM_PROMPTS_SCHEMA.get(
             user_role, ROLE_SYSTEM_PROMPTS_SCHEMA["client"]
         )
@@ -224,10 +242,22 @@ async def chat(message, Login: str = None):
 
 
 def is_schema_bot_available() -> bool:
-    """Check if schema bot can serve queries (DuckDB must be initialised)."""
-    import os
-    duckdb_path = os.path.join("/app/data", "knowledge.duckdb")
-    return os.path.exists(duckdb_path)
+    """Check if schema bot can serve queries (MSSQL connection must be reachable)."""
+    try:
+        import pymssql, os
+        from dotenv import load_dotenv
+        load_dotenv()
+        conn = pymssql.connect(
+            server=os.getenv("MSSQL_HOST", "192.168.0.112"),
+            user=os.getenv("MSSQL_USER", "unisoft"),
+            password=os.getenv("MSSQL_PASSWORD", "unisoft@2012"),
+            database=os.getenv("MSSQL_DATABASE", "BASICTEST"),
+            timeout=5
+        )
+        conn.close()
+        return True
+    except Exception:
+        return False
 
 
-logger.info(f"Schema bot initialised — DuckDB source: unisoft_all_tables_export.xlsx")
+logger.info("Schema bot initialised — MSSQL direct connection")

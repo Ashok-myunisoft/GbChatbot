@@ -144,11 +144,12 @@ Previous conversation context:
 {history}
 
 [CRITICAL CONSTRAINTS — READ BEFORE ANYTHING ELSE]
-⚠ You have NO ability to execute code, run queries, load data, or call any functions.
-⚠ Do NOT write Python code, SQL scripts, or loader commands under any circumstances.
-⚠ Do NOT suggest that data needs to be "loaded" or "initialized".
-⚠ ALL data available to you is ALREADY provided in [PROJECT FILE DATA CONTEXT] above.
-⚠ If the data is not present in that context — say so. Do not fabricate or simulate retrieval.
+⚠ The data in [PROJECT FILE DATA CONTEXT] has ALREADY been fetched from MSSQL by the backend — present it directly to the user.
+⚠ NEVER say "run this query", "use this SQL", "execute this in your database", or ask the user to run anything manually.
+⚠ Do NOT write Python code or loader commands under any circumstances.
+⚠ Do NOT suggest that data needs to be "loaded" or "initialized" — it is already loaded.
+⚠ If the data is not present in [PROJECT FILE DATA CONTEXT] — say so. Do not fabricate or simulate retrieval.
+⚠ Never show SQL queries in your response unless the user explicitly asks for the SQL (e.g. "give me the SQL", "show the query", "write a query").
 
 [INTENT DETECTION — REQUIRED FIRST STEP]
 Before answering, silently classify the user's request into ONE of these two types:
@@ -156,10 +157,12 @@ Before answering, silently classify the user's request into ONE of these two typ
 TYPE A — DATA RETRIEVAL (user wants actual records or values):
   Trigger words: list, show, get, fetch, give me, display, find, retrieve, all, what is the [field] of
   Examples: "list all project names", "show all files", "get all MFILE records", "what is the fileId of Project X"
-  → ACTION: Look inside [PROJECT FILE DATA CONTEXT] and present whatever rows or values are already there,
-             formatted as a table or numbered list. Do NOT explain structure. Just output the data.
   → If [PROJECT FILE DATA CONTEXT] is empty or has no matching rows, respond EXACTLY:
              "No data found for this request in the available context."
+  → ACTION: Read the fetched data in the context carefully. Extract ONLY the rows and fields
+    that directly answer the user's specific question. Do NOT dump all rows or all columns.
+    Present the relevant information clearly. If the user asked for a specific item, show only
+    that item's details. If the user asked for a list, show only the relevant fields they asked for.
 
 TYPE B — STRUCTURE / EXPLANATION (user wants to understand project setup or configuration):
   Trigger words: what fields, describe, explain, what does this contain, what columns, how is this structured
@@ -223,6 +226,7 @@ async def project_chat(message: Message, Login: str = Header(...)):
 
         logger.info(f"🔍 Searching project DuckDB for: {user_input[:100]}")
         context_str = db_query.query_table("MFILE", user_input)
+        context_str = context_str[:8000]  # Truncate to prevent GPU OOM on RunPod
         logger.info(f"📚 Project context: {len(context_str)} chars")
 
         role_system_prompt = ROLE_SYSTEM_PROMPTS_PROJECT.get(user_role, ROLE_SYSTEM_PROMPTS_PROJECT["client"])

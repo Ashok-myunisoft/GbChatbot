@@ -1579,12 +1579,12 @@ class AIOrchestrationAgent:
         
         # Report bot keywords
         report_keywords = [
-            'report', 'analyze', 'analysis', 'chart', 'graph', 'data', 
+            'report', 'analyze', 'analysis', 'chart', 'graph',
             'dashboard', 'visualize', 'show me data', 'statistics', 'stats',
             'metric', 'kpi', 'performance', 'trend', 'summary', 'breakdown',
             'export', 'generate report', 'view report', 'display data',
-            'show chart', 'create graph', 'table', 'listing', 'history of',
-            'details of', 'ledger', 'balance sheet', 'p&l', 'profit', 'loss'
+            'show chart', 'create graph', 'listing', 'history of',
+            'ledger', 'balance sheet', 'p&l', 'profit', 'loss'
         ]
         if any(word in question_lower for word in report_keywords):
             logger.info("🚀 Fast route: report")
@@ -1592,17 +1592,28 @@ class AIOrchestrationAgent:
         
         # Menu bot keywords
         menu_keywords = [
-            'menu', 'navigate', 'where is', 'find screen', 'interface', 
+            'menu', 'navigate', 'where is', 'find screen', 'interface',
             'how to access', 'location of', 'where can i', 'how do i find',
             'show me how to get to', 'navigation', 'screen', 'page',
-            'section', 'tab', 'button', 'option', 'find the', 'locate',
+            'button', 'option', 'find the', 'locate',
             'path to', 'go to', 'how to open', 'where to find', 'accessing',
-            'shortcut', 'ui', 'module location'
+            'shortcut', 'module location'
         ]
         if any(word in question_lower for word in menu_keywords):
             logger.info("🚀 Fast route: menu")
             return "menu"
         
+        # Structure/schema questions always go to schema bot, even for project-related tables
+        # e.g. "what fields does MFILE have?" must not be stolen by project keywords
+        structure_patterns = [
+            'what fields', 'what columns', 'fields does', 'columns does',
+            'fields in', 'columns in', 'structure of', 'definition of',
+            'schema of', 'what does this table'
+        ]
+        if any(pattern in question_lower for pattern in structure_patterns):
+            logger.info("🚀 Fast route: schema (structure question)")
+            return "schema"
+
         # Project bot keywords
         project_keywords = [
             'project', 'project file', 'project report', 'project document',
@@ -1614,23 +1625,50 @@ class AIOrchestrationAgent:
             logger.info("🚀 Fast route: project")
             return "project"
 
-        # Schema bot keywords
+        # MSSQL table name detection — route to the correct bot by table name.
+        # Only match ALL-CAPS M-prefixed words (e.g. MEMPLOYEE, MREPORT, MMENU) to avoid
+        # false matches on regular lowercase words like "menus", "more", "model".
+        import re as _re
+        table_hit = _re.search(r'\b(M[A-Z]{2,})\b', question)   # search original case
+        if table_hit:
+            tname = table_hit.group(1)
+            if tname in ('MREPORT',):
+                logger.info(f"🚀 Fast route: report (table {tname})")
+                return "report"
+            elif tname in ('MMENU',):
+                logger.info(f"🚀 Fast route: menu (table {tname})")
+                return "menu"
+            elif tname in ('MFORMULAFIELD', 'MFORMULA'):
+                logger.info(f"🚀 Fast route: formula (table {tname})")
+                return "formula"
+            elif tname in ('MFILE', 'MPROJECT'):
+                logger.info(f"🚀 Fast route: project (table {tname})")
+                return "project"
+            else:
+                # MEMPLOYEE, MMODULE, MUSER, MROLE, etc. → schema
+                logger.info(f"🚀 Fast route: schema (table {tname})")
+                return "schema"
+
+        # Schema bot keywords — structural and data-fetch queries
         schema_keywords = [
             'column', 'columns', 'field', 'fields', 'table', 'tables',
             'schema', 'database schema', 'db schema', 'table structure',
             'table definition', 'what columns', 'what fields', 'list tables',
             'list columns', 'show tables', 'show columns', 'unisoft',
-            'data model', 'entity', 'primary key', 'foreign key'
+            'data model', 'entity', 'primary key', 'foreign key',
+            'get all', 'list all', 'fetch all', 'show all', 'display all',
+            'all records', 'all rows', 'all entries',
+            'give me', 'show me', 'find me', 'fetch me'
         ]
         if any(word in question_lower for word in schema_keywords):
             logger.info("🚀 Fast route: schema")
             return "schema"
 
-        # General bot keywords (to avoid routing LLM for common generic questions)
+        # General bot keywords — NOTE: 'employee' removed to avoid stealing DB queries
         general_keywords = [
             'what is', 'who is', 'tell me about', 'explain', 'describe',
             'help with', 'how does', 'info on', 'company', 'goodbooks',
-            'features', 'modules', 'support', 'contact', 'employee',
+            'features', 'modules', 'support', 'contact',
             'leave policy', 'hr', 'it', 'office'
         ]
         if any(word in question_lower for word in general_keywords):
@@ -1672,14 +1710,17 @@ class AIOrchestrationAgent:
             
             if intent not in valid_intents:
                 logger.warning(f"⚠️ Invalid AI intent '{intent}', analyzing question structure")
-                if has_numbers := any(char.isdigit() for char in question):
+                question_lower = question.lower()
+                if any(char.isdigit() for char in question):
                     intent = "formula"
-                elif any(word in question.lower() for word in ['what', 'who', 'tell me', 'explain', 'describe']):
-                    intent = "general"
-                elif any(word in question.lower() for word in ['show', 'display', 'view']):
+                elif any(word in question_lower for word in ['table', 'column', 'field', 'schema', 'record', 'row', 'list all', 'get all', 'fetch all', 'show all', 'all records']):
+                    intent = "schema"
+                elif any(word in question_lower for word in ['show', 'display', 'view', 'report', 'chart', 'graph']):
                     intent = "report"
-                elif any(word in question.lower() for word in ['where', 'find', 'locate']):
+                elif any(word in question_lower for word in ['where', 'find', 'locate', 'navigate', 'menu']):
                     intent = "menu"
+                elif any(word in question_lower for word in ['what', 'who', 'tell me', 'explain', 'describe']):
+                    intent = "general"
                 else:
                     intent = "general"
                 logger.info(f"📊 Fallback analysis selected: {intent}")
@@ -1695,12 +1736,14 @@ class AIOrchestrationAgent:
                 question_lower = question.lower()
                 if any(char.isdigit() for char in question):
                     fallback = "formula"
+                elif any(word in question_lower for word in ['table', 'column', 'field', 'schema', 'record', 'row', 'list all', 'get all', 'fetch all', 'show all', 'all records']):
+                    fallback = "schema"
+                elif any(word in question_lower for word in ['show', 'display', 'view', 'see', 'report', 'chart']):
+                    fallback = "report"
+                elif any(word in question_lower for word in ['where', 'find', 'locate', 'access', 'navigate', 'menu']):
+                    fallback = "menu"
                 elif any(word in question_lower for word in ['what', 'who', 'tell', 'explain', 'describe', 'about']):
                     fallback = "general"
-                elif any(word in question_lower for word in ['show', 'display', 'view', 'see']):
-                    fallback = "report"
-                elif any(word in question_lower for word in ['where', 'find', 'locate', 'access']):
-                    fallback = "menu"
                 else:
                     fallback = "general"
             logger.info(f"🔍 Timeout fallback route: {fallback}")
@@ -1903,6 +1946,18 @@ For example: "Name: John, Role: developer" """
             context = build_conversational_context(username, question, thread_id, thread_isolation=False)
 
         logger.info(f"📚 Retrieved {len(recent_memories)} contextual memories")
+
+        # Detect "try again" / "retry" — re-use the previous question and intent
+        retry_phrases = {"try again", "retry", "try once more", "please retry", "try that again", "again"}
+        if question.lower().strip() in retry_phrases and thread_id:
+            thread = history_manager.get_thread(thread_id)
+            if thread and thread.messages:
+                last_msg = thread.messages[-1]
+                prev_question = last_msg.get("user_message", question)
+                prev_bot = last_msg.get("bot_type", "general")
+                logger.info(f"🔄 Retry detected — replaying question: '{prev_question}' with bot: {prev_bot}")
+                question = prev_question
+                context = build_conversational_context(username, question, thread_id, thread_isolation=True)
 
         logger.info("🎯 Detecting intent...")
         intent = await self.detect_intent_with_ai(question, context)
@@ -2980,7 +3035,8 @@ async def startup_event():
             warm_bot(FormulaBot(), "formula"),
             warm_bot(ReportBot(), "report"),
             warm_bot(MenuBot(), "menu"),
-            warm_bot(ProjectBot(), "project")
+            warm_bot(ProjectBot(), "project"),
+            warm_bot(SchemaBot(), "schema")
         )
 
         # --------------------------------------------------
