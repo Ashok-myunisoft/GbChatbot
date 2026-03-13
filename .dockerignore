@@ -1,27 +1,37 @@
-# Git
-.git
-.gitignore
-
-# Virtual environment
-venv/
-.venv/
+# Secrets — never bake into the image
+.env
 
 # Python cache
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.pyd
 
-# IDE and OS specific
-.vscode/
+# Virtual environments
+.venv/
+venv/
+
+# Local vectorstore data (mount via volume instead)
+memory_vectorstore_formula/
+memory_vectorstore_report/
+conversational_memory_vectorstore/
+menu_memory_vectorstore/
+
+# Data files (mount via volume instead)
+data/
+
+# Dev / editor artefacts
+.git/
+.gitignore
+*.md
+.DS_Store
 .idea/
-*.DS_Store
+.vscode/
 
-# Environment variables
-.env
-
-# Docker files
+# Docker files (no need to copy into image)
 Dockerfile
 docker-compose.yml
 
-# CRITICAL: Ignore large data and vector stores
-conversational_memory_vectorstore/
-menu_memory_vectorstore/
+# Temp / log files
+*.log
+*.tmp
