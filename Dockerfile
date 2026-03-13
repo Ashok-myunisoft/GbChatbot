@@ -5,6 +5,10 @@ FROM python:3.10-slim
 
 # ─────────────────────────────────────────────
 # System dependencies
+#   - curl, gnupg, apt-transport-https : needed to add Microsoft ODBC repo
+#   - unixodbc-dev                     : required by pyodbc
+#   - freetds-dev, freetds-bin         : required by pymssql
+#   - gcc, g++, build-essential        : compile C extensions (pymssql, faiss, etc.)
 # ─────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
         curl \
@@ -20,13 +24,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         g++ \
         build-essential \
     && \
-    # Microsoft MSSQL ODBC 17 driver
+    # ── Microsoft MSSQL ODBC 17 driver ───────────────────────────────────
     curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
         | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg && \
-    curl -fsSL https://packages.microsoft.com/config/debian/12/prod.list \
+    curl -fsSL https://packages.microsoft.com/config/debian/11/prod.list \
         -o /etc/apt/sources.list.d/mssql-release.list && \
     apt-get update && \
     ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql17 && \
+    # ── Allow TLS 1.0/1.1 for older on-premise MSSQL servers ─────────────
+    # Debian 11 OpenSSL enforces TLSv1.2 minimum by default.
+    # Older MSSQL servers only support TLS 1.0 — lower the floor so the
+    # SSL handshake succeeds (unsupported protocol error fix).
+    sed -i 's/MinProtocol = TLSv1.2/MinProtocol = TLSv1/g' /etc/ssl/openssl.cnf && \
+    sed -i 's/CipherString = DEFAULT@SECLEVEL=2/CipherString = DEFAULT@SECLEVEL=1/g' /etc/ssl/openssl.cnf && \
+    # ── Cleanup ──────────────────────────────────────────────────────────
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ─────────────────────────────────────────────
@@ -35,7 +46,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # ─────────────────────────────────────────────
-# Python dependencies
+# Python dependencies (separate layer for cache)
 # ─────────────────────────────────────────────
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
@@ -43,6 +54,8 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 # ─────────────────────────────────────────────
 # Application code
+# (secrets / .env are NOT baked in — supply via
+#  docker-compose env_file or runtime --env-file)
 # ─────────────────────────────────────────────
 COPY . .
 
