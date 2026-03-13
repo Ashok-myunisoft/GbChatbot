@@ -38,7 +38,7 @@ def _get_engine():
     global _engine
     if _engine is None:
         conn_str = (
-                f"DRIVER={{ODBC Driver 18 for SQL Server}};"  # CHANGE THE DRIVER NAME
+                f"DRIVER={{ODBC Driver 17 for SQL Server}};"  # CHANGE THE DRIVER NAME
                 f"SERVER={MSSQL_HOST};"
                 f"DATABASE={MSSQL_DATABASE};"
                 f"UID={MSSQL_USER};"
