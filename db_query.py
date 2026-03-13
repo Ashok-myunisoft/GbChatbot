@@ -43,7 +43,7 @@ def _get_engine():
             f"DATABASE={MSSQL_DATABASE};"
             f"UID={MSSQL_USER};"
             f"PWD={MSSQL_PASSWORD};"
-            f"Encrypt=no;"
+            f"Encrypt=yes;"
             f"TrustServerCertificate=yes;"
         )
         url = f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(conn_str)}"
