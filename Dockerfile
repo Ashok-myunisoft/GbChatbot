@@ -1,12 +1,17 @@
 # ─────────────────────────────────────────────
-# Base image (Debian 10 → allows old TLS)
+# Base image
 # ─────────────────────────────────────────────
 FROM python:3.10-buster
+
+# Fix Debian 10 archived repo
+RUN sed -i 's/deb.debian.org/archive.debian.org/g' /etc/apt/sources.list && \
+    sed -i 's/security.debian.org/archive.debian.org/g' /etc/apt/sources.list && \
+    apt-get -o Acquire::Check-Valid-Until=false update
 
 # ─────────────────────────────────────────────
 # System dependencies
 # ─────────────────────────────────────────────
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get install -y --no-install-recommends \
         curl \
         gnupg \
         apt-transport-https \
@@ -21,7 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ─────────────────────────────────────────────
-# Install Microsoft ODBC Driver 17
+# Install Microsoft ODBC Driver
 # ─────────────────────────────────────────────
 RUN curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - && \
     curl https://packages.microsoft.com/config/debian/10/prod.list \
