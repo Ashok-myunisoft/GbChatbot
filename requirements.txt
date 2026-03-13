@@ -17,3 +17,6 @@ psycopg2-binary
 # --- Structured knowledge base ---
 duckdb
 openpyxl
+# --- MSSQL direct connection ---
+pymssql
+pyodbc
