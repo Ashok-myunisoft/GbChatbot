@@ -1,8 +1,7 @@
 # ─────────────────────────────────────────────
-# Base image
+# Base image - Upgraded to Debian 12 (Bookworm)
 # ─────────────────────────────────────────────
-# MUST be a modern image like bullseye (Debian 11) or newer
-FROM python:3.10-bullseye
+FROM python:3.11-bookworm
 
 # ─────────────────────────────────────────────
 # System dependencies
@@ -19,22 +18,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc \
         g++ \
         build-essential \
-        # Explicitly install OpenSSL
         openssl \
         libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # ─────────────────────────────────────────────
-# Install Microsoft ODBC Driver
+# Install Microsoft ODBC Driver 18
 # ─────────────────────────────────────────────
-# MUST use the correct repo for the new base image (debian/11)
+# Updated to use the Debian 12 repo and msodbcsql18
 RUN curl https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /etc/apt/trusted.gpg.d/microsoft.gpg && \
-    curl https://packages.microsoft.com/config/debian/11/prod.list > /etc/apt/sources.list.d/mssql-release.list && \
+    curl https://packages.microsoft.com/config/debian/12/prod.list > /etc/apt/sources.list.d/mssql-release.list && \
     apt-get update && \
-    ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql17 mssql-tools && \
+    ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 mssql-tools18 && \
     rm -rf /var/lib/apt/lists/*
 
-ENV PATH="$PATH:/opt/mssql-tools/bin"
+# Set the path for mssql-tools18
+ENV PATH="$PATH:/opt/mssql-tools18/bin"
 
 WORKDIR /app
 

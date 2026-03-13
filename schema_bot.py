@@ -274,7 +274,9 @@ def is_schema_bot_available() -> bool:
             f"DATABASE={os.getenv('MSSQL_DATABASE', 'UNISOFTTEST')};"
             f"UID={os.getenv('MSSQL_USER', 'developer')};"
             f"PWD={os.getenv('MSSQL_PASSWORD', 'devuser@123')};"
-            f"Encrypt=yes;TrustServerCertificate=yes;"
+            f"Encrypt=yes;"
+            f"TrustServerCertificate=yes;"
+            f"TLS=1.2;"  # <--- ADD THIS LINE
         )
         conn = pyodbc.connect(conn_str, timeout=5)
         conn.close()
