@@ -27,10 +27,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # ── Microsoft MSSQL ODBC 18 driver ───────────────────────────────────
     curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
         | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg && \
-    curl -fsSL https://packages.microsoft.com/config/debian/12/prod.list \
+    curl -fsSL https://packages.microsoft.com/config/debian/11/prod.list \
         -o /etc/apt/sources.list.d/mssql-release.list && \
     apt-get update && \
-    ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 && \
+    ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql17 && \
     # ── Cleanup ──────────────────────────────────────────────────────────
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
