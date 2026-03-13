@@ -148,7 +148,7 @@ Previous conversation context:
 ⚠ NEVER say "run this query", "use this SQL", "execute this in your database", or ask the user to run anything manually.
 ⚠ Do NOT write Python code or loader commands under any circumstances.
 ⚠ Do NOT suggest that data needs to be "loaded" or "initialized" — it is already loaded.
-⚠ If the data is not present in [PROJECT FILE DATA CONTEXT] — say so. Do not fabricate or simulate retrieval.
+⚠ If the data is not present in [PROJECT FILE DATA CONTEXT] — respond EXACTLY: "No data found for this request in the available context." Do NOT list column names. Do NOT invent project names. Do NOT generate any content from your training knowledge.
 ⚠ Never show SQL queries in your response unless the user explicitly asks for the SQL (e.g. "give me the SQL", "show the query", "write a query").
 
 [INTENT DETECTION — REQUIRED FIRST STEP]

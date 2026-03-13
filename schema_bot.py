@@ -195,12 +195,33 @@ async def chat(message, Login: str = None):
         # real table names in the DB (handles ALL tables, not just M-prefixed ones).
         # Falls back to None so the LLM gets the full table list as context.
         target_table = db_query._detect_table_from_question(user_input)
-        if target_table:
+
+        # TYPE B detection: column/describe questions should get schema context, not row data
+        type_b_keywords = ['column', 'columns', 'field', 'fields', 'describe', 'structure', 'definition', 'what does this table']
+        is_type_b = any(kw in user_input.lower() for kw in type_b_keywords)
+
+        if target_table and is_type_b:
+            # For schema questions, return column list from INFORMATION_SCHEMA
+            cols = db_query._get_columns(target_table)
+            if cols:
+                context_str = f"Table: {target_table}\nColumns ({len(cols)} total):\n" + "\n".join(f"  - {c}" for c in cols)
+            else:
+                context_str = f"No column information available for table '{target_table}'."
+        elif target_table:
             context_str = db_query.query_table(target_table, user_input)
         else:
             all_tables = db_query._get_all_tables()
             if all_tables:
-                context_str = "Available tables in the database:\n" + "\n".join(all_tables)
+                # Filter out garbage/test tables — keep GoodBooks ERP tables only
+                import re as _re
+                filtered = [
+                    t for t in all_tables
+                    if len(t) >= 4
+                    and not t.upper().startswith(('DUMP', 'BULK_', 'Z_', 'TR_', 'APARNA', 'TEMP', 'billtemp', 'chargedetail'))
+                    and not _re.match(r'^[A-Za-z]{1,3}\d*$', t)  # removes AA, AG1, ABC, ABC1, etc.
+                ]
+                table_list = filtered if len(filtered) > 10 else all_tables
+                context_str = "Available tables in the database:\n" + "\n".join(table_list)
             else:
                 context_str = "No table information available."
         context_str = context_str[:8000]  # Truncate to prevent GPU OOM on RunPod
@@ -244,16 +265,18 @@ async def chat(message, Login: str = None):
 def is_schema_bot_available() -> bool:
     """Check if schema bot can serve queries (MSSQL connection must be reachable)."""
     try:
-        import pymssql, os
+        import pyodbc, os
         from dotenv import load_dotenv
         load_dotenv()
-        conn = pymssql.connect(
-            server=os.getenv("MSSQL_HOST", "192.168.0.112"),
-            user=os.getenv("MSSQL_USER", "unisoft"),
-            password=os.getenv("MSSQL_PASSWORD", "unisoft@2012"),
-            database=os.getenv("MSSQL_DATABASE", "BASICTEST"),
-            timeout=5
+        conn_str = (
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={os.getenv('MSSQL_HOST', '183.82.250.223')};"
+            f"DATABASE={os.getenv('MSSQL_DATABASE', 'UNISOFTTEST')};"
+            f"UID={os.getenv('MSSQL_USER', 'developer')};"
+            f"PWD={os.getenv('MSSQL_PASSWORD', 'devuser@123')};"
+            f"Encrypt=yes;TrustServerCertificate=yes;"
         )
+        conn = pyodbc.connect(conn_str, timeout=5)
         conn.close()
         return True
     except Exception:

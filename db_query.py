@@ -24,27 +24,34 @@ _table_cache_ts: float = 0.0
 _TABLE_CACHE_TTL: int = 300  # seconds (5 minutes)
 
 # MSSQL connection details from .env
-MSSQL_HOST     = os.getenv("MSSQL_HOST", "192.168.0.112")
-MSSQL_USER     = os.getenv("MSSQL_USER", "unisoft")
-MSSQL_PASSWORD = os.getenv("MSSQL_PASSWORD", "unisoft@2012")
-MSSQL_DATABASE = os.getenv("MSSQL_DATABASE", "BASICTEST")
+MSSQL_HOST     = os.getenv("MSSQL_HOST", "183.82.250.223")
+MSSQL_USER     = os.getenv("MSSQL_USER", "developer")
+MSSQL_PASSWORD = os.getenv("MSSQL_PASSWORD", "devuser@123")
+MSSQL_DATABASE = os.getenv("MSSQL_DATABASE", "UNISOFTTEST")
 
 # Singleton engine — created once, reused across all calls (enables connection pooling)
 _engine = None
 
 
 def _get_engine():
-    """Return the shared SQLAlchemy engine for MSSQL via pymssql (singleton)."""
+    """Return the shared SQLAlchemy engine for MSSQL via pyodbc (singleton)."""
     global _engine
     if _engine is None:
-        password = urllib.parse.quote_plus(MSSQL_PASSWORD)
-        url = f"mssql+pymssql://{MSSQL_USER}:{password}@{MSSQL_HOST}/{MSSQL_DATABASE}"
+        conn_str = (
+            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"SERVER={MSSQL_HOST};"
+            f"DATABASE={MSSQL_DATABASE};"
+            f"UID={MSSQL_USER};"
+            f"PWD={MSSQL_PASSWORD};"
+            f"Encrypt=yes;"
+            f"TrustServerCertificate=yes;"
+        )
+        url = f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(conn_str)}"
         _engine = create_engine(
             url,
-            connect_args={"timeout": 30},
             pool_size=5,
             max_overflow=10,
-            pool_pre_ping=True  # test connection before using it from pool
+            pool_pre_ping=True
         )
     return _engine
 
@@ -142,7 +149,9 @@ def _detect_table_from_question(user_question: str) -> "str | None":
                 partial_hits.append((len(tbl_up), tbl_orig))
 
     if partial_hits:
-        partial_hits.sort(key=lambda x: x[0])   # shortest table name = most specific
+        # Sort by: length ASC, then prefer M-prefixed tables (GoodBooks master tables)
+        # e.g. MEMPLOYEE wins over EMPLOYEES, MMENU wins over MENUS, MREPORT wins over REPORTS
+        partial_hits.sort(key=lambda x: (x[0], 0 if x[1].upper().startswith('M') else 1, x[1]))
         return partial_hits[0][1]
 
     return None
@@ -164,11 +173,14 @@ def _generate_sql(llm, table_name: str, col_names: list, user_question: str, max
         f"- Only use SELECT statements — no INSERT, UPDATE, DELETE, DROP, EXEC\n"
         f"- Use TOP {max_rows} instead of LIMIT\n"
         f"- Column selection: Read the user question carefully and select ONLY the columns needed to answer it.\n"
-        f"  * If the user asks for specific fields (e.g. names, codes, dates, amounts) — select only those columns.\n"
-        f"  * If the user asks for all data, all records, or does not specify columns — use SELECT *.\n"
-        f"  * Examples: 'employee names and codes' → SELECT TOP N [EMPLOYEENAME],[EMPLOYECODE] FROM [...]\n"
-        f"              'all employees' or 'all records' → SELECT TOP N * FROM [...]\n"
-        f"              'show sales amount by date' → SELECT TOP N [SALEDATE],[AMOUNT] FROM [...]\n"
+        f"  * RULE 1: If the user asks for 'all X names', 'all X codes', 'all X titles', 'all X values' — select ONLY that single name/code/title column. Do NOT use SELECT *.\n"
+        f"    Examples: 'give me all employee names' → SELECT TOP N [EMPLOYEENAME] FROM [MEMPLOYEE]\n"
+        f"              'list all project names'     → SELECT TOP N [PROJECTNAME] FROM [MPROJECT]\n"
+        f"              'show all report names'      → SELECT TOP N [REPORTNAME] FROM [MREPORT]\n"
+        f"  * RULE 2: If the user asks for specific multiple fields (e.g. names and codes) — select only those columns.\n"
+        f"    Example: 'employee names and codes' → SELECT TOP N [EMPLOYEENAME],[EMPLOYECODE] FROM [...]\n"
+        f"  * RULE 3: If the user asks for all data, all records, all columns, or does not specify — use SELECT *.\n"
+        f"    Example: 'get all data from MEMPLOYEE' → SELECT TOP N * FROM [MEMPLOYEE]\n"
         f"- Row filtering: If the user asks about a specific item, keyword, or entity, add a WHERE clause to filter rows.\n"
         f"  * Extract the key search term from the question and filter using LIKE.\n"
         f"  * Examples: 'save endpoint for leave request' → WHERE CAST([WEBSERVICENAME] AS NVARCHAR(MAX)) LIKE '%leave%' OR CAST([URIITEMPLATE] AS NVARCHAR(MAX)) LIKE '%leave%'\n"
