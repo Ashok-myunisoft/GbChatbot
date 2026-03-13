@@ -19,16 +19,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         unixodbc-dev \
         freetds-dev \
         freetds-bin \
-        tdsodbc \
         gcc \
         g++ \
         build-essential \
     && \
     # ── Microsoft MSSQL ODBC 17 driver ───────────────────────────────────
+    # Download and register the Microsoft signing key
     curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
         | gpg --dearmor -o /usr/share/keyrings/microsoft-prod.gpg && \
-    curl -fsSL https://packages.microsoft.com/config/debian/11/prod.list \
-        -o /etc/apt/sources.list.d/mssql-release.list && \
+    # Manually write the sources entry with explicit signed-by so apt trusts it
+    echo "deb [arch=amd64 signed-by=/usr/share/keyrings/microsoft-prod.gpg] https://packages.microsoft.com/debian/11/prod bullseye main" \
+        > /etc/apt/sources.list.d/mssql-release.list && \
     apt-get update && \
     ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql17 && \
     # ── Allow TLS 1.0/1.1 for older on-premise MSSQL servers ─────────────
