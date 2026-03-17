@@ -1,7 +1,7 @@
 """
 db_query.py
 
-Utility for querying the GoodBooks ERP MSSQL database directly.
+Utility for querying the GoodBooks ERP PostgreSQL database directly.
 Used by menu_bot, report_bot, formula_bot, project_bot, schema_bot.
 """
 
@@ -9,9 +9,8 @@ import os
 import time
 import logging
 import re
-import urllib.parse
 import pandas as pd
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text as sa_text
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -23,33 +22,23 @@ _table_cache: list = []
 _table_cache_ts: float = 0.0
 _TABLE_CACHE_TTL: int = 300  # seconds (5 minutes)
 
-# MSSQL connection details from .env
-MSSQL_HOST     = os.getenv("MSSQL_HOST", "183.82.250.223")
-MSSQL_USER     = os.getenv("MSSQL_USER", "developer")
-MSSQL_PASSWORD = os.getenv("MSSQL_PASSWORD", "devuser@123")
-MSSQL_DATABASE = os.getenv("MSSQL_DATABASE", "UNISOFTTEST")
+# PostgreSQL connection string from .env (falls back to hardcoded default)
+PG_URL = os.getenv(
+    "PG_URL",
+    "postgresql://gbuser:aidev123@217.217.249.121:5432/IMPSYS_backup"
+)
+PG_DATABASE = os.getenv("PG_DATABASE", "IMPSYS_backup")
 
 # Singleton engine — created once, reused across all calls (enables connection pooling)
 _engine = None
 
 
 def _get_engine():
-    """Return the shared SQLAlchemy engine for MSSQL via pyodbc (singleton)."""
+    """Return the shared SQLAlchemy engine for PostgreSQL (singleton)."""
     global _engine
     if _engine is None:
-        conn_str = (
-                f"DRIVER={{ODBC Driver 17 for SQL Server}};"  # CHANGE THE DRIVER NAME
-                f"SERVER={MSSQL_HOST};"
-                f"DATABASE={MSSQL_DATABASE};"
-                f"UID={MSSQL_USER};"
-                f"PWD={MSSQL_PASSWORD};"
-                f"Encrypt=yes;"
-                f"TrustServerCertificate=yes;"
-                f"TLS=1.2;"
-            )
-        url = f"mssql+pyodbc:///?odbc_connect={urllib.parse.quote_plus(conn_str)}"
         _engine = create_engine(
-            url,
+            PG_URL,
             pool_size=5,
             max_overflow=10,
             pool_pre_ping=True
@@ -67,34 +56,38 @@ def _get_llm():
 
 
 def _get_columns(table_name: str) -> list:
-    """Get column names for a table from MSSQL INFORMATION_SCHEMA."""
+    """Get column names for a table from PostgreSQL information_schema."""
     try:
         engine = _get_engine()
-        df = pd.read_sql(
-            f"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
-            f"WHERE TABLE_NAME = '{table_name}' ORDER BY ORDINAL_POSITION",
-            engine
+        query = sa_text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'public' AND table_name = :tname "
+            "ORDER BY ordinal_position"
         )
-        return df["COLUMN_NAME"].tolist()
+        with engine.connect() as conn:
+            df = pd.read_sql(query, conn, params={"tname": table_name.lower()})
+        return df["column_name"].tolist()
     except Exception as e:
         logger.warning(f"Could not get columns for table '{table_name}': {e}")
         return []
 
 
 def _get_all_tables() -> list:
-    """Return all user table names from MSSQL INFORMATION_SCHEMA (cached for TTL seconds)."""
+    """Return all user table names from PostgreSQL information_schema (cached for TTL seconds)."""
     global _table_cache, _table_cache_ts
     now = time.time()
     if _table_cache and (now - _table_cache_ts) < _TABLE_CACHE_TTL:
         return _table_cache
     try:
         engine = _get_engine()
-        df = pd.read_sql(
-            "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
-            "WHERE TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME",
-            engine
+        query = sa_text(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'public' AND table_type = 'BASE TABLE' "
+            "ORDER BY table_name"
         )
-        _table_cache = df["TABLE_NAME"].tolist()
+        with engine.connect() as conn:
+            df = pd.read_sql(query, conn)
+        _table_cache = df["table_name"].tolist()
         _table_cache_ts = now
         return _table_cache
     except Exception as e:
@@ -104,7 +97,7 @@ def _get_all_tables() -> list:
 
 def _detect_table_from_question(user_question: str) -> "str | None":
     """
-    Find the most likely MSSQL table name mentioned in the user question.
+    Find the most likely PostgreSQL table name mentioned in the user question.
 
     Strategy:
       1. Exact match — any word in the question exactly equals a table name (case-insensitive).
@@ -128,7 +121,6 @@ def _detect_table_from_question(user_question: str) -> "str | None":
             return tables_upper[word.upper()]
 
     # Pass 2 — partial match (meaningful words only)
-    # Exclude words that are generic schema/query vocabulary or too short
     skip_words = {
         'table', 'tables', 'column', 'columns', 'record', 'records',
         'field', 'fields', 'value', 'values', 'database', 'schema',
@@ -139,19 +131,17 @@ def _detect_table_from_question(user_question: str) -> "str | None":
     partial_hits = []
     for word in words_sorted:
         w_up = word.upper()
-        if len(w_up) < 5:                        # skip very short words
+        if len(w_up) < 5:
             continue
-        if word.lower() in skip_words:           # skip generic schema words
+        if word.lower() in skip_words:
             continue
         for tbl_up, tbl_orig in tables_upper.items():
             if w_up in tbl_up:
                 partial_hits.append((len(tbl_up), tbl_orig))
-            elif w_up.endswith('S') and w_up[:-1] in tbl_up:   # plural: employees→employee
+            elif w_up.endswith('S') and w_up[:-1] in tbl_up:
                 partial_hits.append((len(tbl_up), tbl_orig))
 
     if partial_hits:
-        # Sort by: length ASC, then prefer M-prefixed tables (GoodBooks master tables)
-        # e.g. MEMPLOYEE wins over EMPLOYEES, MMENU wins over MENUS, MREPORT wins over REPORTS
         partial_hits.sort(key=lambda x: (x[0], 0 if x[1].upper().startswith('M') else 1, x[1]))
         return partial_hits[0][1]
 
@@ -159,48 +149,52 @@ def _detect_table_from_question(user_question: str) -> "str | None":
 
 
 def _generate_sql(llm, table_name: str, col_names: list, user_question: str, max_rows: int) -> str:
-    """Ask the LLM to generate a T-SQL SELECT query for MSSQL."""
+    """Ask the LLM to generate a PostgreSQL SELECT query."""
     if col_names:
-        schema_info = f"Table: [{table_name}]\nColumns: {', '.join(col_names)}"
+        schema_info = f"Table: {table_name}\nColumns: {', '.join(col_names)}"
     else:
-        # No specific table — LLM must infer the table from the user question
-        schema_info = f"Database: {MSSQL_DATABASE} (Microsoft SQL Server)"
+        schema_info = f"Database: {PG_DATABASE} (PostgreSQL)"
 
     sql_prompt = (
-        f"You are a SQL expert for Microsoft SQL Server (T-SQL). Generate a single valid T-SQL SELECT query.\n\n"
+        f"You are a SQL expert for PostgreSQL. Generate a single valid PostgreSQL SELECT query.\n\n"
         f"Schema info:\n{schema_info}\n\n"
         f"User question: {user_question}\n\n"
         f"Rules:\n"
-        f"- Only use SELECT statements — no INSERT, UPDATE, DELETE, DROP, EXEC\n"
-        f"- Use TOP {max_rows} instead of LIMIT\n"
+        f"- Only use SELECT statements — no INSERT, UPDATE, DELETE, DROP\n"
+        f"- Use LIMIT {max_rows} at the end of the query (PostgreSQL does NOT support TOP)\n"
+        f"- IMPORTANT: All table and column names in this PostgreSQL database are LOWERCASE. Never use uppercase or quoted identifiers.\n"
+        f"  * Correct:   SELECT employeename FROM memployee LIMIT N\n"
+        f"  * Incorrect: SELECT \"EMPLOYEENAME\" FROM \"MEMPLOYEE\" LIMIT N\n"
         f"- Column selection: Read the user question carefully and select ONLY the columns needed to answer it.\n"
         f"  * RULE 1: If the user asks for 'all X names', 'all X codes', 'all X titles', 'all X values' — select ONLY that single name/code/title column. Do NOT use SELECT *.\n"
-        f"    Examples: 'give me all employee names' → SELECT TOP N [EMPLOYEENAME] FROM [MEMPLOYEE]\n"
-        f"              'list all project names'     → SELECT TOP N [PROJECTNAME] FROM [MPROJECT]\n"
-        f"              'show all report names'      → SELECT TOP N [REPORTNAME] FROM [MREPORT]\n"
-        f"  * RULE 2: If the user asks for specific multiple fields (e.g. names and codes) — select only those columns.\n"
-        f"    Example: 'employee names and codes' → SELECT TOP N [EMPLOYEENAME],[EMPLOYECODE] FROM [...]\n"
+        f"    Examples: 'give me all employee names' → SELECT employeename FROM memployee LIMIT N\n"
+        f"              'list all project names'     → SELECT projectname FROM mproject LIMIT N\n"
+        f"              'show all report names'      → SELECT reportname FROM mreport LIMIT N\n"
+        f"  * RULE 2: If the user asks for specific multiple fields — select only those columns.\n"
+        f"    Example: 'employee names and codes' → SELECT employeename, employecode FROM memployee LIMIT N\n"
         f"  * RULE 3: If the user asks for all data, all records, all columns, or does not specify — use SELECT *.\n"
-        f"    Example: 'get all data from MEMPLOYEE' → SELECT TOP N * FROM [MEMPLOYEE]\n"
+        f"    Example: 'get all data from memployee' → SELECT * FROM memployee LIMIT N\n"
         f"- Row filtering: If the user asks about a specific item, keyword, or entity, add a WHERE clause to filter rows.\n"
-        f"  * Extract the key search term from the question and filter using LIKE.\n"
-        f"  * Examples: 'save endpoint for leave request' → WHERE CAST([WEBSERVICENAME] AS NVARCHAR(MAX)) LIKE '%leave%' OR CAST([URIITEMPLATE] AS NVARCHAR(MAX)) LIKE '%leave%'\n"
-        f"              'employee named John' → WHERE CAST([EMPLOYEENAME] AS NVARCHAR(MAX)) LIKE '%John%'\n"
-        f"              'reports in finance module' → WHERE CAST([REPORTNAME] AS NVARCHAR(MAX)) LIKE '%finance%'\n"
+        f"  * Extract the key search term from the question and filter using ILIKE (case-insensitive).\n"
+        f"  * Examples: 'employee named John' → WHERE CAST(employeename AS TEXT) ILIKE '%John%'\n"
+        f"              'reports in finance module' → WHERE CAST(reportname AS TEXT) ILIKE '%finance%'\n"
         f"  * Only fetch ALL rows without a WHERE clause if the user asks for everything with no specific filter.\n"
-        f"- Use LIKE for text searches (MSSQL LIKE is case-insensitive by default)\n"
-        f"- ALWAYS wrap every column with CAST([col] AS NVARCHAR(MAX)) when using LIKE or = with a string value — do this for ALL columns without exception, because any column could be tinyint, int, or bit even if its name looks like text (e.g. REPORTVIEWTYPE, STATUS, TYPE are often integers).\n"
-        f"  * Correct:   WHERE CAST([REPORTVIEWTYPE] AS NVARCHAR(MAX)) LIKE '%leave%'\n"
-        f"  * Incorrect: WHERE [REPORTVIEWTYPE] = 'LEAVE BALANCE'  ← never do this\n"
-        f"- Use square brackets [ ] around table and column names\n"
-        f"- NEVER use parameterized queries or placeholder variables (e.g. @SearchTerm, @param, ?, :param) — always embed literal values directly in the WHERE clause\n"
-        f"  * Correct:   WHERE CAST([NAME] AS NVARCHAR(MAX)) LIKE '%leave%'\n"
-        f"  * Incorrect: WHERE CAST([NAME] AS NVARCHAR(MAX)) LIKE '%' + @SearchTerm + '%'\n"
+        f"- Use ILIKE for case-insensitive text searches (PostgreSQL)\n"
+        f"- ALWAYS wrap every column with CAST(col AS TEXT) when using ILIKE or = with a string value\n"
+        f"  * Correct:   WHERE CAST(reportviewtype AS TEXT) ILIKE '%leave%'\n"
+        f"  * Incorrect: WHERE reportviewtype = 'LEAVE BALANCE'\n"
+        f"- Do NOT use double quotes around table or column names\n"
+        f"- Use COALESCE instead of ISNULL\n"
+        f"- Use NOW() instead of GETDATE()\n"
+        f"- NEVER use parameterized queries or placeholder variables — always embed literal values directly\n"
+        f"  * Correct:   WHERE CAST(\"NAME\" AS TEXT) ILIKE '%leave%'\n"
+        f"  * Incorrect: WHERE CAST(\"NAME\" AS TEXT) ILIKE '%' || $1 || '%'\n"
         f"- Return ONLY the raw SQL query — no explanation, no markdown, no code fences\n\n"
         f"SQL:"
     )
     raw = llm.invoke(sql_prompt)
     sql = raw.content if hasattr(raw, "content") else str(raw)
+    logger.info(f"LLM raw output for SQL generation: {repr(sql[:300])}")
     # Unwrap {'output': '...'} or {"output": "..."} format if LLM returned it wrapped
     if sql.strip().startswith("{") and ("'output'" in sql or '"output"' in sql):
         try:
@@ -212,35 +206,50 @@ def _generate_sql(llm, table_name: str, col_names: list, user_question: str, max
             pass
     # Strip markdown code fences if present
     sql = re.sub(r"```(?:sql)?", "", sql, flags=re.IGNORECASE).replace("```", "").strip()
-    # Convert LIMIT N → TOP N for MSSQL compatibility
-    sql = _fix_mssql_syntax(sql)
+    # Convert any T-SQL TOP N → LIMIT N for PostgreSQL compatibility
+    sql = _fix_pg_syntax(sql)
     return sql
 
 
-def _fix_mssql_syntax(sql: str) -> str:
+def _fix_pg_syntax(sql: str) -> str:
     """
-    Convert generic SQL to T-SQL syntax.
-    Handles: LIMIT N  →  TOP N  (MSSQL does not support LIMIT).
+    Convert T-SQL syntax to PostgreSQL syntax.
+    Handles: SELECT TOP N → SELECT ... LIMIT N
     """
-    limit_match = re.search(r'\bLIMIT\s+(\d+)\s*;?\s*$', sql.strip(), re.IGNORECASE)
-    if limit_match:
-        n = limit_match.group(1)
-        # Remove LIMIT clause from end
-        sql = sql[:limit_match.start()].strip().rstrip(';')
-        # Insert TOP N after SELECT DISTINCT, or after plain SELECT
-        if re.search(r'\bSELECT\s+DISTINCT\b', sql, re.IGNORECASE):
-            sql = re.sub(
-                r'\bSELECT\s+DISTINCT\s+',
-                f'SELECT DISTINCT TOP {n} ',
-                sql, count=1, flags=re.IGNORECASE
-            )
-        else:
-            sql = re.sub(
-                r'\bSELECT\s+',
-                f'SELECT TOP {n} ',
-                sql, count=1, flags=re.IGNORECASE
-            )
-        sql = sql.strip() + ';'
+    # Convert TOP N to LIMIT N
+    top_match = re.search(r'\bSELECT\s+(DISTINCT\s+)?TOP\s+(\d+)\s+', sql, re.IGNORECASE)
+    if top_match:
+        n = top_match.group(2)
+        distinct = top_match.group(1) or ""
+        # Remove TOP N from SELECT clause
+        sql = re.sub(
+            r'\bSELECT\s+(?:DISTINCT\s+)?TOP\s+\d+\s+',
+            f'SELECT {distinct}',
+            sql, count=1, flags=re.IGNORECASE
+        ).strip()
+        # Append LIMIT N (remove existing LIMIT first if any)
+        sql = re.sub(r'\bLIMIT\s+\d+\s*;?\s*$', '', sql.strip(), flags=re.IGNORECASE).strip()
+        sql = sql.rstrip(';') + f' LIMIT {n};'
+
+    # Replace square bracket identifiers [col] → lowercase unquoted
+    sql = re.sub(r'\[([^\]]+)\]', lambda m: m.group(1).lower(), sql)
+
+    # Lowercase all double-quoted identifiers "TABLE" → table
+    # PostgreSQL folds unquoted identifiers to lowercase; quoted uppercase names fail
+    sql = re.sub(r'"([^"]+)"', lambda m: m.group(1).lower(), sql)
+
+    # Replace ISNULL( with COALESCE(
+    sql = re.sub(r'\bISNULL\s*\(', 'COALESCE(', sql, flags=re.IGNORECASE)
+
+    # Replace GETDATE() with NOW()
+    sql = re.sub(r'\bGETDATE\s*\(\s*\)', 'NOW()', sql, flags=re.IGNORECASE)
+
+    # Replace NVARCHAR casts: CAST(x AS NVARCHAR(MAX)) → CAST(x AS TEXT)
+    sql = re.sub(r'\bNVARCHAR\s*\(\s*MAX\s*\)', 'TEXT', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bNVARCHAR\s*\(\s*\d+\s*\)', 'TEXT', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bNVARCHAR\b', 'TEXT', sql, flags=re.IGNORECASE)
+    sql = re.sub(r'\bVARCHAR\s*\(\s*MAX\s*\)', 'TEXT', sql, flags=re.IGNORECASE)
+
     return sql
 
 
@@ -268,36 +277,38 @@ def _format_df(df: pd.DataFrame) -> str:
 
 
 def _like_sql(table_name: str, col_names: list, search_term: str, max_rows: int) -> str:
-    """Build a fallback LIKE SQL query for MSSQL from keywords."""
+    """Build a fallback ILIKE SQL query for PostgreSQL from keywords."""
     keywords = [w for w in search_term.split() if len(w) > 2] or [search_term]
+    tbl = table_name.lower()
     word_blocks = []
     for kw in keywords[:6]:
         safe_kw = kw.replace("'", "")
         col_conds = " OR ".join(
-            f"CAST([{col}] AS NVARCHAR(MAX)) LIKE '%{safe_kw}%'"
+            f"CAST({col.lower()} AS TEXT) ILIKE '%{safe_kw}%'"
             for col in col_names
         )
         word_blocks.append(f"({col_conds})")
     where_clause = " OR ".join(word_blocks)
-    return f"SELECT TOP {max_rows} * FROM [{table_name}] WHERE {where_clause}"
+    return f"SELECT * FROM {tbl} WHERE {where_clause} LIMIT {max_rows}"
 
 
 def query_table(table_name: str, search_term: str, max_rows: int = 50) -> str:
     """
-    Query *table_name* in MSSQL using Text-to-SQL (LLM-generated query).
+    Query *table_name* in PostgreSQL using Text-to-SQL (LLM-generated query).
 
     Strategy:
-      1. LLM generates a T-SQL SELECT query from the user question + table schema.
-      2. If LLM query fails or returns no rows, fall back to keyword LIKE search.
-      3. If still no rows, return a TOP 30 sample so the LLM has schema context.
+      1. LLM generates a PostgreSQL SELECT query from the user question + table schema.
+      2. If LLM query fails or returns no rows, fall back to keyword ILIKE search.
+      3. If still no rows, return a LIMIT 30 sample so the LLM has schema context.
 
     Returns a formatted string ready to be injected into an LLM prompt.
     """
     try:
+        # ── Normalize table name to lowercase (PostgreSQL stores names in lowercase)
+        table_name = table_name.lower()
+
         # ── Get column names ───────────────────────────────────────────────────
         col_names = _get_columns(table_name)
-        # col_names may be empty if table_name is a virtual name (e.g. "Unisoft")
-        # In that case the LLM will infer the real table from the user question
 
         df = None
 
@@ -310,32 +321,37 @@ def query_table(table_name: str, search_term: str, max_rows: int = 50) -> str:
 
                 # Safety: block any non-SELECT statements
                 if not generated_sql.strip().upper().startswith("SELECT"):
-                    raise ValueError("Non-SELECT query blocked")
+                    logger.warning(f"Non-SELECT query blocked. LLM output was: {repr(generated_sql[:300])}")
+                    raise ValueError(f"Non-SELECT query blocked: {generated_sql[:100]}")
 
-                # Safety: reject suspiciously long queries (LLM hallucination with too many LIKE conditions)
+                # Safety: reject suspiciously long queries
                 if len(generated_sql) > 5000:
                     raise ValueError(f"Generated SQL too long ({len(generated_sql)} chars) — likely hallucinated")
 
                 engine = _get_engine()
-                df = pd.read_sql(generated_sql, engine)
+                with engine.connect() as conn:
+                    df = pd.read_sql(sa_text(generated_sql), conn)
 
                 if df.empty:
-                    logger.info("Text-to-SQL returned 0 rows — falling back to LIKE")
+                    logger.info("Text-to-SQL returned 0 rows — falling back to ILIKE")
                     df = None
                 else:
                     logger.info(f"Text-to-SQL matched {len(df)} rows")
             except Exception as sql_exc:
-                logger.warning(f"Text-to-SQL failed ({sql_exc}) — falling back to LIKE")
+                logger.warning(
+                    f"Text-to-SQL failed [{type(sql_exc).__name__}]: {sql_exc} — falling back to ILIKE"
+                )
                 df = None
 
-        # ── Step 2: Fallback — keyword LIKE search ─────────────────────────────
+        # ── Step 2: Fallback — keyword ILIKE search ────────────────────────────
         if df is None and col_names:
             try:
                 fallback_sql = _like_sql(table_name, col_names, search_term, max_rows)
                 engine = _get_engine()
-                df = pd.read_sql(fallback_sql, engine)
+                with engine.connect() as conn:
+                    df = pd.read_sql(sa_text(fallback_sql), conn)
             except Exception as like_exc:
-                logger.warning(f"LIKE fallback failed ({like_exc})")
+                logger.warning(f"ILIKE fallback failed [{type(like_exc).__name__}]: {like_exc}")
                 df = None
 
         # ── Step 3: If still empty, return a broad sample ─────────────────────
@@ -343,7 +359,8 @@ def query_table(table_name: str, search_term: str, max_rows: int = 50) -> str:
             if col_names:
                 try:
                     engine = _get_engine()
-                    df = pd.read_sql(f"SELECT TOP 30 * FROM [{table_name}]", engine)
+                    with engine.connect() as conn:
+                        df = pd.read_sql(sa_text(f'SELECT * FROM {table_name.lower()} LIMIT 30'), conn)
                     return (
                         f"No exact matches for '{search_term}' in table '{table_name}'.\n"
                         f"Available data overview ({len(df)} rows shown):\n\n"
@@ -360,5 +377,5 @@ def query_table(table_name: str, search_term: str, max_rows: int = 50) -> str:
         )
 
     except Exception as exc:
-        logger.error(f"MSSQL query error on table '{table_name}': {exc}")
+        logger.error(f"PostgreSQL query error on table '{table_name}': {exc}")
         return f"Error querying table '{table_name}': {exc}"

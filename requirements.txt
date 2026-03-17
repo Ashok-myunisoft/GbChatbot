@@ -14,9 +14,7 @@ jq
 numpy<2.0
 # --- PostgreSQL ---
 psycopg2-binary
+sqlalchemy
 # --- Structured knowledge base ---
 duckdb
 openpyxl
-# --- MSSQL direct connection ---
-pymssql
-pyodbc

@@ -107,7 +107,7 @@ Previous conversation context:
 {history}
 
 [CRITICAL CONSTRAINTS — READ BEFORE ANYTHING ELSE]
-⚠ The data in [DATABASE SCHEMA CONTEXT] has ALREADY been fetched from MSSQL by the backend — present it directly to the user.
+⚠ The data in [DATABASE SCHEMA CONTEXT] has ALREADY been fetched from PostgreSQL by the backend — present it directly to the user.
 ⚠ NEVER say "run this query", "use this SQL", "execute this in your database", or ask the user to run anything manually.
 ⚠ Do NOT write Python code or loader commands under any circumstances.
 ⚠ Do NOT suggest that data needs to be "loaded" or "initialized" — it is already loaded.
@@ -191,7 +191,7 @@ async def chat(message, Login: str = None):
                 )
             }
 
-        # Detect the actual MSSQL table name from user input by matching against
+        # Detect the actual PostgreSQL table name from user input by matching against
         # real table names in the DB (handles ALL tables, not just M-prefixed ones).
         # Falls back to None so the LLM gets the full table list as context.
         target_table = db_query._detect_table_from_question(user_input)
@@ -263,26 +263,15 @@ async def chat(message, Login: str = None):
 
 
 def is_schema_bot_available() -> bool:
-    """Check if schema bot can serve queries (MSSQL connection must be reachable)."""
+    """Check if schema bot can serve queries (PostgreSQL connection must be reachable)."""
     try:
-        import pyodbc, os
-        from dotenv import load_dotenv
-        load_dotenv()
-        conn_str = (
-            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-            f"SERVER={os.getenv('MSSQL_HOST', '183.82.250.223')};"
-            f"DATABASE={os.getenv('MSSQL_DATABASE', 'UNISOFTTEST')};"
-            f"UID={os.getenv('MSSQL_USER', 'developer')};"
-            f"PWD={os.getenv('MSSQL_PASSWORD', 'devuser@123')};"
-            f"Encrypt=yes;"
-            f"TrustServerCertificate=yes;"
-            f"TLS=1.2;"  # <--- ADD THIS LINE
-        )
-        conn = pyodbc.connect(conn_str, timeout=5)
-        conn.close()
+        from db_query import _get_engine
+        engine = _get_engine()
+        with engine.connect() as conn:
+            conn.execute(__import__("sqlalchemy").text("SELECT 1"))
         return True
     except Exception:
         return False
 
 
-logger.info("Schema bot initialised — MSSQL direct connection")
+logger.info("Schema bot initialised — PostgreSQL direct connection")

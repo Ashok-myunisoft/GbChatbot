@@ -32,6 +32,9 @@ data/
 Dockerfile
 docker-compose.yml
 
+# Dev / utility scripts (not needed at runtime)
+db_setup.py
+
 # Temp / log files
 *.log
 *.tmp

@@ -143,7 +143,7 @@ Previous messages in this conversation:
 {history}
 
 [CRITICAL CONSTRAINTS — READ BEFORE ANYTHING ELSE]
-⚠ The data in [MENU CONTEXT] has ALREADY been fetched from MSSQL by the backend — present it directly to the user.
+⚠ The data in [MENU CONTEXT] has ALREADY been fetched from PostgreSQL by the backend — present it directly to the user.
 ⚠ NEVER say "run this query", "use this SQL", "execute this in your database", or ask the user to run anything manually.
 ⚠ Do NOT write Python code or loader commands under any circumstances.
 ⚠ Do NOT suggest that data needs to be "loaded" or "initialized" — it is already loaded.

@@ -1625,7 +1625,7 @@ class AIOrchestrationAgent:
             logger.info("🚀 Fast route: project")
             return "project"
 
-        # MSSQL table name detection — route to the correct bot by table name.
+        # PostgreSQL table name detection — route to the correct bot by table name.
         # Only match ALL-CAPS M-prefixed words (e.g. MEMPLOYEE, MREPORT, MMENU) to avoid
         # false matches on regular lowercase words like "menus", "more", "model".
         import re as _re
@@ -3084,3 +3084,5 @@ if __name__ == "__main__":
     logger.info(f"🚀 Starting FIXED & ENHANCED server on port {port}")
     logger.info("="*80)
     uvicorn.run(app, host="0.0.0.0", port=port)
+
+    
