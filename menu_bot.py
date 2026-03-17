@@ -188,7 +188,8 @@ TYPE B — NAVIGATION / STRUCTURE EXPLANATION (user wants to know how to navigat
 - Avoid unnecessary repetition
 
 [FAIL-SAFE CONDITION]
-If the Menu context does not contain the required information, utilize conversation history and cross-bot context to provide the best possible guidance. If still unable to answer, state what you don't know based on all available information.
+If the Menu context does not contain the required information, respond EXACTLY: "No data found for this request in the available context."
+⚠ NEVER invent, guess, or generate menu names, module names, operation names, or any values that are not explicitly present in [MENU CONTEXT]. Do NOT use your training knowledge to fill in missing data.
 
 [USER QUESTION]
 {question}

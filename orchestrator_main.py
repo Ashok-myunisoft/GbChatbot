@@ -1097,11 +1097,23 @@ class EnhancedMessage:
         self.context = context
 
 def _extract_clean_response(response: str) -> str:
-    """Extract actual content if LLM returned {'output': '...'} wrapped format."""
+    """Extract actual content if LLM returned {'output': '...'} wrapped format.
+    Uses regex so it works even when the string is truncated (ast.literal_eval fails on partial strings).
+    """
     if not response:
         return response
     stripped = response.strip()
     if stripped.startswith("{'output':") or stripped.startswith('{"output":'):
+        # Try regex first — works even on truncated strings
+        match = re.search(r"""['"]output['"]\s*:\s*['"](.+)""", stripped, re.DOTALL)
+        if match:
+            raw = match.group(1)
+            # Remove trailing quote/brace if present (non-truncated case)
+            raw = re.sub(r"""['"]\s*\}?\s*$""", "", raw)
+            # Unescape common escape sequences
+            raw = raw.replace("\\n", "\n").replace("\\t", "\t").replace("\\'", "'").replace('\\"', '"')
+            return raw.strip()
+        # Fallback: try ast.literal_eval for well-formed strings
         try:
             import ast
             parsed = ast.literal_eval(stripped)
@@ -1579,7 +1591,11 @@ class AIOrchestrationAgent:
         has_math_ops = any(op in question_lower for op in ['+', '-', '*', '/', '=', '%'])
         has_formula_keyword = any(word in question_lower for word in formula_keywords)
         
-        if (has_formula_keyword and has_numbers) or has_math_ops:
+        # Also route to formula bot when user explicitly lists/shows formulas (no numbers needed)
+        is_formula_listing = has_formula_keyword and any(
+            w in question_lower for w in ['show', 'list', 'get', 'give', 'all', 'fetch', 'display']
+        )
+        if (has_formula_keyword and has_numbers) or has_math_ops or is_formula_listing:
             logger.info("🚀 Fast route: formula")
             return "formula"
         

@@ -167,19 +167,19 @@ def _generate_sql(llm, table_name: str, col_names: list, user_question: str, max
         f"  * Incorrect: SELECT \"EMPLOYEENAME\" FROM \"MEMPLOYEE\" LIMIT N\n"
         f"- Column selection: Read the user question carefully and select ONLY the columns needed to answer it.\n"
         f"  * RULE 1: If the user asks for 'all X names', 'all X codes', 'all X titles', 'all X values' — select ONLY that single name/code/title column. Do NOT use SELECT *.\n"
-        f"    Examples: 'give me all employee names' → SELECT employeename FROM memployee LIMIT N\n"
-        f"              'list all project names'     → SELECT projectname FROM mproject LIMIT N\n"
-        f"              'show all report names'      → SELECT reportname FROM mreport LIMIT N\n"
+        f"    Examples: 'give me all employee names' → SELECT employeename FROM memployee LIMIT {max_rows}\n"
+        f"              'list all project names'     → SELECT projectname FROM mproject LIMIT {max_rows}\n"
+        f"              'show all report names'      → SELECT reportname FROM mreport LIMIT {max_rows}\n"
         f"  * RULE 2: If the user asks for specific multiple fields — select only those columns.\n"
-        f"    Example: 'employee names and codes' → SELECT employeename, employecode FROM memployee LIMIT N\n"
+        f"    Example: 'employee names and codes' → SELECT employeename, employecode FROM memployee LIMIT {max_rows}\n"
         f"  * RULE 3: If the user asks for all data, all records, all columns, or does not specify — use SELECT *.\n"
-        f"    Example: 'get all data from memployee' → SELECT * FROM memployee LIMIT N\n"
+        f"    Example: 'get all data from memployee' → SELECT * FROM memployee LIMIT {max_rows}\n"
         f"- RULE 4: If the user asks 'show me', 'get all', 'list', 'give me', 'can I get', 'display' without a specific filter value — do NOT add a WHERE clause. Just SELECT the relevant column(s) with LIMIT.\n"
-        f"  * Examples: 'show me the reportname'  → SELECT reportname FROM mreport LIMIT N\n"
-        f"              'get all reports'          → SELECT reportname FROM mreport LIMIT N\n"
-        f"              'can I get reportname'     → SELECT reportname FROM mreport LIMIT N\n"
-        f"              'show me all menus'        → SELECT * FROM mmenu LIMIT N\n"
-        f"              'list all formulas'        → SELECT * FROM mformulafield LIMIT N\n"
+        f"  * Examples: 'show me the reportname'  → SELECT reportname FROM mreport LIMIT {max_rows}\n"
+        f"              'get all reports'          → SELECT reportname FROM mreport LIMIT {max_rows}\n"
+        f"              'can I get reportname'     → SELECT reportname FROM mreport LIMIT {max_rows}\n"
+        f"              'show me all menus'        → SELECT * FROM mmenu LIMIT {max_rows}\n"
+        f"              'list all formulas'        → SELECT * FROM mformulafield LIMIT {max_rows}\n"
         f"- Row filtering: ONLY add a WHERE clause when the user provides a specific filter value (a name, keyword, ID, or category to search for).\n"
         f"  * Extract the key search term from the question and filter using ILIKE (case-insensitive).\n"
         f"  * Examples: 'employee named John'         → WHERE CAST(employeename AS TEXT) ILIKE '%John%'\n"
@@ -193,8 +193,8 @@ def _generate_sql(llm, table_name: str, col_names: list, user_question: str, max
         f"- Use COALESCE instead of ISNULL\n"
         f"- Use NOW() instead of GETDATE()\n"
         f"- NEVER use parameterized queries or placeholder variables — always embed literal values directly\n"
-        f"  * Correct:   WHERE CAST(\"NAME\" AS TEXT) ILIKE '%leave%'\n"
-        f"  * Incorrect: WHERE CAST(\"NAME\" AS TEXT) ILIKE '%' || $1 || '%'\n"
+        f"  * Correct:   WHERE CAST(name AS TEXT) ILIKE '%leave%'\n"
+        f"  * Incorrect: WHERE CAST(name AS TEXT) ILIKE '%' || $1 || '%'\n"
         f"- Return ONLY the raw SQL query — no explanation, no markdown, no code fences\n\n"
         f"SQL:"
     )
@@ -203,13 +203,20 @@ def _generate_sql(llm, table_name: str, col_names: list, user_question: str, max
     logger.info(f"LLM raw output for SQL generation: {repr(sql[:300])}")
     # Unwrap {'output': '...'} or {"output": "..."} format if LLM returned it wrapped
     if sql.strip().startswith("{") and ("'output'" in sql or '"output"' in sql):
-        try:
-            import ast
-            parsed = ast.literal_eval(sql.strip())
-            if isinstance(parsed, dict) and "output" in parsed:
-                sql = str(parsed["output"])
-        except Exception:
-            pass
+        match = re.search(r"""['"]output['"]\s*:\s*['"](.+)""", sql.strip(), re.DOTALL)
+        if match:
+            raw_sql = match.group(1)
+            raw_sql = re.sub(r"""['"]\s*\}?\s*$""", "", raw_sql)
+            raw_sql = raw_sql.replace("\\n", "\n").replace("\\t", "\t").replace("\\'", "'").replace('\\"', '"')
+            sql = raw_sql.strip()
+        else:
+            try:
+                import ast
+                parsed = ast.literal_eval(sql.strip())
+                if isinstance(parsed, dict) and "output" in parsed:
+                    sql = str(parsed["output"])
+            except Exception:
+                pass
     # Strip markdown code fences if present
     sql = re.sub(r"```(?:sql)?", "", sql, flags=re.IGNORECASE).replace("```", "").strip()
     # Convert any T-SQL TOP N → LIMIT N for PostgreSQL compatibility
@@ -317,6 +324,36 @@ def query_table(table_name: str, search_term: str, max_rows: int = 50) -> str:
         col_names = _get_columns(table_name)
 
         df = None
+
+        # ── Pre-check: if question is a pure "list all / show all" with no filter
+        # bypass LLM SQL generation entirely and directly SELECT * — 100% reliable
+        _list_all_patterns = re.compile(
+            r'^\s*(show|list|get|give|fetch|display|can i get|what are)(\s+me|\s+all|\s+the)?\s+'
+            r'(all\s+)?[\w\s]{1,30}$',
+            re.IGNORECASE
+        )
+        _filter_words = re.compile(
+            r'\b(where|filter|named|called|with|by|for|in|of|from|whose|having|like|equal|between|greater|less)\b',
+            re.IGNORECASE
+        )
+        is_list_all_request = (
+            _list_all_patterns.match(search_term.strip()) is not None
+            and not _filter_words.search(search_term)
+        )
+        if is_list_all_request and col_names:
+            logger.info(f"⚡ List-all detected — skipping LLM, running SELECT * directly")
+            try:
+                engine = _get_engine()
+                with engine.connect() as conn:
+                    df = pd.read_sql(sa_text(f'SELECT * FROM {table_name} LIMIT {max_rows}'), conn)
+                if not df.empty:
+                    return (
+                        f"Results from table '{table_name}' ({len(df)} rows):\n\n"
+                        + _format_df(df)
+                    )
+            except Exception as direct_exc:
+                logger.warning(f"Direct SELECT failed: {direct_exc} — falling through to LLM")
+                df = None
 
         # ── Step 1: Try Text-to-SQL ────────────────────────────────────────────
         llm = _get_llm()
