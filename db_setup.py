@@ -123,8 +123,8 @@ def create_tables():
             """)
 
         conn.commit()
-        logger.info("✅ PostgreSQL tables ready.")
-        print("✅ PostgreSQL tables created / verified successfully.")
+        logger.info("PostgreSQL tables ready.")
+        print("PostgreSQL tables created / verified successfully.")
 
     except Exception as e:
         logger.error(f"Failed to create tables: {e}")
