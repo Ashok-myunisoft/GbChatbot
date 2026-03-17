@@ -2291,15 +2291,13 @@ async def ai_role_based_chat(message: Message, Login: str = Header(...)):
         return JSONResponse(status_code=400, content={"response": "Please provide a message"})
 
     try:
-        # Use login_dto as session key to maintain session state across requests
-        login_dto_str = json.dumps(login_dto, sort_keys=True)
-        session_info = user_sessions.get(login_dto_str, {})
-        # ✅ FIX: Remove role from session check - always use from login_dto
-        is_registered = session_info.get("registered", False)
-        
-        # ✅ FIX: ALWAYS create thread for first message
+        # Create new thread first — thread_id is unique per conversation/device
         thread_id = await asyncio.to_thread(history_manager.create_new_thread, username, user_input)
         logger.info(f"📍 Created new thread: {thread_id}")
+
+        # Use thread_id as session key — isolates sessions per device/conversation
+        session_info = user_sessions.get(thread_id, {})
+        is_registered = session_info.get("registered", False)
         
         thread = history_manager.get_thread(thread_id)
         
@@ -2330,7 +2328,7 @@ async def ai_role_based_chat(message: Message, Login: str = Header(...)):
             session_info["current_role"] = user_role
             session_info["user_name"] = username
             session_info["last_thread_id"] = thread_id
-            user_sessions[login_dto_str] = session_info
+            user_sessions[thread_id] = session_info
 
             return {
                 "response": confirmation,
@@ -2448,9 +2446,8 @@ async def ai_thread_chat(request: ThreadRequest, Login: str = Header(...)):
     if not thread_id:
         return JSONResponse(status_code=400, content={"response": "Thread ID is required"})
 
-    # Use login_dto as session key for consistency
-    login_dto_str = json.dumps(login_dto, sort_keys=True)
-    session_info = user_sessions.get(login_dto_str, {})
+    # Use thread_id as session key — isolates sessions per device/conversation
+    session_info = user_sessions.get(thread_id, {})
 
     # Verify thread exists and belongs to user
     thread = history_manager.get_thread(thread_id)
@@ -2490,7 +2487,7 @@ async def ai_thread_chat(request: ThreadRequest, Login: str = Header(...)):
             session_info["registered"] = True
             session_info["current_role"] = user_role
             session_info["user_name"] = username
-            user_sessions[login_dto_str] = session_info
+            user_sessions[thread_id] = session_info
 
             return {
                 "response": confirmation,
@@ -2570,8 +2567,7 @@ async def get_conversation_threads(Login: str = Header(...), limit: int = 50):
         return JSONResponse(status_code=400, content={"response": "Invalid login header"})
     
     threads = history_manager.get_user_threads(username, limit)
-    login_dto_str = json.dumps(login_dto, sort_keys=True)
-    session_info = user_sessions.get(login_dto_str, {})
+    session_info = {}
     
     return {
         "username": username,
