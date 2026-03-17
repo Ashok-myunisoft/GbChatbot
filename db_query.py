@@ -25,7 +25,7 @@ _TABLE_CACHE_TTL: int = 300  # seconds (5 minutes)
 # PostgreSQL connection string from .env (falls back to hardcoded default)
 PG_URL = os.getenv(
     "PG_URL",
-    "postgresql://gbuser:aidev123@217.217.249.121:5432/IMPSYS_backup"
+    "postgresql://gbuser:aidev123@host.docker.internal:5432/IMPSYS_backup"
 )
 PG_DATABASE = os.getenv("PG_DATABASE", "IMPSYS_backup")
 
@@ -174,11 +174,17 @@ def _generate_sql(llm, table_name: str, col_names: list, user_question: str, max
         f"    Example: 'employee names and codes' → SELECT employeename, employecode FROM memployee LIMIT N\n"
         f"  * RULE 3: If the user asks for all data, all records, all columns, or does not specify — use SELECT *.\n"
         f"    Example: 'get all data from memployee' → SELECT * FROM memployee LIMIT N\n"
-        f"- Row filtering: If the user asks about a specific item, keyword, or entity, add a WHERE clause to filter rows.\n"
+        f"- RULE 4: If the user asks 'show me', 'get all', 'list', 'give me', 'can I get', 'display' without a specific filter value — do NOT add a WHERE clause. Just SELECT the relevant column(s) with LIMIT.\n"
+        f"  * Examples: 'show me the reportname'  → SELECT reportname FROM mreport LIMIT N\n"
+        f"              'get all reports'          → SELECT reportname FROM mreport LIMIT N\n"
+        f"              'can I get reportname'     → SELECT reportname FROM mreport LIMIT N\n"
+        f"              'show me all menus'        → SELECT * FROM mmenu LIMIT N\n"
+        f"              'list all formulas'        → SELECT * FROM mformulafield LIMIT N\n"
+        f"- Row filtering: ONLY add a WHERE clause when the user provides a specific filter value (a name, keyword, ID, or category to search for).\n"
         f"  * Extract the key search term from the question and filter using ILIKE (case-insensitive).\n"
-        f"  * Examples: 'employee named John' → WHERE CAST(employeename AS TEXT) ILIKE '%John%'\n"
-        f"              'reports in finance module' → WHERE CAST(reportname AS TEXT) ILIKE '%finance%'\n"
-        f"  * Only fetch ALL rows without a WHERE clause if the user asks for everything with no specific filter.\n"
+        f"  * Examples: 'employee named John'         → WHERE CAST(employeename AS TEXT) ILIKE '%John%'\n"
+        f"              'reports in finance module'   → WHERE CAST(reportname AS TEXT) ILIKE '%finance%'\n"
+        f"  * Words like 'show', 'get', 'list', 'give', 'all', 'me', 'the' are NOT filter values — ignore them.\n"
         f"- Use ILIKE for case-insensitive text searches (PostgreSQL)\n"
         f"- ALWAYS wrap every column with CAST(col AS TEXT) when using ILIKE or = with a string value\n"
         f"  * Correct:   WHERE CAST(reportviewtype AS TEXT) ILIKE '%leave%'\n"
@@ -362,8 +368,7 @@ def query_table(table_name: str, search_term: str, max_rows: int = 50) -> str:
                     with engine.connect() as conn:
                         df = pd.read_sql(sa_text(f'SELECT * FROM {table_name.lower()} LIMIT 30'), conn)
                     return (
-                        f"No exact matches for '{search_term}' in table '{table_name}'.\n"
-                        f"Available data overview ({len(df)} rows shown):\n\n"
+                        f"Data from table '{table_name}' ({len(df)} rows):\n\n"
                         + _format_df(df)
                     )
                 except Exception:

@@ -461,11 +461,13 @@ Respond with ONLY ONE WORD (general, formula, report, menu, project, or schema):
 # ===========================
 OUT_OF_SCOPE_SYSTEM_PROMPT = """You are a GoodBooks ERP assistant speaking to a {role}.
 
-The user asked about something outside GoodBooks ERP scope or you couldn't find the answer.
-
 User question: {question}
 
-Politely explain that you're here to help with GoodBooks ERP and redirect them to relevant GoodBooks features. Keep it brief and appropriate for the {role} role.
+Instructions:
+- If the question is related to ERP, business processes, HR, payroll, accounting, inventory, finance, company management, software features, or GoodBooks modules → answer it helpfully using your ERP knowledge. Do NOT redirect.
+- If the question is completely unrelated to ERP or business software (e.g. sports, entertainment, politics, personal advice) → politely explain you are a GoodBooks ERP assistant and redirect them to relevant GoodBooks features.
+
+Keep the response brief and appropriate for a {role}.
 
 Response:"""
 
@@ -1135,6 +1137,8 @@ class GeneralBotWrapper:
             
             if response:
                 response_lower = response.lower()
+                # Only treat as refusal if the ENTIRE response is a refusal
+                # (not just contains a refusal phrase as part of a longer helpful answer)
                 refusal_patterns = [
                     "i don't have access",
                     "i do not have access",
@@ -1145,8 +1149,10 @@ class GeneralBotWrapper:
                     "i am unable to",
                     "i'm unable to"
                 ]
-                
-                is_refusal = any(pattern in response_lower for pattern in refusal_patterns)
+                is_refusal = (
+                    any(pattern in response_lower for pattern in refusal_patterns)
+                    and len(response.strip()) < 200  # short response = pure refusal, long = partial refusal with useful content
+                )
                 
                 if is_refusal:
                     logger.warning(f"⚠️ General bot returned refusal: {response[:150]}")
