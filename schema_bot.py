@@ -98,10 +98,6 @@ Use ONLY the provided database schema context.
 Historical session context for reference. Do NOT use values from here to answer the current question:
 {orchestrator_context}
 
-[DATABASE SCHEMA CONTEXT]
-Use the database schema information below as the ONLY source of truth:
-{context}
-
 [CONVERSATION HISTORY]
 Previous conversation context:
 {history}
@@ -118,8 +114,9 @@ Previous conversation context:
 Before answering, silently classify the user's request into ONE of these two types:
 
 TYPE A — DATA RETRIEVAL (user wants actual records or values):
-  Trigger words: list, show, get, fetch, give me, display, find, retrieve, all, what is the [field] of
-  Examples: "list all EMPLOYEE_NAME from MEMPLOYEE", "show all tables", "get all records", "what is the moduleId of Finance"
+  Trigger words: list, show, get, fetch, give me, display, find, retrieve, all, what are, what do you have, you have, what is the [field] of
+  Examples: "list all EMPLOYEE_NAME from MEMPLOYEE", "show all tables", "get all records", "what is the moduleId of Finance",
+            "what are the reports you have", "what are the reasons", "get all picklist name"
   → If [DATABASE SCHEMA CONTEXT] is empty or has no matching rows, respond EXACTLY:
              "No data found for this request in the available context."
   → ACTION: The context contains ACTUAL DATA ROWS from the database. Present the VALUES from those rows directly.
@@ -157,6 +154,9 @@ TYPE B — SCHEMA / STRUCTURE EXPLANATION (user wants to understand table design
 - Keep explanations clear, professional, and easy to understand
 - Maintain conversational flow and continuity
 - Adjust technical depth based on the user's role in [ROLE]
+
+[DATABASE SCHEMA CONTEXT — fetched live from PostgreSQL, answer from this only]
+{context}
 
 [USER QUESTION]
 {question}
@@ -229,7 +229,15 @@ async def chat(message, Login: str = None):
                 ]
                 table_list = filtered if filtered else list(dict.fromkeys(all_tables))
                 # Build list and truncate at a complete line boundary — never mid-word
-                header = f"Available tables in the database ({len(table_list)} total):\n"
+                header = (
+                    f"[TABLE LIST ONLY — NO ROW DATA]\n"
+                    f"⚠ This context contains ONLY table names, not actual records.\n"
+                    f"⚠ Do NOT describe what these tables 'contain' or 'represent' — you have no row data.\n"
+                    f"⚠ If the user asked for specific records or values, respond EXACTLY:\n"
+                    f"   'I could not identify which table you mean. Here are the available tables. "
+                    f"Please specify a table name to query.'\n"
+                    f"Available tables in the database ({len(table_list)} total):\n"
+                )
                 lines = table_list
                 result_lines = [header]
                 char_count = len(header)
@@ -260,6 +268,9 @@ async def chat(message, Login: str = None):
             user_role, ROLE_SYSTEM_PROMPTS_SCHEMA["client"]
         )
         orchestrator_context = getattr(message, 'context', '')
+        # Cap orchestrator context — prevents large previous responses from drowning actual data
+        if orchestrator_context and len(orchestrator_context) > 800:
+            orchestrator_context = orchestrator_context[:800] + "\n[...context truncated to prevent prompt pollution...]"
         history_str          = ""
 
         full_prompt = prompt_template.format(

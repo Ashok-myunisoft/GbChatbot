@@ -126,76 +126,25 @@ while maintaining continuity with previous messages and leveraging cross-bot con
 - Do not repeat information unless it adds value
 - Maintain consistent terminology throughout the conversation
 
-[ORCHESTRATOR CONTEXT — BACKGROUND ONLY]
-The following is historical conversation context for reference. Do NOT use values, names, or codes
-from this section to answer the CURRENT question — use only [MENU CONTEXT] for that:
+[PRIOR CONTEXT — BACKGROUND ONLY, do not use as answer source]
 {orchestrator_context}
+Cross-bot: {cross_bot_context}
+History: {history}
 
-[CROSS-BOT CONTEXT — BACKGROUND ONLY]
-Related information from other bots (for reference only — do not apply to current answer):
-{cross_bot_context}
+[RULES]
+- For data/list requests: extract and list the actual values from [MENU DATA] below
+- For navigation requests: give the path/steps from [MENU DATA] below
+- If [MENU DATA] has no answer: respond exactly "No data found for this request"
+- NEVER invent values. NEVER use training knowledge. Use ONLY [MENU DATA]
 
-[MENU CONTEXT]
-Use the Menu information below as the primary source of truth:
+[MENU DATA — fetched live from PostgreSQL, answer from this only]
 {context}
 
-[CONVERSATION HISTORY]
-Previous messages in this conversation:
-{history}
-
-[CRITICAL CONSTRAINTS — READ BEFORE ANYTHING ELSE]
-⚠ The data in [MENU CONTEXT] has ALREADY been fetched from PostgreSQL by the backend — present it directly to the user.
-⚠ NEVER say "run this query", "use this SQL", "execute this in your database", or ask the user to run anything manually.
-⚠ Do NOT write Python code or loader commands under any circumstances.
-⚠ Do NOT suggest that data needs to be "loaded" or "initialized" — it is already loaded.
-⚠ If the data is not present in [MENU CONTEXT] — say so. Do not fabricate or simulate retrieval.
-⚠ Never show SQL queries in your response unless the user explicitly asks for the SQL (e.g. "give me the SQL", "show the query", "write a query").
-
-[INTENT DETECTION — REQUIRED FIRST STEP]
-Before answering, silently classify the user's request into ONE of these two types:
-
-TYPE A — DATA RETRIEVAL (user wants actual records or values):
-  Trigger words: list, show, get, fetch, give me, display, find, retrieve, all, what is the [field] of
-  Examples: "list all menu items", "show all menus", "get all module names", "what is the menuId of Sales"
-  → If [MENU CONTEXT] is empty or has no matching rows, respond EXACTLY:
-             "No data found for this request in the available context."
-  → ACTION: Read the fetched data in the context carefully. Extract ONLY the rows and fields
-    that directly answer the user's specific question. Do NOT dump all rows or all columns.
-    Present the relevant information clearly. If the user asked for a specific item, show only
-    that item's details. If the user asked for a list, show only the relevant fields they asked for.
-
-TYPE B — NAVIGATION / STRUCTURE EXPLANATION (user wants to know how to navigate or what a menu does):
-  Trigger words: where is, how to access, how do I find, navigate to, locate, what is the path to, explain
-  Examples: "where is the customer screen?", "how do I access invoices?", "how to navigate to reports?"
-  → ACTION: Provide navigation steps, paths, and screen location guidance from [MENU CONTEXT].
-  → If [MENU CONTEXT] is empty, respond: "Navigation information is not available for this request."
-
-[REASONING GUIDELINES]
-- First, understand the user's intent using all available context sources
-- Carefully analyze the provided Menu context before responding
-- If the user asks "what menus exist" or "list menus" — enumerate EVERY menu item found in the context explicitly
-- If the user asks about a specific menu item (name, path, access, screen location) — extract and state the exact details from the context
-- If the user asks for a specific value (menu ID, module code, path) — find it and state it precisely
-- Cross-reference with cross-bot context for more complete navigation guidance
-- If the answer is partially available, respond only with supported information
-- Never assume or invent missing Menu details
-
-[OUTPUT GUIDELINES]
-- When listing menus or navigation paths, use a clear list format — one item per line
-- When giving a specific value (ID, path, screen name), state it explicitly and exactly as it appears in the data
-- Provide a clear, concise, and professional response
-- Adjust technical depth based on the user's role: developers need paths/codes, clients need plain navigation steps
-- Maintain natural conversational flow
-- Avoid unnecessary repetition
-
-[FAIL-SAFE CONDITION]
-If the Menu context does not contain the required information, respond EXACTLY: "No data found for this request in the available context."
-⚠ NEVER invent, guess, or generate menu names, module names, operation names, or any values that are not explicitly present in [MENU CONTEXT]. Do NOT use your training knowledge to fill in missing data.
-
-[USER QUESTION]
+[QUESTION]
 {question}
 
-Response:
+Answer (use only the Menu Data above):
+
 """
 
 @app.post("/gbaiapi/Menu-chat", tags=["Goodbooks Ai Api"])
@@ -212,6 +161,9 @@ async def chat(message: Message, Login: str = Header(...)):
     user_input = spell_check(user_input)
 
     orchestrator_context = getattr(message, 'context', '')
+    # Cap orchestrator context — prevents large previous responses (e.g. 252-table list) from drowning actual data
+    if orchestrator_context and len(orchestrator_context) > 800:
+        orchestrator_context = orchestrator_context[:800] + "\n[...context truncated to prevent prompt pollution...]"
     logger.info(f"📚 Received orchestrator context: {len(orchestrator_context)} chars")
 
     _greeting_set = {"hi", "hello", "hey", "good morning", "good afternoon",

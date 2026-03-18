@@ -316,9 +316,6 @@ RESPONSE OPTIMIZATION
 ────────────────────────────────────────
 AVAILABLE CONTEXT SOURCES
 ────────────────────────────────────────
-COMPANY KNOWLEDGE BASE (Primary ERP Information):
-{context}
-
 CROSS-BOT CONTEXT (Background only — do NOT use these values to answer the current question):
 {cross_bot_context}
 
@@ -327,6 +324,10 @@ ORCHESTRATOR CONTEXT (Background only — historical session context, do NOT der
 
 PAST CONVERSATION MEMORIES (User History & Preferences):
 {relevant_memories}
+
+────────────────────────────────────────
+COMPANY KNOWLEDGE BASE (Primary ERP Information — answer from this only):
+{context}
 
 ────────────────────────────────────────
 USER QUESTION: {question}
@@ -395,6 +396,9 @@ async def chat(message: Message, Login: str = Header(...)):
     
     # ✅ FIX: Get orchestrator context from message object
     orchestrator_context = getattr(message, 'context', '')
+    # Cap orchestrator context — prevents large previous responses (e.g. 252-table list) from drowning actual data
+    if orchestrator_context and len(orchestrator_context) > 800:
+        orchestrator_context = orchestrator_context[:800] + "\n[...context truncated to prevent prompt pollution...]"
     logger.info(f"📚 Received orchestrator context: {len(orchestrator_context)} chars")
  
     # Greeting check

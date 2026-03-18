@@ -357,9 +357,6 @@ RESPONSE OPTIMIZATION
 ────────────────────────────────────────
 AVAILABLE CONTEXT SOURCES
 ────────────────────────────────────────
-FORMULA KNOWLEDGE BASE (Primary Formula Information):
-{context}
-
 CROSS-BOT CONTEXT (Background only — do NOT use these values to answer the current question):
 {cross_bot_context}
 
@@ -368,6 +365,10 @@ ORCHESTRATOR CONTEXT (Background only — historical session context, do NOT der
 
 PAST CONVERSATION MEMORIES (User History & Preferences):
 {history}
+
+────────────────────────────────────────
+FORMULA KNOWLEDGE BASE (Primary Formula Information — fetched live from PostgreSQL, answer from this only):
+{context}
 
 ────────────────────────────────────────
 USER QUESTION: {question}
@@ -418,7 +419,10 @@ async def chat(message: Message, Login: str = Header(...)):
         relevant_memories = conversational_memory.retrieve_relevant_memories(username, user_input, k=3)
         formatted_memories = format_memories(relevant_memories)
 
-        orchestrator_context = message.context
+        orchestrator_context = message.context or ''
+        # Cap orchestrator context — prevents large previous responses from drowning actual data
+        if orchestrator_context and len(orchestrator_context) > 800:
+            orchestrator_context = orchestrator_context[:800] + "\n[...context truncated to prevent prompt pollution...]"
 
         logger.info(f"🔍 Searching PostgreSQL MFORMULAFIELD for: {user_input[:100]}")
         context_str = db_query.query_table("MFORMULAFIELD", user_input)

@@ -144,16 +144,27 @@ def _detect_table_from_question(user_question: str) -> "str | None":
 
     # Pass 3 — partial match (meaningful words only, any table prefix)
     skip_words = {
+        # schema/meta words
         'table', 'tables', 'column', 'columns', 'record', 'records',
         'field', 'fields', 'value', 'values', 'database', 'schema',
-        'describe', 'display', 'fetch', 'query', 'there', 'where',
-        'which', 'data', 'from', 'show', 'list', 'give', 'find', 'what',
-        'the', 'and', 'for', 'all', 'are', 'with', 'this', 'that'
+        'describe', 'display', 'fetch', 'query',
+        # question/stop words (3–4 chars)
+        'the', 'and', 'for', 'all', 'are', 'with', 'this', 'that',
+        'from', 'show', 'list', 'give', 'find', 'what', 'data',
+        'there', 'where', 'which',
+        # generic 4-char grammatical words that must NOT trigger table detection
+        'have', 'will', 'been', 'they', 'them', 'then', 'your', 'does',
+        'also', 'just', 'like', 'only', 'same', 'such', 'know', 'make',
+        'take', 'used', 'very', 'many', 'much', 'most', 'more', 'each',
+        'both', 'once', 'back', 'want', 'need', 'tell', 'look', 'done',
+        'come', 'sure', 'true', 'else', 'when', 'here', 'than', 'well',
+        'name', 'type', 'code', 'date', 'time', 'into', 'some', 'call',
+        'said', 'says', 'work', 'were', 'year', 'gets', 'give', 'sort',
     }
     partial_hits = []
     for word in words_sorted:
         w_up = word.upper()
-        if len(w_up) < 5:
+        if len(w_up) < 4:   # reduced from 5 → allows 4-char table roots: menu, file, sale, role
             continue
         if word.lower() in skip_words:
             continue
@@ -334,16 +345,19 @@ def _fix_pg_syntax(sql: str) -> str:
 
 def _format_df(df: pd.DataFrame) -> str:
     """
-    Format a DataFrame for readable output regardless of column count.
-    - ≤10 columns : standard table format (df.to_string)
-    - >10 columns : one record per block with key: value pairs, skipping blank/null fields
+    Always format as key:value record blocks — regardless of column count.
+    This is far more readable for LLMs than fixed-width column-aligned tables.
+    Blank/null fields are skipped to reduce noise.
+    Single-column results are returned as a clean numbered list.
     """
     if df.empty:
         return "(no rows)"
-    num_cols = len(df.columns)
-    if num_cols <= 10:
-        return df.to_string(index=False)
-    # Many-column path — vertical record blocks
+    # Single column — return as plain numbered list (clearest for LLM)
+    if len(df.columns) == 1:
+        col = df.columns[0]
+        values = [str(v) for v in df[col] if v is not None and str(v).strip() not in ("", "None", "nan", "NaT")]
+        return "\n".join(f"{i + 1}. {v}" for i, v in enumerate(values))
+    # Multiple columns — vertical key:value blocks
     lines = []
     for i, (_, row) in enumerate(df.iterrows(), 1):
         lines.append(f"--- Record {i} ---")
@@ -406,8 +420,8 @@ def query_table(table_name: str, search_term: str, max_rows: int = 50) -> str:
         # ── Pre-check: if question is a pure "list all / show all" with no filter
         # bypass LLM SQL generation entirely and directly SELECT * — 100% reliable
         _list_all_patterns = re.compile(
-            r'^\s*(show|list|get|give|fetch|display|can i get|what are)(\s+me|\s+all|\s+the)?\s+'
-            r'(all\s+)?[\w\s]{1,30}$',
+            r'^\s*(show|list|get|give|fetch|display|can i get|what are|what do you have)(\s+me|\s+all|\s+the)?\s+'
+            r'(all\s+)?[\w\s]{1,40}[?!.]?\s*$',
             re.IGNORECASE
         )
         _filter_words = re.compile(
@@ -419,11 +433,35 @@ def query_table(table_name: str, search_term: str, max_rows: int = 50) -> str:
             and not _filter_words.search(search_term)
         )
         if is_list_all_request and col_names:
-            logger.info(f"⚡ List-all detected — skipping LLM, running SELECT * directly")
+            # Detect what kind of value the user wants so we can fetch only that column
+            sq = search_term.lower()
+            want_code  = any(w in sq for w in ['code', 'codes', 'menucode', 'id', 'ids', 'number', 'no'])
+            want_name  = any(w in sq for w in ['name', 'names', 'title', 'titles', 'description', 'desc', 'label'])
+            want_all   = not want_code and not want_name   # user said "get all X" with no specific field
+
+            target_col = None
+            if want_code:
+                target_col = next((c for c in col_names
+                                   if any(k in c.lower() for k in ['code', 'id', 'num', 'no'])
+                                   and c.lower() not in ('isactive', 'isdelete', 'isdefault')), None)
+            if not target_col and want_name:
+                target_col = next((c for c in col_names
+                                   if any(k in c.lower() for k in ['name', 'desc', 'title', 'caption', 'label'])), None)
+            # For "list all X" with no field hint — pick the first short text column (likely the primary label)
+            if not target_col and not want_all:
+                target_col = next((c for c in col_names
+                                   if any(k in c.lower() for k in ['name', 'desc', 'title', 'caption', 'label'])), None)
+
+            select_clause = target_col if target_col else '*'
+            logger.info(f"⚡ List-all detected — SELECT {select_clause} FROM {table_name}")
             try:
                 engine = _get_engine()
                 with engine.connect() as conn:
-                    df = pd.read_sql(sa_text(f'SELECT * FROM {table_name} LIMIT {max_rows}'), conn)
+                    df = pd.read_sql(
+                        sa_text(f'SELECT {select_clause} FROM {table_name} ORDER BY {target_col} LIMIT {max_rows}'
+                                if target_col else f'SELECT * FROM {table_name} LIMIT {max_rows}'),
+                        conn
+                    )
                 if not df.empty:
                     return (
                         f"Results from table '{table_name}' ({len(df)} rows):\n\n"

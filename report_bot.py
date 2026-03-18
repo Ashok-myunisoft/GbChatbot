@@ -263,8 +263,9 @@ INTENT DETECTION — REQUIRED FIRST STEP
 Before answering, silently classify the user's request into ONE of these two types:
 
 TYPE A — DATA RETRIEVAL (user wants actual records or values):
-  Trigger words: list, show, get, fetch, give me, display, find, retrieve, all, what is the [field] of
-  Examples: "list all report names", "show all MREPORT records", "get report IDs", "what is the reportId of Sales"
+  Trigger words: list, show, get, fetch, give me, display, find, retrieve, all, what are, what do you have, you have, what is the [field] of
+  Examples: "list all report names", "show all MREPORT records", "get report IDs", "what is the reportId of Sales",
+            "what are the reports you have", "what reports do you have"
   → If REPORT KNOWLEDGE BASE is empty or has no matching rows, respond EXACTLY:
              "No data found for this request in the available context."
   → ACTION: Read the fetched data in the context carefully. Extract ONLY the rows and fields
@@ -306,9 +307,6 @@ RESPONSE OPTIMIZATION
 ────────────────────────────────────────
 AVAILABLE CONTEXT SOURCES
 ────────────────────────────────────────
-REPORT KNOWLEDGE BASE (Primary Report Information):
-{context}
-
 CROSS-BOT CONTEXT (Background only — do NOT use these values to answer the current question):
 {cross_bot_context}
 
@@ -317,6 +315,10 @@ ORCHESTRATOR CONTEXT (Background only — historical session context, do NOT der
 
 PAST CONVERSATION MEMORIES (User History & Preferences):
 {relevant_memories}
+
+────────────────────────────────────────
+REPORT KNOWLEDGE BASE (Primary Report Information — fetched live from PostgreSQL, answer from this only):
+{context}
 
 ────────────────────────────────────────
 USER QUESTION: {question}
@@ -340,6 +342,9 @@ async def report_chat(message: Message, Login: str = Header(...)):
     user_input = spell_check(user_input)
 
     orchestrator_context = getattr(message, 'context', '')
+    # Cap orchestrator context — prevents large previous responses (e.g. 252-table list) from drowning actual data
+    if orchestrator_context and len(orchestrator_context) > 800:
+        orchestrator_context = orchestrator_context[:800] + "\n[...context truncated to prevent prompt pollution...]"
     logger.info(f"📚 Received orchestrator context: {len(orchestrator_context)} chars")
 
     _greeting_set = {"hi", "hello", "hey", "good morning", "good afternoon",

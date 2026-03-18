@@ -135,10 +135,6 @@ Historical session context for reference. Do NOT use values from here to answer 
 Related information from other bots (for reference only — do not apply to current answer):
 {cross_bot_context}
 
-[PROJECT FILE DATA CONTEXT]
-Use the Project file data below as the primary source of truth:
-{context}
-
 [CONVERSATION HISTORY]
 Previous conversation context:
 {history}
@@ -195,6 +191,9 @@ TYPE B — STRUCTURE / EXPLANATION (user wants to understand project setup or co
 - Organize tabular values or numeric data clearly if present
 - Keep the response focused, accurate, and easy to read
 
+[PROJECT FILE DATA CONTEXT — fetched live from PostgreSQL, answer from this only]
+{context}
+
 [USER QUESTION]
 {question}
 
@@ -227,7 +226,10 @@ async def project_chat(message: Message, Login: str = Header(...)):
 
     try:
         history_str = ""
-        orchestrator_context = message.context
+        orchestrator_context = message.context or ''
+        # Cap orchestrator context — prevents large previous responses from drowning actual data
+        if orchestrator_context and len(orchestrator_context) > 800:
+            orchestrator_context = orchestrator_context[:800] + "\n[...context truncated to prevent prompt pollution...]"
 
         logger.info(f"🔍 Searching PostgreSQL MFILE for: {user_input[:100]}")
         context_str = db_query.query_table("MFILE", user_input)
