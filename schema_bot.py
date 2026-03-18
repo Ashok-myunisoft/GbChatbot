@@ -94,8 +94,8 @@ Use ONLY the provided database schema context.
 - Do not repeat explanations unless it adds clarity or new value
 - Maintain consistent terminology throughout the conversation
 
-[ORCHESTRATOR CONTEXT]
-Conversation context from the current session:
+[ORCHESTRATOR CONTEXT — BACKGROUND ONLY]
+Historical session context for reference. Do NOT use values from here to answer the current question:
 {orchestrator_context}
 
 [DATABASE SCHEMA CONTEXT]
@@ -210,20 +210,48 @@ async def chat(message, Login: str = None):
         else:
             all_tables = db_query._get_all_tables()
             if all_tables:
-                # Filter out garbage/test tables — keep GoodBooks ERP tables only
+                # Filter out system/framework tables — keep GoodBooks ERP tables only
                 import re as _re
+                _system_prefixes = (
+                    'act_',          # Activiti workflow engine
+                    'qrtz_',         # Quartz scheduler
+                    'conversation_', # Internal chatbot state
+                    'dump', 'bulk_', 'z_', 'tr_', 'aparna', 'temp',
+                    'billtemp', 'chargedetail',
+                )
+                _system_exact = {'dbjoin', 'dbobject', 'dbobjectfields', 'dimdate'}
                 filtered = [
-                    t for t in all_tables
+                    t for t in dict.fromkeys(all_tables)   # deduplicate preserving order
                     if len(t) >= 4
-                    and not t.upper().startswith(('DUMP', 'BULK_', 'Z_', 'TR_', 'APARNA', 'TEMP', 'billtemp', 'chargedetail'))
-                    and not _re.match(r'^[A-Za-z]{1,3}\d*$', t)  # removes AA, AG1, ABC, ABC1, etc.
+                    and not t.lower().startswith(_system_prefixes)
+                    and t.lower() not in _system_exact
+                    and not _re.match(r'^[A-Za-z]{1,3}\d*$', t)
                 ]
-                table_list = filtered if filtered else all_tables
-                context_str = f"Available tables in the database ({len(table_list)} total):\n" + "\n".join(table_list)
+                table_list = filtered if filtered else list(dict.fromkeys(all_tables))
+                # Build list and truncate at a complete line boundary — never mid-word
+                header = f"Available tables in the database ({len(table_list)} total):\n"
+                lines = table_list
+                result_lines = [header]
+                char_count = len(header)
+                for tbl in lines:
+                    entry = tbl + "\n"
+                    if char_count + len(entry) > 7800:
+                        result_lines.append(
+                            f"\n[TRUNCATED: Showing {len(result_lines) - 1} of {len(table_list)} tables. "
+                            "Ask about a specific table name for full details.]"
+                        )
+                        break
+                    result_lines.append(tbl)
+                    char_count += len(entry)
+                context_str = "\n".join(result_lines) if len(result_lines) > 1 else header + "\n".join(table_list)
             else:
                 context_str = "No table information available."
         if len(context_str) > 8000:
-            context_str = context_str[:8000] + "\n\n[TRUNCATED: Context exceeded 8000 chars. Some data above may be incomplete. Ask about a specific table for full details.]"
+            # Fallback hard truncation (for non-list contexts like query results)
+            # Find last newline before limit to avoid cutting mid-word
+            cutoff = context_str.rfind('\n', 0, 8000)
+            cutoff = cutoff if cutoff > 0 else 8000
+            context_str = context_str[:cutoff] + "\n\n[TRUNCATED: Context exceeded limit. Ask about a specific table for full details.]"
 
         # Always pass fetched data through the LLM so it can extract the exact
         # relevant answer from the results instead of dumping raw rows to the user.

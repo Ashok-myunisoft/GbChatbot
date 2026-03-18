@@ -319,10 +319,10 @@ AVAILABLE CONTEXT SOURCES
 COMPANY KNOWLEDGE BASE (Primary ERP Information):
 {context}
 
-CROSS-BOT CONTEXT (Related Information from Other Bots):
+CROSS-BOT CONTEXT (Background only — do NOT use these values to answer the current question):
 {cross_bot_context}
 
-ORCHESTRATOR CONTEXT (Current Conversation Flow):
+ORCHESTRATOR CONTEXT (Background only — historical session context, do NOT derive the current answer from this):
 {orchestrator_context}
 
 PAST CONVERSATION MEMORIES (User History & Preferences):

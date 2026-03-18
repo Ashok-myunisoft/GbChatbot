@@ -127,12 +127,12 @@ while maintaining continuity with the ongoing conversation and leveraging cross-
 - Do not repeat information unless it adds clarity or new value
 - Maintain consistent terminology and assumptions throughout the conversation
 
-[ORCHESTRATOR CONTEXT]
-Conversation context from the current session:
+[ORCHESTRATOR CONTEXT — BACKGROUND ONLY]
+Historical session context for reference. Do NOT use values from here to answer the current question:
 {orchestrator_context}
 
-[CROSS-BOT CONTEXT]
-Related information from other bots (reports, menus, general, formulas):
+[CROSS-BOT CONTEXT — BACKGROUND ONLY]
+Related information from other bots (for reference only — do not apply to current answer):
 {cross_bot_context}
 
 [PROJECT FILE DATA CONTEXT]
@@ -215,8 +215,13 @@ async def project_chat(message: Message, Login: str = Header(...)):
 
     user_input = spell_check(user_input)
 
-    greetings = ["hi","hello","hey","good morning","good afternoon","good evening","howdy","greetings","what's up","sup"]
-    if any(g in user_input.lower() for g in greetings):
+    _greeting_set = {"hi", "hello", "hey", "good morning", "good afternoon",
+                     "good evening", "howdy", "greetings", "what's up", "sup"}
+    _txt = user_input.lower().strip()
+    _first_word = _txt.split()[0] if _txt.split() else ""
+    if (_txt in _greeting_set
+            or (len(_txt.split()) <= 4
+                and _first_word in {"hi", "hello", "hey", "howdy", "greetings", "sup"})):
         formatted_answer = "Hello! I'm your Project Data assistant. Ask me anything about the uploaded project data."
         return {"response": formatted_answer}
 

@@ -81,13 +81,13 @@ def _get_all_tables() -> list:
     try:
         engine = _get_engine()
         query = sa_text(
-            "SELECT table_name FROM information_schema.tables "
+            "SELECT DISTINCT table_name FROM information_schema.tables "
             "WHERE table_schema = 'public' AND table_type = 'BASE TABLE' "
             "ORDER BY table_name"
         )
         with engine.connect() as conn:
             df = pd.read_sql(query, conn)
-        _table_cache = df["table_name"].tolist()
+        _table_cache = df["table_name"].drop_duplicates().tolist()
         _table_cache_ts = now
         return _table_cache
     except Exception as e:
@@ -236,6 +236,13 @@ def _generate_sql(llm, table_name: str, col_names: list, user_question: str, max
         f"- NEVER use parameterized queries or placeholder variables — always embed literal values directly\n"
         f"  * Correct:   WHERE CAST(name AS TEXT) ILIKE '%leave%'\n"
         f"  * Incorrect: WHERE CAST(name AS TEXT) ILIKE '%' || $1 || '%'\n"
+        f"- NEVER use CASE WHEN COUNT(*) — this is an existence-check pattern, NOT a data retrieval query\n"
+        f"  * Incorrect: SELECT CASE WHEN COUNT(*) > 0 THEN 'true' ELSE 'false' END ...\n"
+        f"  * Correct:   SELECT col FROM table WHERE condition LIMIT N\n"
+        f"- NEVER use nested subqueries or CTEs for simple data retrieval — keep the query flat\n"
+        f"  * Incorrect: SELECT * FROM (SELECT * FROM (SELECT * FROM table))\n"
+        f"  * Correct:   SELECT col FROM table WHERE condition LIMIT N\n"
+        f"- ALWAYS produce a simple flat SELECT: SELECT [columns] FROM [table] [WHERE ...] LIMIT N\n"
         f"- Return ONLY the raw SQL query — no explanation, no markdown, no code fences\n\n"
         f"SQL:"
     )
@@ -262,6 +269,24 @@ def _generate_sql(llm, table_name: str, col_names: list, user_question: str, max
     sql = re.sub(r"```(?:sql)?", "", sql, flags=re.IGNORECASE).replace("```", "").strip()
     # Convert any T-SQL TOP N → LIMIT N for PostgreSQL compatibility
     sql = _fix_pg_syntax(sql)
+
+    # ── Structural validation — reject broken/invalid patterns immediately ────
+    # Check 1: CASE WHEN COUNT(*) — existence-check pattern, not a data query
+    if re.search(r'\bCASE\s+WHEN\s+COUNT\s*\(', sql, re.IGNORECASE):
+        raise ValueError(f"LLM generated CASE WHEN COUNT(*) existence-check pattern — rejecting")
+
+    # Check 2: Deeply nested SELECT subqueries (more than 1 level deep)
+    inner_selects = len(re.findall(r'\bSELECT\b', sql, re.IGNORECASE))
+    if inner_selects > 2:
+        raise ValueError(f"LLM generated deeply nested subqueries ({inner_selects} SELECTs) — rejecting")
+
+    # Check 3: Unbalanced parentheses (truncated mid-query by token limit)
+    if sql.count('(') != sql.count(')'):
+        raise ValueError(
+            f"Generated SQL has unbalanced parentheses "
+            f"(open={sql.count('(')}, close={sql.count(')')}) — likely truncated by token limit"
+        )
+
     return sql
 
 
@@ -330,9 +355,21 @@ def _format_df(df: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
+_STOP_WORDS = {
+    "what", "which", "where", "when", "who", "how", "why",
+    "are", "is", "was", "were", "has", "have", "had", "does", "did",
+    "the", "for", "from", "with", "about", "give", "show", "list", "get",
+    "all", "you", "your", "can", "tell", "find", "fetch", "display",
+    "me", "my", "our", "its", "their", "this", "that", "these", "those",
+    "any", "some", "more", "also", "please", "now", "do",
+}
+
 def _like_sql(table_name: str, col_names: list, search_term: str, max_rows: int) -> str:
     """Build a fallback ILIKE SQL query for PostgreSQL from keywords."""
-    keywords = [w for w in search_term.split() if len(w) > 2] or [search_term]
+    raw_words = search_term.split()
+    keywords = [w for w in raw_words if len(w) > 2 and w.lower() not in _STOP_WORDS]
+    if not keywords:
+        keywords = [w for w in raw_words if len(w) > 2] or [search_term]
     tbl = table_name.lower()
     word_blocks = []
     for kw in keywords[:6]:

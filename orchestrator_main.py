@@ -1619,14 +1619,15 @@ class AIOrchestrationAgent:
         
         # Menu bot keywords
         menu_keywords = [
-            'menu', 'navigate', 'where is', 'find screen', 'interface',
+            'navigate', 'where is', 'find screen', 'interface',
             'how to access', 'location of', 'where can i', 'how do i find',
             'show me how to get to', 'navigation', 'screen', 'page',
             'button', 'option', 'find the', 'locate',
             'path to', 'go to', 'how to open', 'where to find', 'accessing',
             'shortcut', 'module location',
             'settings', 'toolbar', 'sidebar', 'open screen', 'which screen',
-            'how to reach', 'how to get to'
+            'how to reach', 'how to get to',
+            'menu path', 'menu location', 'which menu', 'navigate menu'
         ]
         if any(word in question_lower for word in menu_keywords):
             logger.info("🚀 Fast route: menu")
@@ -1689,7 +1690,9 @@ class AIOrchestrationAgent:
             'data model', 'entity', 'primary key', 'foreign key',
             'get all', 'list all', 'fetch all', 'show all', 'display all',
             'all records', 'all rows', 'all entries',
-            'give me', 'show me', 'find me', 'fetch me'
+            'give me', 'show me', 'find me', 'fetch me',
+            'picklist', 'pick list', 'dropdown', 'lookup', 'masterdata',
+            'master data', 'what are', 'what is the', 'menucode', 'menu code'
         ]
         if any(word in question_lower for word in schema_keywords):
             logger.info("🚀 Fast route: schema")
@@ -1751,7 +1754,7 @@ class AIOrchestrationAgent:
                     intent = "schema"
                 elif any(word in combined for word in ['report', 'chart', 'graph', 'analysis', 'ledger', 'balance']):
                     intent = "report"
-                elif any(word in combined for word in ['menu', 'where', 'find', 'locate', 'navigate', 'screen', 'path']):
+                elif any(word in combined for word in ['where is', 'where can i', 'how to access', 'navigate', 'navigation', 'screen path', 'menu path', 'locate screen']):
                     intent = "menu"
                 elif any(word in combined for word in ['formula', 'calculate', 'compute', 'expression']):
                     intent = "formula"
@@ -1778,7 +1781,7 @@ class AIOrchestrationAgent:
                     fallback = "schema"
                 elif any(word in question_lower for word in ['show', 'display', 'view', 'see', 'report', 'chart']):
                     fallback = "report"
-                elif any(word in question_lower for word in ['where', 'find', 'locate', 'access', 'navigate', 'menu']):
+                elif any(word in question_lower for word in ['where is', 'where can i', 'how to access', 'navigate', 'navigation', 'screen path', 'menu path']):
                     fallback = "menu"
                 elif any(word in question_lower for word in ['what', 'who', 'tell', 'explain', 'describe', 'about']):
                     fallback = "general"

@@ -126,12 +126,13 @@ while maintaining continuity with previous messages and leveraging cross-bot con
 - Do not repeat information unless it adds value
 - Maintain consistent terminology throughout the conversation
 
-[ORCHESTRATOR CONTEXT]
-Conversation context from the current session:
+[ORCHESTRATOR CONTEXT — BACKGROUND ONLY]
+The following is historical conversation context for reference. Do NOT use values, names, or codes
+from this section to answer the CURRENT question — use only [MENU CONTEXT] for that:
 {orchestrator_context}
 
-[CROSS-BOT CONTEXT]
-Related information from other bots (reports, general, projects):
+[CROSS-BOT CONTEXT — BACKGROUND ONLY]
+Related information from other bots (for reference only — do not apply to current answer):
 {cross_bot_context}
 
 [MENU CONTEXT]
@@ -213,11 +214,13 @@ async def chat(message: Message, Login: str = Header(...)):
     orchestrator_context = getattr(message, 'context', '')
     logger.info(f"📚 Received orchestrator context: {len(orchestrator_context)} chars")
 
-    greetings = [
-        "hi", "hello", "hey", "good morning", "good afternoon",
-        "good evening", "howdy", "greetings", "what's up", "sup"
-    ]
-    if any(greeting in user_input.lower() for greeting in greetings):
+    _greeting_set = {"hi", "hello", "hey", "good morning", "good afternoon",
+                     "good evening", "howdy", "greetings", "what's up", "sup"}
+    _txt = user_input.lower().strip()
+    _first_word = _txt.split()[0] if _txt.split() else ""
+    if (_txt in _greeting_set
+            or (len(_txt.split()) <= 4
+                and _first_word in {"hi", "hello", "hey", "howdy", "greetings", "sup"})):
         formatted_answer = "Hello! I'm here to help you with any questions you have. I can assist you with information from the available data sources. What would you like to know?"
         return {"response": formatted_answer}
 

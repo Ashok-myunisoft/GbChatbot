@@ -309,10 +309,10 @@ AVAILABLE CONTEXT SOURCES
 REPORT KNOWLEDGE BASE (Primary Report Information):
 {context}
 
-CROSS-BOT CONTEXT (Related Information from Other Bots):
+CROSS-BOT CONTEXT (Background only — do NOT use these values to answer the current question):
 {cross_bot_context}
 
-ORCHESTRATOR CONTEXT (Current Conversation Flow):
+ORCHESTRATOR CONTEXT (Background only — historical session context, do NOT derive the current answer from this):
 {orchestrator_context}
 
 PAST CONVERSATION MEMORIES (User History & Preferences):
@@ -342,8 +342,13 @@ async def report_chat(message: Message, Login: str = Header(...)):
     orchestrator_context = getattr(message, 'context', '')
     logger.info(f"📚 Received orchestrator context: {len(orchestrator_context)} chars")
 
-    greetings = ["hi","hello","hey","good morning","good afternoon","good evening","howdy","greetings","what's up","sup"]
-    if any(g in user_input.lower() for g in greetings):
+    _greeting_set = {"hi", "hello", "hey", "good morning", "good afternoon",
+                     "good evening", "howdy", "greetings", "what's up", "sup"}
+    _txt = user_input.lower().strip()
+    _first_word = _txt.split()[0] if _txt.split() else ""
+    if (_txt in _greeting_set
+            or (len(_txt.split()) <= 4
+                and _first_word in {"hi", "hello", "hey", "howdy", "greetings", "sup"})):
         formatted_answer = "Hello! I'm your Report Data assistant. Ask me anything about the uploaded report data."
         return {"response": formatted_answer}
 
