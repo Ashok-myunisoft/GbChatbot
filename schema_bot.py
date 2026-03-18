@@ -170,12 +170,10 @@ async def chat(message, Login: str = None):
     try:
         user_input = message.content.strip() if hasattr(message, 'content') else str(message).strip()
 
-        username  = "orchestrator"
         user_role = "client"
         if Login:
             try:
                 login_dto = json.loads(Login)
-                username  = login_dto.get("UserName", "orchestrator")
                 user_role = login_dto.get("Role", "client").lower()
             except Exception:
                 pass
@@ -220,11 +218,12 @@ async def chat(message, Login: str = None):
                     and not t.upper().startswith(('DUMP', 'BULK_', 'Z_', 'TR_', 'APARNA', 'TEMP', 'billtemp', 'chargedetail'))
                     and not _re.match(r'^[A-Za-z]{1,3}\d*$', t)  # removes AA, AG1, ABC, ABC1, etc.
                 ]
-                table_list = filtered if len(filtered) > 10 else all_tables
-                context_str = "Available tables in the database:\n" + "\n".join(table_list)
+                table_list = filtered if filtered else all_tables
+                context_str = f"Available tables in the database ({len(table_list)} total):\n" + "\n".join(table_list)
             else:
                 context_str = "No table information available."
-        context_str = context_str[:8000]  # Truncate to prevent GPU OOM on RunPod
+        if len(context_str) > 8000:
+            context_str = context_str[:8000] + "\n\n[TRUNCATED: Context exceeded 8000 chars. Some data above may be incomplete. Ask about a specific table for full details.]"
 
         # Always pass fetched data through the LLM so it can extract the exact
         # relevant answer from the results instead of dumping raw rows to the user.
@@ -248,7 +247,7 @@ async def chat(message, Login: str = None):
 
         return {
             "response":    answer.strip(),
-            "source_file": "unisoft_all_tables_export.xlsx",
+            "source_file": f"PostgreSQL table: {target_table}" if target_table else "PostgreSQL (live schema)",
             "bot_name":    "Schema Bot"
         }
 

@@ -224,7 +224,7 @@ async def chat(message: Message, Login: str = Header(...)):
     try:
         history_str = ""
 
-        logger.info(f"🔍 Searching menu DuckDB for: {user_input[:100]}")
+        logger.info(f"🔍 Searching PostgreSQL MMENU for: {user_input[:100]}")
         context_str = db_query.query_table("MMENU", user_input)
         context_str = context_str[:8000]  # Truncate to prevent GPU OOM on RunPod
         logger.info(f"📚 Menu context: {len(context_str)} chars")

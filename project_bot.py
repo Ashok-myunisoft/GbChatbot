@@ -224,7 +224,7 @@ async def project_chat(message: Message, Login: str = Header(...)):
         history_str = ""
         orchestrator_context = message.context
 
-        logger.info(f"🔍 Searching project DuckDB for: {user_input[:100]}")
+        logger.info(f"🔍 Searching PostgreSQL MFILE for: {user_input[:100]}")
         context_str = db_query.query_table("MFILE", user_input)
         context_str = context_str[:8000]  # Truncate to prevent GPU OOM on RunPod
         logger.info(f"📚 Project context: {len(context_str)} chars")

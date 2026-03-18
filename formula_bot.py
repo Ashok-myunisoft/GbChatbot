@@ -420,7 +420,7 @@ async def chat(message: Message, Login: str = Header(...)):
 
         orchestrator_context = message.context
 
-        logger.info(f"🔍 Searching formula DuckDB for: {user_input[:100]}")
+        logger.info(f"🔍 Searching PostgreSQL MFORMULAFIELD for: {user_input[:100]}")
         context_str = db_query.query_table("MFORMULAFIELD", user_input)
         context_str = context_str[:8000]  # Truncate to prevent GPU OOM on RunPod
         logger.info(f"📚 Formula context: {len(context_str)} chars")

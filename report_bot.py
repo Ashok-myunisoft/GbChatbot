@@ -348,7 +348,7 @@ async def report_chat(message: Message, Login: str = Header(...)):
         return {"response": formatted_answer}
 
     try:
-        logger.info(f"🔍 Searching report DuckDB for: {user_input[:100]}")
+        logger.info(f"🔍 Searching PostgreSQL MREPORT for: {user_input[:100]}")
         context_str = db_query.query_table("MREPORT", user_input)
         context_str = context_str[:8000]  # Truncate to prevent GPU OOM on RunPod
         logger.info(f"📚 Report context: {len(context_str)} chars")

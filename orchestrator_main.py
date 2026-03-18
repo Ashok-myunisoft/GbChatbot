@@ -7,7 +7,7 @@ import uuid
 import asyncio
 import time
 from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+from typing import Dict, List, Optional
 from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -1581,11 +1581,13 @@ class AIOrchestrationAgent:
         
         # Formula bot keywords
         formula_keywords = [
-            'calculate', 'compute', 'formula', 'math', 'sum', 'average', 'total', 
+            'calculate', 'compute', 'formula', 'math', 'sum', 'average', 'total',
             'count', 'percentage', 'divide', 'multiply', 'subtract', 'add',
             'equation', 'expression', 'result of', 'what is', 'how much',
             '+', '-', '*', '/', '=', '%', 'mean', 'median', 'gst', 'tax', 'discount',
-            'net amount', 'gross', 'valuation', 'variance'
+            'net amount', 'gross', 'valuation', 'variance',
+            'interest', 'deduction', 'allowance', 'commission', 'wage',
+            'rate calculation', 'salary calculation', 'payroll calculation'
         ]
         has_numbers = any(char.isdigit() for char in question_lower)
         has_math_ops = any(op in question_lower for op in ['+', '-', '*', '/', '=', '%'])
@@ -1606,7 +1608,10 @@ class AIOrchestrationAgent:
             'metric', 'kpi', 'performance', 'trend', 'summary', 'breakdown',
             'export', 'generate report', 'view report', 'display data',
             'show chart', 'create graph', 'listing', 'history of',
-            'ledger', 'balance sheet', 'p&l', 'profit', 'loss'
+            'ledger', 'balance sheet', 'p&l', 'profit', 'loss',
+            'payroll report', 'attendance report', 'sales report',
+            'inventory report', 'purchase report', 'financial report',
+            'stock report', 'transaction report'
         ]
         if any(word in question_lower for word in report_keywords):
             logger.info("🚀 Fast route: report")
@@ -1619,7 +1624,9 @@ class AIOrchestrationAgent:
             'show me how to get to', 'navigation', 'screen', 'page',
             'button', 'option', 'find the', 'locate',
             'path to', 'go to', 'how to open', 'where to find', 'accessing',
-            'shortcut', 'module location'
+            'shortcut', 'module location',
+            'settings', 'toolbar', 'sidebar', 'open screen', 'which screen',
+            'how to reach', 'how to get to'
         ]
         if any(word in question_lower for word in menu_keywords):
             logger.info("🚀 Fast route: menu")
@@ -1647,29 +1654,31 @@ class AIOrchestrationAgent:
             logger.info("🚀 Fast route: project")
             return "project"
 
-        # PostgreSQL table name detection — route to the correct bot by table name.
-        # Only match ALL-CAPS M-prefixed words (e.g. MEMPLOYEE, MREPORT, MMENU) to avoid
-        # false matches on regular lowercase words like "menus", "more", "model".
-        import re as _re
-        table_hit = _re.search(r'\b(M[A-Z]{2,})\b', question)   # search original case
-        if table_hit:
-            tname = table_hit.group(1)
-            if tname in ('MREPORT',):
-                logger.info(f"🚀 Fast route: report (table {tname})")
-                return "report"
-            elif tname in ('MMENU',):
-                logger.info(f"🚀 Fast route: menu (table {tname})")
-                return "menu"
-            elif tname in ('MFORMULAFIELD', 'MFORMULA'):
-                logger.info(f"🚀 Fast route: formula (table {tname})")
-                return "formula"
-            elif tname in ('MFILE', 'MPROJECT'):
-                logger.info(f"🚀 Fast route: project (table {tname})")
-                return "project"
-            else:
-                # MEMPLOYEE, MMODULE, MUSER, MROLE, etc. → schema
-                logger.info(f"🚀 Fast route: schema (table {tname})")
-                return "schema"
+        # PostgreSQL table name detection — works for ALL table prefixes (M, PL, FW, HR, GL…)
+        # Uses the cached table list from db_query — no extra DB call.
+        try:
+            import db_query as _dq
+            _detected = _dq._detect_table_from_question(question)
+            if _detected:
+                tname = _detected.upper()
+                if tname in ('MREPORT',):
+                    logger.info(f"🚀 Fast route: report (table {tname})")
+                    return "report"
+                elif tname in ('MMENU',):
+                    logger.info(f"🚀 Fast route: menu (table {tname})")
+                    return "menu"
+                elif tname in ('MFORMULAFIELD', 'MFORMULA'):
+                    logger.info(f"🚀 Fast route: formula (table {tname})")
+                    return "formula"
+                elif tname in ('MFILE', 'MPROJECT'):
+                    logger.info(f"🚀 Fast route: project (table {tname})")
+                    return "project"
+                else:
+                    # All other tables (any prefix) → schema bot
+                    logger.info(f"🚀 Fast route: schema (table {tname})")
+                    return "schema"
+        except Exception:
+            pass  # Fall through to keyword and AI routing
 
         # Schema bot keywords — structural and data-fetch queries
         schema_keywords = [
@@ -1732,20 +1741,27 @@ class AIOrchestrationAgent:
             
             if intent not in valid_intents:
                 logger.warning(f"⚠️ Invalid AI intent '{intent}', analyzing question structure")
-                question_lower = question.lower()
+                # Use both question AND context for better fallback routing.
+                # Context helps resolve vague follow-ups like "tell me more about it"
+                # by checking what bot was used in the previous turn.
+                combined = (question + " " + context).lower()
                 if any(char.isdigit() for char in question):
                     intent = "formula"
-                elif any(word in question_lower for word in ['table', 'column', 'field', 'schema', 'record', 'row', 'list all', 'get all', 'fetch all', 'show all', 'all records']):
+                elif any(word in combined for word in ['table', 'column', 'field', 'schema', 'record', 'row', 'list all', 'get all', 'fetch all', 'show all', 'all records']):
                     intent = "schema"
-                elif any(word in question_lower for word in ['show', 'display', 'view', 'report', 'chart', 'graph']):
+                elif any(word in combined for word in ['report', 'chart', 'graph', 'analysis', 'ledger', 'balance']):
                     intent = "report"
-                elif any(word in question_lower for word in ['where', 'find', 'locate', 'navigate', 'menu']):
+                elif any(word in combined for word in ['menu', 'where', 'find', 'locate', 'navigate', 'screen', 'path']):
                     intent = "menu"
-                elif any(word in question_lower for word in ['what', 'who', 'tell me', 'explain', 'describe']):
+                elif any(word in combined for word in ['formula', 'calculate', 'compute', 'expression']):
+                    intent = "formula"
+                elif any(word in combined for word in ['project', 'mfile', 'task', 'milestone']):
+                    intent = "project"
+                elif any(word in combined for word in ['what', 'who', 'tell me', 'explain', 'describe']):
                     intent = "general"
                 else:
                     intent = "general"
-                logger.info(f"📊 Fallback analysis selected: {intent}")
+                logger.info(f"📊 Fallback analysis selected (with context): {intent}")
             
             self.intent_cache[question.lower().strip()] = intent
             logger.info(f"✅ Final routing decision: {intent}")
@@ -1980,6 +1996,72 @@ For example: "Name: John, Role: developer" """
                 logger.info(f"🔄 Retry detected — replaying question: '{prev_question}' with bot: {prev_bot}")
                 question = prev_question
                 context = build_conversational_context(username, question, thread_id, thread_isolation=True)
+
+        # ── Base Answer Quality (every question) ──────────────────────────────
+        # Lightweight instruction appended to context for ALL questions.
+        # Reinforces bot prompts to ensure complete, precise first-time answers.
+        _base_quality = (
+            "\n\n=== ANSWER QUALITY STANDARD ===\n"
+            "Provide a complete, accurate, and direct answer on the first attempt:\n"
+            "- State specific values, codes, names, or steps directly from the data\n"
+            "- If multiple relevant records exist, list all of them clearly\n"
+            "- Do not give vague, partial, or cut-off answers\n"
+            "=== END QUALITY STANDARD ==="
+        )
+        context = (context + _base_quality) if context else _base_quality
+        # ── End Base Answer Quality ────────────────────────────────────────────
+
+        # ── Deep Analysis Detection ───────────────────────────────────────────
+        # Triggers when user is dissatisfied OR repeats the same question.
+        # Only modifies the context string — no bot logic or routing is changed.
+        import re as _re_deep
+        deep_analysis_needed = False
+
+        # Signal 1: User explicitly expresses dissatisfaction or asks for more
+        dissatisfaction_phrases = [
+            "not enough", "more detail", "more details", "explain more", "tell me more",
+            "elaborate", "go deeper", "more information", "not clear", "don't understand",
+            "didn't understand", "can you expand", "more specific", "more thorough",
+            "in depth", "in-depth", "not satisfied", "need more", "give more",
+            "more about", "explain further", "not helpful", "better answer",
+            "still not", "still unclear", "want more", "i need more"
+        ]
+        if any(phrase in question.lower() for phrase in dissatisfaction_phrases):
+            deep_analysis_needed = True
+            logger.info("🔍 Deep analysis triggered: dissatisfaction signal detected")
+
+        # Signal 2: Current question has ≥70% word overlap with the last question
+        # (same question asked again, possibly rephrased)
+        if not deep_analysis_needed and thread_id:
+            _thread_obj = history_manager.get_thread(thread_id)
+            if _thread_obj and _thread_obj.messages:
+                _last_msg = _thread_obj.messages[-1]
+                _prev_q = _last_msg.get("user_message", "")
+                # Skip if the previous message was itself a retry command
+                _retry_commands = {"try again", "retry", "again", "try once more"}
+                if _prev_q and _prev_q.lower().strip() not in _retry_commands:
+                    _curr_words = set(_re_deep.findall(r'\b\w{4,}\b', question.lower()))
+                    _prev_words = set(_re_deep.findall(r'\b\w{4,}\b', _prev_q.lower()))
+                    if _curr_words and _prev_words:
+                        _overlap = len(_curr_words & _prev_words) / max(len(_curr_words), len(_prev_words))
+                        if _overlap >= 0.7:
+                            deep_analysis_needed = True
+                            logger.info(f"🔍 Deep analysis triggered: question similarity {_overlap:.0%}")
+
+        if deep_analysis_needed:
+            _depth_note = (
+                "\n\n=== DEEP ANALYSIS REQUIRED ===\n"
+                "The user was not satisfied with the previous answer or is asking the same question again. "
+                "You MUST provide a significantly MORE thorough, detailed, and complete response than before:\n"
+                "- Cover ALL aspects of the topic, not just the main point\n"
+                "- Include more specific values, codes, names, steps, or examples from the data\n"
+                "- If previous data was partial or incomplete, present more records\n"
+                "- Explain related context and connections that were not covered before\n"
+                "=== END DEEP ANALYSIS ==="
+            )
+            context = (context + _depth_note) if context else _depth_note
+            logger.info("📣 Deep analysis instruction appended to context")
+        # ── End Deep Analysis Detection ───────────────────────────────────────
 
         logger.info("🎯 Detecting intent...")
         intent = await self.detect_intent_with_ai(question, context)

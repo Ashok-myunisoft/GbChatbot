@@ -115,12 +115,34 @@ def _detect_table_from_question(user_question: str) -> "str | None":
     words = re.findall(r'\b\w{3,}\b', user_question)
     words_sorted = sorted(set(words), key=len, reverse=True)  # longest word first
 
-    # Pass 1 — exact match (any length)
+    # Pass 1 — exact single-word match (case-insensitive)
     for word in words_sorted:
         if word.upper() in tables_upper:
             return tables_upper[word.upper()]
 
-    # Pass 2 — partial match (meaningful words only)
+    # Pass 2 — compound bigram match for multi-word table names
+    # e.g. "purchase order" → "PURCHASEORDER" finds MPURCHASEORDER, PLPURCHASEORDER, etc.
+    word_list = re.findall(r'\b\w+\b', user_question)
+    compound_hits = []
+    for i in range(len(word_list) - 1):
+        compound = (word_list[i] + word_list[i + 1]).upper()
+        for tbl_up, tbl_orig in tables_upper.items():
+            if tbl_up == compound:
+                compound_hits.append((0, len(tbl_up), tbl_orig))   # exact
+            else:
+                # compound appears right after a short prefix (1–3 chars: M, PL, FW, HR, GL…)
+                for offset in range(1, 4):
+                    if tbl_up[offset:] == compound:
+                        compound_hits.append((offset, len(tbl_up), tbl_orig))
+                        break
+                    elif tbl_up[offset:].startswith(compound):
+                        compound_hits.append((offset + 1, len(tbl_up), tbl_orig))
+                        break
+    if compound_hits:
+        compound_hits.sort(key=lambda x: (x[0], x[1], x[2]))
+        return compound_hits[0][2]
+
+    # Pass 3 — partial match (meaningful words only, any table prefix)
     skip_words = {
         'table', 'tables', 'column', 'columns', 'record', 'records',
         'field', 'fields', 'value', 'values', 'database', 'schema',
@@ -136,14 +158,27 @@ def _detect_table_from_question(user_question: str) -> "str | None":
         if word.lower() in skip_words:
             continue
         for tbl_up, tbl_orig in tables_upper.items():
+            match_word = None
             if w_up in tbl_up:
-                partial_hits.append((len(tbl_up), tbl_orig))
+                match_word = w_up
             elif w_up.endswith('S') and w_up[:-1] in tbl_up:
-                partial_hits.append((len(tbl_up), tbl_orig))
+                match_word = w_up[:-1]
+            if match_word:
+                # Quality score — lower is better, prefix-agnostic:
+                # 0 = word matches from position 0 of table name  (SALE → SALESORDER)
+                # 1 = word matches from position 1–3 (after any short prefix: M, PL, FW…)
+                # 2 = word appears anywhere else inside the table name
+                if tbl_up.startswith(match_word):
+                    quality = 0
+                elif any(tbl_up[p:].startswith(match_word) for p in range(1, 4)):
+                    quality = 1
+                else:
+                    quality = 2
+                partial_hits.append((quality, len(tbl_up), tbl_orig))
 
     if partial_hits:
-        partial_hits.sort(key=lambda x: (x[0], 0 if x[1].upper().startswith('M') else 1, x[1]))
-        return partial_hits[0][1]
+        partial_hits.sort(key=lambda x: (x[0], x[1], x[2]))
+        return partial_hits[0][2]
 
     return None
 
@@ -181,14 +216,20 @@ def _generate_sql(llm, table_name: str, col_names: list, user_question: str, max
         f"              'show me all menus'        → SELECT * FROM mmenu LIMIT {max_rows}\n"
         f"              'list all formulas'        → SELECT * FROM mformulafield LIMIT {max_rows}\n"
         f"- Row filtering: ONLY add a WHERE clause when the user provides a specific filter value (a name, keyword, ID, or category to search for).\n"
-        f"  * Extract the key search term from the question and filter using ILIKE (case-insensitive).\n"
-        f"  * Examples: 'employee named John'         → WHERE CAST(employeename AS TEXT) ILIKE '%John%'\n"
-        f"              'reports in finance module'   → WHERE CAST(reportname AS TEXT) ILIKE '%finance%'\n"
         f"  * Words like 'show', 'get', 'list', 'give', 'all', 'me', 'the' are NOT filter values — ignore them.\n"
-        f"- Use ILIKE for case-insensitive text searches (PostgreSQL)\n"
+        f"- EXACT NAME LOOKUP vs KEYWORD SEARCH — choose carefully:\n"
+        f"  * EXACT MATCH: When the user asks for a specific named item (e.g. 'menucode for Program', 'what is the id of Sales', 'code of Finance')\n"
+        f"    → Use LOWER(CAST(col AS TEXT)) = LOWER('exact_name')  — do NOT use ILIKE '%name%'\n"
+        f"    Examples: 'menucode for Program'      → WHERE LOWER(CAST(menuname AS TEXT)) = LOWER('program')\n"
+        f"              'what is the id of Sales'   → WHERE LOWER(CAST(modulename AS TEXT)) = LOWER('sales')\n"
+        f"              'employee named John Smith' → WHERE LOWER(CAST(employeename AS TEXT)) = LOWER('john smith')\n"
+        f"  * KEYWORD SEARCH: When the user searches broadly by category, module, or partial description\n"
+        f"    → Use CAST(col AS TEXT) ILIKE '%keyword%'\n"
+        f"    Examples: 'reports in finance module'   → WHERE CAST(reportname AS TEXT) ILIKE '%finance%'\n"
+        f"              'menus related to purchase'   → WHERE CAST(menuname AS TEXT) ILIKE '%purchase%'\n"
         f"- ALWAYS wrap every column with CAST(col AS TEXT) when using ILIKE or = with a string value\n"
-        f"  * Correct:   WHERE CAST(reportviewtype AS TEXT) ILIKE '%leave%'\n"
-        f"  * Incorrect: WHERE reportviewtype = 'LEAVE BALANCE'\n"
+        f"  * Correct:   LOWER(CAST(menuname AS TEXT)) = LOWER('program')\n"
+        f"  * Incorrect: menuname = 'Program'\n"
         f"- Do NOT use double quotes around table or column names\n"
         f"- Use COALESCE instead of ISNULL\n"
         f"- Use NOW() instead of GETDATE()\n"
@@ -405,7 +446,7 @@ def query_table(table_name: str, search_term: str, max_rows: int = 50) -> str:
                     with engine.connect() as conn:
                         df = pd.read_sql(sa_text(f'SELECT * FROM {table_name.lower()} LIMIT 30'), conn)
                     return (
-                        f"Data from table '{table_name}' ({len(df)} rows):\n\n"
+                        f"[NOTE: No matching rows found for the query. Showing a general sample of {len(df)} rows from '{table_name}' for context only — this may NOT directly answer the user's question.]\n\n"
                         + _format_df(df)
                     )
                 except Exception:
