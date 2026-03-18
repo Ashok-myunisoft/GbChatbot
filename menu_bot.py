@@ -143,6 +143,8 @@ History: {history}
 [QUESTION]
 {question}
 
+⚠ FINAL INSTRUCTION: The data above is already fetched. Present it DIRECTLY. DO NOT write SQL or suggest running queries.
+
 Answer (use only the Menu Data above):
 
 """

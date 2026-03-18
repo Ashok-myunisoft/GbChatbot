@@ -373,6 +373,8 @@ FORMULA KNOWLEDGE BASE (Primary Formula Information — fetched live from Postgr
 ────────────────────────────────────────
 USER QUESTION: {question}
 
+⚠ FINAL INSTRUCTION: The data above is already fetched. Present it DIRECTLY. DO NOT write SQL or suggest running queries.
+
 ────────────────────────────────────────
 CONTEXT-AWARE FORMULA RESPONSE (Synthesize all available information):
 """

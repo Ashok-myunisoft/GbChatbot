@@ -323,6 +323,8 @@ REPORT KNOWLEDGE BASE (Primary Report Information — fetched live from PostgreS
 ────────────────────────────────────────
 USER QUESTION: {question}
 
+⚠ FINAL INSTRUCTION: The data above is already fetched. Present it DIRECTLY. DO NOT write SQL or suggest running queries.
+
 ────────────────────────────────────────
 CONTEXT-AWARE REPORT RESPONSE (Synthesize all available information):
 """

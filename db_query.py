@@ -87,7 +87,17 @@ def _get_all_tables() -> list:
         )
         with engine.connect() as conn:
             df = pd.read_sql(query, conn)
-        _table_cache = df["table_name"].drop_duplicates().tolist()
+        _raw = df["table_name"].drop_duplicates().tolist()
+        # Deduplicate partition-like tables: macloperation_2024, macloperation_2025 → keep first seen
+        # Pattern: trailing _\d+ suffix (e.g. _2024, _01, _2024_01) indicates a partition copy
+        _seen_bases: set = set()
+        _deduped = []
+        for t in _raw:
+            base = re.sub(r'(_\d+)+$', '', t.lower())
+            if base not in _seen_bases:
+                _seen_bases.add(base)
+                _deduped.append(t)
+        _table_cache = _deduped
         _table_cache_ts = now
         return _table_cache
     except Exception as e:

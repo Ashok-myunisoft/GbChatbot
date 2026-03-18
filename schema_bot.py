@@ -161,6 +161,9 @@ TYPE B — SCHEMA / STRUCTURE EXPLANATION (user wants to understand table design
 [USER QUESTION]
 {question}
 
+⚠ FINAL INSTRUCTION: The data above is already fetched from the database. Present it DIRECTLY.
+DO NOT write SQL. DO NOT say "run this query" or "use this command". Just show the data.
+
 Response:
 """
 
