@@ -16,16 +16,20 @@ logger = logging.getLogger(__name__)
 # ===========================
 # Read config from environment
 # ===========================
-RUNPOD_ENDPOINT_URL = os.getenv("RUNPOD_ENDPOINT_URL", "https://api.runpod.ai/v2/wg49n0prq013uh/run")
-RUNPOD_API_KEY      = os.getenv("RUNPOD_API_KEY", "")
+RUNPOD_ENDPOINT_URL = os.getenv( "RUNPOD_ENDPOINT_URL", "https://api.runpod.ai/v2/wg49n0prq013uh/run")
+RUNPOD_API_KEY      = os.getenv( "RUNPOD_API_KEY", "")
 EMBEDDING_MODEL     = os.getenv("EMBEDDING_MODEL",  "sentence-transformers/all-MiniLM-L6-v2")
 EMBEDDING_DEVICE    = os.getenv("EMBEDDING_DEVICE", "cpu")
 
-# Derive the GET status base URL from the POST run URL
-# POST: https://api.runpod.ai/v2/wg49n0prq013uh/run
-# GET:  https://api.runpod.ai/v2/wg49n0prq013uh/status/{job_id}
-_ENDPOINT_BASE    = RUNPOD_ENDPOINT_URL.rsplit("/run", 1)[0]
-RUNPOD_STATUS_URL = f"{_ENDPOINT_BASE}/status"
+# SQL Agent — separate RunPod endpoint (same API key)
+RUNPOD_SQL_ENDPOINT_URL = os.getenv("RUNPOD_SQL_ENDPOINT_URL", "https://api.runpod.ai/v2/ezql2os5tdrpdr/run")
+
+# Derive the GET status base URLs
+_ENDPOINT_BASE        = RUNPOD_ENDPOINT_URL.rsplit("/run", 1)[0]
+RUNPOD_STATUS_URL     = f"{_ENDPOINT_BASE}/status"
+
+_SQL_ENDPOINT_BASE    = RUNPOD_SQL_ENDPOINT_URL.rsplit("/run", 1)[0]
+RUNPOD_SQL_STATUS_URL = f"{_SQL_ENDPOINT_BASE}/status"
 
 
 # ===========================
@@ -98,7 +102,7 @@ class RunPodLLM(LLM):
             time.sleep(self.poll_interval)
             elapsed += self.poll_interval
 
-            get_resp = requests.get(poll_url, headers=headers, timeout=30)
+            get_resp = requests.get(poll_url, headers=headers, timeout=60)
             get_resp.raise_for_status()
             data   = get_resp.json()
             status = data.get("status", "UNKNOWN")
@@ -109,7 +113,8 @@ class RunPodLLM(LLM):
                 output = data.get("output", "")
                 logger.info(f"[RunPod] job {job_id} COMPLETED")
                 if isinstance(output, dict):
-                    return output.get("text", str(output))
+                    # RunPod workers may return {"text": "..."} or {"output": "..."}
+                    return output.get("text", output.get("output", str(output)))
                 return str(output)
 
             if status in ("FAILED", "CANCELLED"):
@@ -139,9 +144,10 @@ class AIResources:
             return
 
         logger.info("Initializing shared AI resources...")
-        logger.info(f"RunPod Endpoint : {RUNPOD_ENDPOINT_URL}")
-        logger.info(f"RunPod Status   : {RUNPOD_STATUS_URL}")
-        logger.info(f"Embeddings      : {EMBEDDING_MODEL} (device={EMBEDDING_DEVICE})")
+        logger.info(f"RunPod Endpoint     : {RUNPOD_ENDPOINT_URL}")
+        logger.info(f"RunPod Status       : {RUNPOD_STATUS_URL}")
+        logger.info(f"RunPod SQL Endpoint : {RUNPOD_SQL_ENDPOINT_URL}")
+        logger.info(f"Embeddings          : {EMBEDDING_MODEL} (device={EMBEDDING_DEVICE})")
 
         # Routing LLM — fast, only needs one-word intent output
         self.routing_llm = RunPodLLM(
@@ -163,6 +169,17 @@ class AIResources:
             max_tokens=2048,
             poll_interval=1.5,
             timeout=120.0,
+        )
+
+        # SQL Agent LLM — dedicated endpoint for Text-to-SQL (sqlcoder)
+        self.sql_llm = RunPodLLM(
+            endpoint_url=RUNPOD_SQL_ENDPOINT_URL,
+            status_url=RUNPOD_SQL_STATUS_URL,
+            api_key=RUNPOD_API_KEY,
+            temperature=0.1,
+            max_tokens=512,
+            poll_interval=1.5,
+            timeout=200.0,
         )
 
         # Shared Embeddings
