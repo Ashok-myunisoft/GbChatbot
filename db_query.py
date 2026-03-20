@@ -34,6 +34,10 @@ _table_cache: list = []
 _table_cache_ts: float = 0.0
 _TABLE_CACHE_TTL: int = 300
 
+# Query result cache — avoids sql_llm RunPod call for repeated questions
+_query_cache: dict = {}
+_QUERY_CACHE_TTL: int = 300  # 5 minutes
+
 
 def _get_engine():
     global _engine
@@ -384,6 +388,16 @@ def run_db_agent(query: str, max_rows: int = 50) -> str:
       Tool 4: fix_sql_tool      → self-heal on SQL error, retry once
       Tool 5: keyword fallback  → last resort ILIKE query if all above fail
     """
+    # Check query cache first — skip sql_llm entirely if same question asked recently
+    global _query_cache
+    _cache_key = f"{query.lower().strip()}:{max_rows}"
+    _now = time.time()
+    if _cache_key in _query_cache:
+        _cached_result, _cached_ts = _query_cache[_cache_key]
+        if _now - _cached_ts < _QUERY_CACHE_TTL:
+            logger.info(f"Query cache hit — skipping RunPod sql_llm call")
+            return _cached_result
+
     try:
         # Tool 1 — Schema (query-aware: relevant tables first + full table name list)
         schema = get_schema_tool(question=query)
@@ -424,10 +438,12 @@ def run_db_agent(query: str, max_rows: int = 50) -> str:
         if "df" in result and not result["df"].empty:
             df = result["df"]
             logger.info(f"Agent matched {len(df)} rows")
-            return (
+            final = (
                 f"Results for '{query}' ({len(df)} rows):\n\n"
                 + _format_df(df)
             )
+            _query_cache[_cache_key] = (final, time.time())
+            return final
 
         if "error" in result:
             logger.warning(f"All attempts failed: {result['error']}")

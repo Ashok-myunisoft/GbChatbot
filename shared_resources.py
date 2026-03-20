@@ -156,7 +156,7 @@ class AIResources:
             api_key=RUNPOD_API_KEY,
             temperature=0.2,
             max_tokens=15,
-            poll_interval=1.5,
+            poll_interval=0.8,
             timeout=60.0,
         )
 
@@ -166,8 +166,8 @@ class AIResources:
             status_url=RUNPOD_STATUS_URL,
             api_key=RUNPOD_API_KEY,
             temperature=0.2,
-            max_tokens=2048,
-            poll_interval=1.5,
+            max_tokens=1024,
+            poll_interval=0.8,
             timeout=120.0,
         )
 
@@ -178,7 +178,7 @@ class AIResources:
             api_key=RUNPOD_API_KEY,
             temperature=0.1,
             max_tokens=512,
-            poll_interval=1.5,
+            poll_interval=0.8,
             timeout=200.0,
         )
 

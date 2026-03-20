@@ -3081,19 +3081,23 @@ async def startup_event():
 
         # --------------------------------------------------
         # 🔥 WARM RUNPOD MODELS (optional — non-fatal)
+        # Includes sql_llm so the SQL endpoint is also warm on first request.
+        # Uses wait_for with a generous timeout to survive RunPod queue delays.
         # --------------------------------------------------
-        logger.info("🔥 Warming models in parallel...")
-        try:
-            await asyncio.gather(
-                ai_orchestrator.routing_llm.ainvoke("hello"),
-                ai_orchestrator.response_llm.ainvoke("Reply OK")
-            )
-            logger.info("✅ RunPod models warmed")
-        except Exception as warm_err:
-            logger.warning(
-                f"⚠️ Model warm-up skipped (RunPod unreachable or API key issue): {warm_err}"
-            )
-            logger.warning("⚠️ App will still start — warm-up is optional.")
+        logger.info("🔥 Warming all 3 RunPod endpoints in parallel...")
+        async def _warm(coro, name):
+            try:
+                await asyncio.wait_for(coro, timeout=250)
+                logger.info(f"✅ {name} warmed")
+            except Exception as e:
+                logger.warning(f"⚠️ {name} warm-up failed (non-fatal): {e}")
+
+        await asyncio.gather(
+            _warm(asyncio.to_thread(ai_resources.routing_llm.invoke, "ping"), "routing_llm"),
+            _warm(asyncio.to_thread(ai_resources.response_llm.invoke, "ping"), "response_llm"),
+            _warm(asyncio.to_thread(ai_resources.sql_llm.invoke, "SELECT 1"), "sql_llm"),
+        )
+        logger.info("🔥 RunPod model warm-up complete")
 
         # --------------------------------------------------
         # 📦 FORCE FAISS INTO MEMORY (if exists)
@@ -3126,7 +3130,7 @@ async def startup_event():
             try:
                 await asyncio.wait_for(
                     bot.answer("test", "", "client", "__warmup__"),
-                    timeout=10
+                    timeout=250
                 )
                 logger.info(f"🔥 {name} bot warmed")
             except Exception:
@@ -3141,6 +3145,25 @@ async def startup_event():
             warm_bot(ProjectBot(), "project"),
             warm_bot(SchemaBot(), "schema")
         )
+
+        # --------------------------------------------------
+        # 🔥 BACKGROUND KEEPALIVE (prevents RunPod cold start)
+        # --------------------------------------------------
+        async def _keepalive_loop():
+            """Ping both RunPod endpoints every 4 min so workers never scale to 0."""
+            while True:
+                await asyncio.sleep(240)  # 4 minutes — RunPod idles at 5 min
+                try:
+                    await asyncio.gather(
+                        asyncio.to_thread(ai_resources.routing_llm.invoke, "ping"),
+                        asyncio.to_thread(ai_resources.sql_llm.invoke, "SELECT 1"),
+                    )
+                    logger.info("Keepalive ping sent to both RunPod endpoints")
+                except Exception as ke:
+                    logger.warning(f"Keepalive ping failed (non-fatal): {ke}")
+
+        asyncio.create_task(_keepalive_loop())
+        logger.info("RunPod keepalive loop started (ping every 4 min)")
 
         # --------------------------------------------------
         # 🧹 BACKGROUND CLEANUP
