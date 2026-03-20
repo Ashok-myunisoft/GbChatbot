@@ -379,16 +379,21 @@ def run_db_agent(query: str, max_rows: int = 50) -> str:
     """
     Orchestrates the 4 tools using RunPod SQL endpoint:
       Tool 1: get_schema_tool   → fetch tables + FK relationships
-      Tool 2: generate_sql_tool → LLM generates JOIN-aware SELECT
+      Tool 2: generate_sql_tool → LLM generates JOIN-aware SELECT (retries once on cold-start timeout)
       Tool 3: execute_sql_tool  → run safely (SELECT only)
       Tool 4: fix_sql_tool      → self-heal on SQL error, retry once
+      Tool 5: keyword fallback  → last resort ILIKE query if all above fail
     """
     try:
         # Tool 1 — Schema (query-aware: relevant tables first + full table name list)
         schema = get_schema_tool(question=query)
 
-        # Tool 2 — Generate SQL
-        sql = generate_sql_tool(query, schema, max_rows)
+        # Tool 2 — Generate SQL (with cold-start retry on TimeoutError)
+        try:
+            sql = generate_sql_tool(query, schema, max_rows)
+        except TimeoutError:
+            logger.warning("SQL LLM timed out (cold start) — retrying once, worker should be warm now")
+            sql = generate_sql_tool(query, schema, max_rows)
         logger.info(f"Generated SQL: {sql[:200]}")
 
         if not sql.strip().upper().startswith("SELECT"):
@@ -400,7 +405,11 @@ def run_db_agent(query: str, max_rows: int = 50) -> str:
         # Tool 4 — Self-heal if error
         if "error" in result:
             logger.warning(f"SQL error: {result['error']} — attempting self-heal")
-            fixed_sql = fix_sql_tool(sql, result["error"])
+            try:
+                fixed_sql = fix_sql_tool(sql, result["error"])
+            except TimeoutError:
+                logger.warning("Self-heal LLM timed out (cold start) — retrying once")
+                fixed_sql = fix_sql_tool(sql, result["error"])
             logger.info(f"Fixed SQL: {fixed_sql[:200]}")
             result = execute_sql_tool(fixed_sql)
 

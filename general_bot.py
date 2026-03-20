@@ -464,9 +464,13 @@ async def chat(message: Message, Login: str = Header(...)):
        
         # Generate response
         logger.info("🤖 Generating response with LLM...")
-        raw = llm.invoke(prompt_text)
+        try:
+            raw = llm.invoke(prompt_text)
+        except TimeoutError:
+            logger.warning("LLM timed out (cold start) — retrying once")
+            raw = llm.invoke(prompt_text)
         answer = raw.content if hasattr(raw, 'content') else str(raw)
- 
+
         # Clean and format response
         cleaned_answer = clean_response(answer)
         formatted_answer = format_as_points(cleaned_answer)

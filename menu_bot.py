@@ -210,9 +210,13 @@ async def chat(message: Message, Login: str = Header(...)):
             question=user_input
         )
 
-        raw = llm.invoke(prompt_text)
+        try:
+            raw = llm.invoke(prompt_text)
+        except TimeoutError:
+            logger.warning("LLM timed out (cold start) — retrying once")
+            raw = llm.invoke(prompt_text)
         answer = raw.content if hasattr(raw, 'content') else str(raw)
-        
+
         logger.info(f"✅ Generated answer: {len(answer)} chars")
        
         cleaned_answer = clean_response(answer)
