@@ -3081,10 +3081,9 @@ async def startup_event():
 
         # --------------------------------------------------
         # 🔥 WARM RUNPOD MODELS (optional — non-fatal)
-        # Includes sql_llm so the SQL endpoint is also warm on first request.
-        # Uses wait_for with a generous timeout to survive RunPod queue delays.
+        # Main endpoint (routing + response): wait for it — fast (~10s), needed immediately.
+        # SQL endpoint: fire in background — slow model, must not block startup.
         # --------------------------------------------------
-        logger.info("🔥 Warming all 3 RunPod endpoints in parallel...")
         async def _warm(coro, name):
             try:
                 await asyncio.wait_for(coro, timeout=250)
@@ -3092,12 +3091,19 @@ async def startup_event():
             except Exception as e:
                 logger.warning(f"⚠️ {name} warm-up failed (non-fatal): {e}")
 
+        # Wait for main endpoint (routing + response) — completes in ~10s
+        logger.info("🔥 Warming main RunPod endpoint (routing + response)...")
         await asyncio.gather(
             _warm(asyncio.to_thread(ai_resources.routing_llm.invoke, "ping"), "routing_llm"),
             _warm(asyncio.to_thread(ai_resources.response_llm.invoke, "ping"), "response_llm"),
-            _warm(asyncio.to_thread(ai_resources.sql_llm.invoke, "SELECT 1"), "sql_llm"),
         )
-        logger.info("🔥 RunPod model warm-up complete")
+        logger.info("🔥 Main endpoint warm-up complete")
+
+        # Fire sql_llm warmup in background — heavy model, don't block startup
+        asyncio.create_task(
+            _warm(asyncio.to_thread(ai_resources.sql_llm.invoke, "SELECT 1"), "sql_llm")
+        )
+        logger.info("🔥 SQL endpoint warming in background (non-blocking)")
 
         # --------------------------------------------------
         # 📦 FORCE FAISS INTO MEMORY (if exists)
