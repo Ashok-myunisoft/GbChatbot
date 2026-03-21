@@ -3100,8 +3100,10 @@ async def startup_event():
         logger.info("🔥 Main endpoint warm-up complete")
 
         # Fire sql_llm warmup in background — heavy model, don't block startup
+        # Must use call_sql_endpoint (correct payload format: query + schema)
+        from shared_resources import call_sql_endpoint
         asyncio.create_task(
-            _warm(asyncio.to_thread(ai_resources.sql_llm.invoke, "SELECT 1"), "sql_llm")
+            _warm(asyncio.to_thread(call_sql_endpoint, "list all records", "test(id)"), "sql_llm")
         )
         logger.info("🔥 SQL endpoint warming in background (non-blocking)")
 

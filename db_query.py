@@ -182,33 +182,24 @@ def get_schema_tool(tables_limit: int = 20, question: str = "") -> str:
 
 def generate_sql_tool(question: str, schema: str, max_rows: int = 50) -> str:
     """TOOL 2 — Generate PostgreSQL SELECT from question + schema via RunPod."""
-    from shared_resources import ai_resources
-    llm = ai_resources.sql_llm  # dedicated SQL agent endpoint
+    from shared_resources import call_sql_endpoint
 
-    prompt = f"""You are a PostgreSQL expert.
-
-Schema:
-{schema}
+    enriched_question = f"""{question}
 
 STRICT RULES:
 - ONLY SELECT queries — never INSERT, UPDATE, DELETE, DROP, ALTER
 - Use LIMIT {max_rows}
 - All table/column names are LOWERCASE — never use uppercase or quoted identifiers
-- Use proper JOIN when question involves multiple tables (use RELATIONSHIPS above)
+- Use proper JOIN when question involves multiple tables
 - Use aliases (e, d, o, c) for readability
 - FILTER RULE: Only add WHERE if question has a specific filter value (name, ID, keyword)
   * 'show/list/get/give all X' with no filter → NO WHERE clause
   * 'employee named John' → WHERE CAST(employeename AS TEXT) ILIKE '%John%'
 - Use ILIKE for text search: CAST(col AS TEXT) ILIKE '%value%'
 - Use NOW() not GETDATE(), COALESCE not ISNULL
-- Return ONLY the raw SQL — no explanation, no markdown, no code fences
+- Return ONLY the raw SQL — no explanation, no markdown, no code fences"""
 
-Question: {question}
-
-SQL:"""
-
-    res = llm.invoke(prompt)
-    sql = res.content if hasattr(res, "content") else str(res)
+    sql = call_sql_endpoint(query=enriched_question, schema=schema)
 
     # Unwrap {'output': '...'} if LLM returned wrapped format
     if sql.strip().startswith("{") and ("'output'" in sql or '"output"' in sql):
@@ -263,28 +254,16 @@ def execute_sql_tool(sql: str) -> dict:
 
 def fix_sql_tool(sql: str, error: str) -> str:
     """TOOL 4 — Fix broken SQL using error message via RunPod."""
-    from shared_resources import ai_resources
-    llm = ai_resources.sql_llm  # dedicated SQL agent endpoint
+    from shared_resources import call_sql_endpoint
 
-    prompt = f"""Fix this PostgreSQL SELECT query.
+    fix_query = (
+        f"Fix this broken PostgreSQL SELECT query and return only the corrected SQL.\n"
+        f"Error: {error}\n"
+        f"Rules: Only SELECT, fix the syntax error, keep same meaning, all names lowercase."
+    )
+    fix_schema = f"Broken SQL to fix:\n{sql}"
 
-SQL:
-{sql}
-
-Error:
-{error}
-
-Rules:
-- Only SELECT
-- Fix the syntax error
-- Keep same meaning
-- All names lowercase — no quoted identifiers
-- Return only the fixed SQL, no explanation
-
-Fixed SQL:"""
-
-    res = llm.invoke(prompt)
-    fixed = res.content if hasattr(res, "content") else str(res)
+    fixed = call_sql_endpoint(query=fix_query, schema=fix_schema)
     fixed = re.sub(r"```(?:sql)?", "", fixed, flags=re.IGNORECASE).replace("```", "").strip()
     return _fix_pg_syntax(fixed)
 

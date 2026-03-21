@@ -192,5 +192,66 @@ class AIResources:
         logger.info("Shared AI resources initialized ✅")
 
 
+# ===========================
+# SQL Endpoint Direct Caller
+# ===========================
+def call_sql_endpoint(query: str, schema: str, timeout: float = 200.0) -> str:
+    """
+    Call the SQL RunPod endpoint with the correct payload format.
+    The SQL endpoint expects {"input": {"query": ..., "schema": ...}}
+    NOT the standard {"input": {"prompt": ...}} format.
+    """
+    headers = {
+        "Authorization": f"Bearer {RUNPOD_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    post_resp = requests.post(
+        RUNPOD_SQL_ENDPOINT_URL,
+        json={"input": {"query": query, "schema": schema}},
+        headers=headers,
+        timeout=30,
+    )
+    post_resp.raise_for_status()
+
+    post_data = post_resp.json()
+    job_id = post_data.get("id")
+    if not job_id:
+        raise ValueError(f"RunPod SQL endpoint did not return a job id. Response: {post_data}")
+
+    logger.info(f"[RunPod SQL] Job submitted → id: {job_id}")
+
+    poll_url = f"{RUNPOD_SQL_STATUS_URL}/{job_id}"
+    elapsed = 0.0
+    poll_interval = 0.8
+
+    while elapsed < timeout:
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+
+        get_resp = requests.get(poll_url, headers=headers, timeout=60)
+        get_resp.raise_for_status()
+        data = get_resp.json()
+        status = data.get("status", "UNKNOWN")
+
+        logger.info(f"[RunPod SQL] job {job_id} → {status} ({elapsed:.1f}s)")
+
+        if status == "COMPLETED":
+            output = data.get("output", "")
+            logger.info(f"[RunPod SQL] job {job_id} COMPLETED")
+            if isinstance(output, dict):
+                return output.get("text", output.get("output", str(output)))
+            return str(output)
+
+        if status in ("FAILED", "CANCELLED"):
+            raise RuntimeError(
+                f"[RunPod SQL] job {job_id} {status}: {data.get('error', 'No error message')}"
+            )
+
+    raise TimeoutError(
+        f"[RunPod SQL] job {job_id} did not complete within {timeout}s"
+    )
+
+
 # Global singleton instance
 ai_resources = AIResources()
