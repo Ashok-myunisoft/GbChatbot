@@ -166,29 +166,33 @@ def get_schema_tool(tables_limit: int = 20, question: str = "") -> str:
         # When RAG found tables, use only those + FK neighbours (no padding with unrelated tables)
         priority = [t for t in tables if t.lower() in related]
         others   = [t for t in tables if t.lower() not in related]
-        selected = priority if _rag_tables else priority + others[:max(0, tables_limit - len(priority))]
+        selected = priority if _rag_tables else priority + others[:max(0, 5 - len(priority))]
 
         schema_lines = []
         for t in selected:
             cols = get_columns(t)
-            schema_lines.append(f"{t}({', '.join(cols)})")
+            schema_lines.append(f"{t}({', '.join(cols[:15])})")  # cap at 15 cols per table
+
+        # Only include FK relationships between selected tables
+        selected_lower = {t.lower() for t in selected}
+        rel_lines = [
+            f"{r['source_table']}.{r['source_column']} -> {r['target_table']}.{r['target_column']}"
+            for r in rels
+            if r['source_table'].lower() in selected_lower
+            and r['target_table'].lower() in selected_lower
+        ]
 
         result = "SCHEMA:\n" + "\n".join(schema_lines)
+        if rel_lines:
+            result += "\nFKs:\n" + "\n".join(rel_lines)
+        return result
     else:
         schema_lines = []
-        for t in tables[:tables_limit]:
+        for t in tables[:5]:
             cols = get_columns(t)
-            schema_lines.append(f"{t}({', '.join(cols)})")
-        result = "TABLES:\n" + "\n".join(schema_lines)
-
-    rel_lines = [
-        f"{r['source_table']}.{r['source_column']} -> "
-        f"{r['target_table']}.{r['target_column']}"
-        for r in rels[:30]
-    ]
-    if rel_lines:
-        result += "\n\nRELATIONSHIPS (Foreign Keys):\n" + "\n".join(rel_lines)
-    return result
+            schema_lines.append(f"{t}({', '.join(cols[:15])})")
+        result = "SCHEMA:\n" + "\n".join(schema_lines)
+        return result
 
 
 # =========================================================
