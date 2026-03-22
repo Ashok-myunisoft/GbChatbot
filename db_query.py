@@ -166,7 +166,7 @@ def get_schema_tool(tables_limit: int = 20, question: str = "") -> str:
         # When RAG found tables, use only those + FK neighbours (no padding with unrelated tables)
         priority = [t for t in tables if t.lower() in related]
         others   = [t for t in tables if t.lower() not in related]
-        selected = priority if _rag_tables else priority + others[:max(0, 5 - len(priority))]
+        selected = (priority if _rag_tables else priority + others[:max(0, 5 - len(priority))])[:5]
 
         schema_lines = []
         for t in selected:
