@@ -3107,6 +3107,11 @@ async def startup_event():
         )
         logger.info("🔥 SQL endpoint warming in background (non-blocking)")
 
+        # Build Schema RAG index in background — non-blocking, safe to fail
+        from schema_rag import build_or_load_index
+        asyncio.create_task(asyncio.to_thread(build_or_load_index))
+        logger.info("📐 Schema RAG index building in background (non-blocking)")
+
         # --------------------------------------------------
         # 📦 FORCE FAISS INTO MEMORY (if exists)
         # --------------------------------------------------
@@ -3154,24 +3159,6 @@ async def startup_event():
             warm_bot(SchemaBot(), "schema")
         )
 
-        # --------------------------------------------------
-        # 🔥 BACKGROUND KEEPALIVE (prevents RunPod cold start)
-        # --------------------------------------------------
-        async def _keepalive_loop():
-            """Ping both RunPod endpoints every 4 min so workers never scale to 0."""
-            while True:
-                await asyncio.sleep(240)  # 4 minutes — RunPod idles at 5 min
-                try:
-                    await asyncio.gather(
-                        asyncio.to_thread(ai_resources.routing_llm.invoke, "ping"),
-                        asyncio.to_thread(ai_resources.sql_llm.invoke, "SELECT 1"),
-                    )
-                    logger.info("Keepalive ping sent to both RunPod endpoints")
-                except Exception as ke:
-                    logger.warning(f"Keepalive ping failed (non-fatal): {ke}")
-
-        asyncio.create_task(_keepalive_loop())
-        logger.info("RunPod keepalive loop started (ping every 4 min)")
 
         # --------------------------------------------------
         # 🧹 BACKGROUND CLEANUP

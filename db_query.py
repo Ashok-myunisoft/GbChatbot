@@ -131,16 +131,36 @@ def get_schema_tool(tables_limit: int = 20, question: str = "") -> str:
     rels = get_relationships()
 
     if question:
-        # Identify the target table and its direct FK neighbours
-        target = _detect_table_from_question(question)
-        related: set = set()
-        if target:
-            related.add(target.lower())
-            for r in rels:
-                if r['source_table'].lower() == target.lower():
-                    related.add(r['target_table'].lower())
-                elif r['target_table'].lower() == target.lower():
-                    related.add(r['source_table'].lower())
+        # Pass 0 — Schema RAG (semantic search, faster + more accurate than keyword)
+        # Fully wrapped: any failure silently falls through to existing keyword logic below
+        _rag_tables: list = []
+        try:
+            from schema_rag import is_index_ready, search_schema
+            if is_index_ready():
+                _rag_tables = search_schema(question, top_k=5)
+        except Exception:
+            pass
+
+        if _rag_tables:
+            # RAG found relevant tables — build related set from RAG results + their FK neighbours
+            related: set = set(t.lower() for t in _rag_tables)
+            for t in _rag_tables:
+                for r in rels:
+                    if r['source_table'].lower() == t.lower():
+                        related.add(r['target_table'].lower())
+                    elif r['target_table'].lower() == t.lower():
+                        related.add(r['source_table'].lower())
+        else:
+            # Existing keyword logic (Pass 1/2/3) — completely unchanged
+            target = _detect_table_from_question(question)
+            related: set = set()
+            if target:
+                related.add(target.lower())
+                for r in rels:
+                    if r['source_table'].lower() == target.lower():
+                        related.add(r['target_table'].lower())
+                    elif r['target_table'].lower() == target.lower():
+                        related.add(r['source_table'].lower())
 
         # Priority tables first (related), then fill remaining slots with others
         priority = [t for t in tables if t.lower() in related]
