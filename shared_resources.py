@@ -22,7 +22,7 @@ EMBEDDING_MODEL     = os.getenv("EMBEDDING_MODEL",  "sentence-transformers/all-M
 EMBEDDING_DEVICE    = os.getenv("EMBEDDING_DEVICE", "cpu")
 
 # SQL Agent — separate RunPod endpoint (same API key)
-RUNPOD_SQL_ENDPOINT_URL = os.getenv("RUNPOD_SQL_ENDPOINT_URL", "https://api.runpod.ai/v2/8lgr7xxh32rymr/run")
+RUNPOD_SQL_ENDPOINT_URL = os.getenv("RUNPOD_SQL_ENDPOINT_URL", "https://api.runpod.ai/v2/memmd7zoeml0a4/run")
 
 # Derive the GET status base URLs
 _ENDPOINT_BASE        = RUNPOD_ENDPOINT_URL.rsplit("/run", 1)[0]
