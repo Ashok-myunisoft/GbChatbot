@@ -220,9 +220,9 @@ STRICT RULES:
 
     sql = call_sql_endpoint(query=enriched_question, schema=schema)
 
-    # Unwrap {'output': '...'} if LLM returned wrapped format
-    if sql.strip().startswith("{") and ("'output'" in sql or '"output"' in sql):
-        match = re.search(r"""['"]output['"]\s*:\s*['"](.+)""", sql.strip(), re.DOTALL)
+    # Unwrap {'sql': '...'} or {'output': '...'} if endpoint returned wrapped format
+    if sql.strip().startswith("{"):
+        match = re.search(r"""['"](?:sql|output)['"]\s*:\s*['"](.+)""", sql.strip(), re.DOTALL)
         if match:
             raw_sql = match.group(1)
             raw_sql = re.sub(r"""['"]\s*\}?\s*$""", "", raw_sql)

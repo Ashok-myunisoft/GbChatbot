@@ -240,7 +240,7 @@ def call_sql_endpoint(query: str, schema: str, timeout: float = 200.0) -> str:
             output = data.get("output", "")
             logger.info(f"[RunPod SQL] job {job_id} COMPLETED")
             if isinstance(output, dict):
-                return output.get("text", output.get("output", str(output)))
+                return output.get("sql", output.get("text", output.get("output", str(output))))
             return str(output)
 
         if status in ("FAILED", "CANCELLED"):
