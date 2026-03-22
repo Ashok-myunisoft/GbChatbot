@@ -163,22 +163,17 @@ def get_schema_tool(tables_limit: int = 20, question: str = "") -> str:
                         related.add(r['source_table'].lower())
 
         # Priority tables first (related), then fill remaining slots with others
+        # When RAG found tables, use only those + FK neighbours (no padding with unrelated tables)
         priority = [t for t in tables if t.lower() in related]
         others   = [t for t in tables if t.lower() not in related]
-        selected = priority + others[:max(0, tables_limit - len(priority))]
+        selected = priority if _rag_tables else priority + others[:max(0, tables_limit - len(priority))]
 
         schema_lines = []
         for t in selected:
             cols = get_columns(t)
             schema_lines.append(f"{t}({', '.join(cols)})")
 
-        # Give the LLM a full reference list (names only) so it knows all tables exist
-        all_names = ", ".join(tables)
-        result = (
-            f"ALL TABLES ({len(tables)} total): {all_names}\n\n"
-            f"DETAILED SCHEMA (query-relevant tables first):\n"
-            + "\n".join(schema_lines)
-        )
+        result = "SCHEMA:\n" + "\n".join(schema_lines)
     else:
         schema_lines = []
         for t in tables[:tables_limit]:
