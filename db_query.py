@@ -121,11 +121,11 @@ def get_relationships() -> list:
         return []
 
 
-def get_schema_tool(tables_limit: int = 20, question: str = "") -> str:
+def get_schema_tool(question: str = "", table_hint: str = "") -> str:
     """TOOL 1 — Returns tables + columns + FK relationships.
-    When question is provided, prioritises the detected target table and its
-    FK neighbours so the LLM always sees the relevant schema regardless of
-    how many tables exist in the database.
+    question:   used for Schema RAG / keyword detection to find relevant tables.
+    table_hint: table name forced by the calling bot (e.g. MREPORT, MFORMULA).
+                Always included first, before RAG/keyword results.
     """
     tables = get_tables()
     rels = get_relationships()
@@ -141,31 +141,38 @@ def get_schema_tool(tables_limit: int = 20, question: str = "") -> str:
         except Exception:
             pass
 
+        # table_hint (from calling bot) always takes priority as primary table
+        forced = table_hint.lower() if table_hint else ""
+
         if _rag_tables:
-            # RAG found relevant tables — build related set from RAG results + their FK neighbours
+            # RAG found relevant tables — only outgoing FKs (source = rag table)
+            # Avoids pulling in unrelated tables that merely reference the target
+            primary_table = forced or _rag_tables[0].lower()
             related: set = set(t.lower() for t in _rag_tables)
+            if forced:
+                related.add(forced)
             for t in _rag_tables:
                 for r in rels:
                     if r['source_table'].lower() == t.lower():
                         related.add(r['target_table'].lower())
-                    elif r['target_table'].lower() == t.lower():
-                        related.add(r['source_table'].lower())
         else:
             # Existing keyword logic (Pass 1/2/3) — completely unchanged
             target = _detect_table_from_question(question)
+            primary_table = forced or (target.lower() if target else "")
             related: set = set()
+            if forced:
+                related.add(forced)
             if target:
                 related.add(target.lower())
                 for r in rels:
                     if r['source_table'].lower() == target.lower():
                         related.add(r['target_table'].lower())
-                    elif r['target_table'].lower() == target.lower():
-                        related.add(r['source_table'].lower())
 
-        # Priority tables first (related), then fill remaining slots with others
-        # When RAG found tables, use only those + FK neighbours (no padding with unrelated tables)
-        priority = [t for t in tables if t.lower() in related]
-        others   = [t for t in tables if t.lower() not in related]
+        # Ensure primary table is always first before the :5 cap
+        primary_list = [t for t in tables if t.lower() == primary_table]
+        rest_related  = [t for t in tables if t.lower() in related and t.lower() != primary_table]
+        others        = [t for t in tables if t.lower() not in related]
+        priority      = primary_list + rest_related
         selected = (priority if _rag_tables else priority + others[:max(0, 5 - len(priority))])[:5]
 
         schema_lines = []
@@ -271,16 +278,17 @@ def execute_sql_tool(sql: str) -> dict:
 # 🔧 TOOL 4 — FIX SQL (SELF HEALING)
 # =========================================================
 
-def fix_sql_tool(sql: str, error: str) -> str:
-    """TOOL 4 — Fix broken SQL using error message via RunPod."""
+def fix_sql_tool(sql: str, error: str, schema: str = "") -> str:
+    """TOOL 4 — Fix broken SQL using error message + original schema via RunPod."""
     from shared_resources import call_sql_endpoint
 
     fix_query = (
         f"Fix this broken PostgreSQL SELECT query and return only the corrected SQL.\n"
         f"Error: {error}\n"
-        f"Rules: Only SELECT, fix the syntax error, keep same meaning, all names lowercase."
+        f"Rules: Only SELECT, fix the syntax error, keep same meaning, all names lowercase.\n"
+        f"Only use columns and tables that exist in the schema provided."
     )
-    fix_schema = f"Broken SQL to fix:\n{sql}"
+    fix_schema = f"Available schema:\n{schema}\n\nBroken SQL to fix:\n{sql}"
 
     fixed = call_sql_endpoint(query=fix_query, schema=fix_schema)
     fixed = re.sub(r"```(?:sql)?", "", fixed, flags=re.IGNORECASE).replace("```", "").strip()
@@ -377,14 +385,15 @@ def _format_df(df: pd.DataFrame) -> str:
 # 🤖 AGENT ORCHESTRATION (RunPod — no local model needed)
 # =========================================================
 
-def run_db_agent(query: str, max_rows: int = 50) -> str:
+def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
     """
     Orchestrates the 4 tools using RunPod SQL endpoint:
       Tool 1: get_schema_tool   → fetch tables + FK relationships
       Tool 2: generate_sql_tool → LLM generates JOIN-aware SELECT (retries once on cold-start timeout)
       Tool 3: execute_sql_tool  → run safely (SELECT only)
-      Tool 4: fix_sql_tool      → self-heal on SQL error, retry once
+      Tool 4: fix_sql_tool      → self-heal on SQL error with schema context
       Tool 5: keyword fallback  → last resort ILIKE query if all above fail
+    table_hint: optional table name passed by bots via query_table() to force correct table selection.
     """
     # Check query cache first — skip sql_llm entirely if same question asked recently
     global _query_cache
@@ -397,41 +406,67 @@ def run_db_agent(query: str, max_rows: int = 50) -> str:
             return _cached_result
 
     try:
-        # Tool 1 — Schema (query-aware: relevant tables first + full table name list)
-        schema = get_schema_tool(question=query)
+        # Tool 1 — Schema (query-aware: relevant tables first, table_hint forces correct table)
+        schema = get_schema_tool(question=query, table_hint=table_hint)
 
-        # Tool 2 — Generate SQL (with cold-start retry on TimeoutError)
+        # Tool 2 — Generate SQL
+        # TimeoutError = cold start → retry once (worker will be warm)
+        # RuntimeError = job FAILED (endpoint error) → skip straight to keyword fallback
+        sql = None
         try:
             sql = generate_sql_tool(query, schema, max_rows)
         except TimeoutError:
-            logger.warning("SQL LLM timed out (cold start) — retrying once, worker should be warm now")
-            sql = generate_sql_tool(query, schema, max_rows)
-        logger.info(f"Generated SQL: {sql[:200]}")
-
-        if not sql.strip().upper().startswith("SELECT"):
-            raise ValueError(f"Non-SELECT query blocked: {sql[:100]}")
-
-        # Tool 3 — Execute
-        result = execute_sql_tool(sql)
-
-        # Tool 4 — Self-heal if error
-        if "error" in result:
-            logger.warning(f"SQL error: {result['error']} — attempting self-heal")
+            logger.warning("SQL LLM timed out (cold start) — retrying once")
             try:
-                fixed_sql = fix_sql_tool(sql, result["error"])
-            except TimeoutError:
-                logger.warning("Self-heal LLM timed out (cold start) — retrying once")
-                fixed_sql = fix_sql_tool(sql, result["error"])
-            logger.info(f"Fixed SQL: {fixed_sql[:200]}")
-            result = execute_sql_tool(fixed_sql)
+                sql = generate_sql_tool(query, schema, max_rows)
+            except (TimeoutError, RuntimeError) as e:
+                logger.warning(f"SQL generation failed after retry: {e} — using keyword fallback")
+        except RuntimeError as e:
+            logger.warning(f"SQL endpoint job failed: {e} — using keyword fallback")
 
-        # Keyword fallback — last resort if LLM + self-heal both failed
-        if "error" in result:
-            logger.warning(f"SQL failed after self-heal: {result['error']} — trying keyword fallback")
+        if sql is None:
+            # sql endpoint unavailable — go straight to keyword fallback
             fallback_sql = _build_fallback_sql(query, max_rows)
             if fallback_sql:
-                logger.info(f"Fallback SQL: {fallback_sql[:200]}")
+                logger.info(f"Keyword fallback SQL (endpoint unavailable): {fallback_sql[:200]}")
                 result = execute_sql_tool(fallback_sql)
+            else:
+                result = {"error": "SQL endpoint unavailable and no fallback table detected"}
+        else:
+            logger.info(f"Generated SQL: {sql[:200]}")
+
+            if not sql.strip().upper().startswith("SELECT"):
+                raise ValueError(f"Non-SELECT query blocked: {sql[:100]}")
+
+            # Tool 3 — Execute
+            result = execute_sql_tool(sql)
+
+            # Tool 4 — Self-heal if error (pass schema so LLM knows valid columns)
+            if "error" in result:
+                logger.warning(f"SQL error: {result['error']} — attempting self-heal")
+                fixed_sql = None
+                try:
+                    fixed_sql = fix_sql_tool(sql, result["error"], schema)
+                except TimeoutError:
+                    logger.warning("Self-heal LLM timed out — retrying once")
+                    try:
+                        fixed_sql = fix_sql_tool(sql, result["error"], schema)
+                    except (TimeoutError, RuntimeError) as e:
+                        logger.warning(f"Self-heal failed after retry: {e}")
+                except RuntimeError as e:
+                    logger.warning(f"Self-heal endpoint job failed: {e}")
+
+                if fixed_sql:
+                    logger.info(f"Fixed SQL: {fixed_sql[:200]}")
+                    result = execute_sql_tool(fixed_sql)
+
+            # Keyword fallback — last resort if LLM + self-heal both failed
+            if "error" in result:
+                logger.warning(f"SQL failed after self-heal: {result['error']} — trying keyword fallback")
+                fallback_sql = _build_fallback_sql(query, max_rows)
+                if fallback_sql:
+                    logger.info(f"Fallback SQL: {fallback_sql[:200]}")
+                    result = execute_sql_tool(fallback_sql)
 
         if "df" in result and not result["df"].empty:
             df = result["df"]
@@ -458,8 +493,10 @@ def run_db_agent(query: str, max_rows: int = 50) -> str:
 # =========================================================
 
 def query_table(table_name: str, search_term: str, max_rows: int = 50) -> str:
-    """Compatibility wrapper — called by all bots. Delegates to run_db_agent."""
-    return run_db_agent(f"{search_term} from {table_name}", max_rows)
+    """Compatibility wrapper — called by all bots. Delegates to run_db_agent.
+    Passes table_name as a hint so Schema RAG always prioritises the correct table.
+    """
+    return run_db_agent(search_term, max_rows, table_hint=table_name)
 
 
 # =========================================================
@@ -546,8 +583,8 @@ def _detect_table_from_question(user_question: str) -> "str | None":
                 partial_hits.append((quality, len(tbl_up), tbl_orig))
 
     if partial_hits:
-        partial_hits.sort(key=lambda x: (x[0], 0 if x[1].upper().startswith('M') else 1, x[1]))
-        return partial_hits[0][1]
+        partial_hits.sort(key=lambda x: (x[0], 0 if x[2].upper().startswith('M') else 1, x[1]))
+        return partial_hits[0][2]
 
     return None
 
