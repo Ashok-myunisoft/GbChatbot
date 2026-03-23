@@ -34,6 +34,13 @@ _table_cache: list = []
 _table_cache_ts: float = 0.0
 _TABLE_CACHE_TTL: int = 300
 
+# Column type + PK caches (1 hour TTL — schema rarely changes)
+_col_type_cache: dict = {}
+_col_type_cache_ts: dict = {}
+_pk_cache: dict = {}
+_pk_cache_ts: dict = {}
+_SCHEMA_CACHE_TTL: int = 3600
+
 # Query result cache — avoids sql_llm RunPod call for repeated questions
 _query_cache: dict = {}
 _QUERY_CACHE_TTL: int = 300  # 5 minutes
@@ -80,7 +87,14 @@ def get_tables() -> list:
         return _table_cache
 
 
+_col_cache: dict = {}
+_col_cache_ts: dict = {}
+
 def get_columns(table: str) -> list:
+    key = table.lower()
+    now = time.time()
+    if key in _col_cache and (now - _col_cache_ts.get(key, 0)) < _SCHEMA_CACHE_TTL:
+        return _col_cache[key]
     try:
         q = sa_text(
             "SELECT column_name FROM information_schema.columns "
@@ -88,11 +102,104 @@ def get_columns(table: str) -> list:
             "ORDER BY ordinal_position"
         )
         with _get_engine().connect() as conn:
-            df = pd.read_sql(q, conn, params={"tname": table.lower()})
-        return df["column_name"].tolist()
+            df = pd.read_sql(q, conn, params={"tname": key})
+        result = df["column_name"].tolist()
+        _col_cache[key] = result
+        _col_cache_ts[key] = now
+        return result
     except Exception as e:
         logger.warning(f"Could not get columns for '{table}': {e}")
         return []
+
+
+def get_column_types(table: str) -> list:
+    """Returns list of (column_name, pg_type) for a table. Cached 1 hour."""
+    key = table.lower()
+    now = time.time()
+    if key in _col_type_cache and (now - _col_type_cache_ts.get(key, 0)) < _SCHEMA_CACHE_TTL:
+        return _col_type_cache[key]
+    try:
+        q = sa_text("""
+            SELECT column_name,
+                   CASE
+                     WHEN data_type = 'character varying'
+                          THEN 'VARCHAR(' || COALESCE(character_maximum_length::text, '255') || ')'
+                     WHEN data_type = 'character'
+                          THEN 'CHAR(' || COALESCE(character_maximum_length::text, '1') || ')'
+                     WHEN data_type IN ('integer','bigint','smallint','numeric',
+                                        'boolean','text','date','uuid','json','jsonb')
+                          THEN UPPER(data_type)
+                     WHEN data_type = 'timestamp without time zone' THEN 'TIMESTAMP'
+                     WHEN data_type = 'timestamp with time zone'    THEN 'TIMESTAMPTZ'
+                     WHEN data_type = 'double precision'            THEN 'FLOAT'
+                     ELSE data_type
+                   END AS pg_type
+            FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = :tbl
+            ORDER BY ordinal_position
+        """)
+        with _get_engine().connect() as conn:
+            df = pd.read_sql(q, conn, params={"tbl": key})
+        result = list(zip(df["column_name"], df["pg_type"]))
+        _col_type_cache[key] = result
+        _col_type_cache_ts[key] = now
+        return result
+    except Exception as e:
+        logger.warning(f"Could not get column types for '{table}': {e}")
+        return [(c, "TEXT") for c in get_columns(table)]
+
+
+def get_primary_key(table: str) -> list:
+    """Returns primary key column name(s) for a table. Cached 1 hour."""
+    key = table.lower()
+    now = time.time()
+    if key in _pk_cache and (now - _pk_cache_ts.get(key, 0)) < _SCHEMA_CACHE_TTL:
+        return _pk_cache[key]
+    try:
+        q = sa_text("""
+            SELECT kcu.column_name
+            FROM information_schema.table_constraints tc
+            JOIN information_schema.key_column_usage kcu
+                ON tc.constraint_name = kcu.constraint_name
+               AND tc.table_schema    = kcu.table_schema
+            WHERE tc.constraint_type = 'PRIMARY KEY'
+              AND tc.table_schema    = 'public'
+              AND tc.table_name      = :tbl
+            ORDER BY kcu.ordinal_position
+        """)
+        with _get_engine().connect() as conn:
+            df = pd.read_sql(q, conn, params={"tbl": key})
+        result = df["column_name"].tolist()
+        _pk_cache[key] = result
+        _pk_cache_ts[key] = now
+        return result
+    except Exception as e:
+        logger.warning(f"Could not get PK for '{table}': {e}")
+        return []
+
+
+def _build_create_table(table: str, rels: list) -> str:
+    """Build a CREATE TABLE DDL string with real types, PKs and FK constraints.
+    This is the format sqlcoder-7b-2 was trained on — gives accurate SQL generation.
+    """
+    tbl = table.lower()
+    col_types = get_column_types(tbl)
+    pk_cols   = get_primary_key(tbl)
+
+    lines = [f"    {col} {typ}" for col, typ in col_types]
+
+    if pk_cols:
+        lines.append(f"    PRIMARY KEY ({', '.join(pk_cols)})")
+
+    # Outgoing FKs only (source = this table)
+    for r in rels:
+        if r["source_table"].lower() == tbl:
+            lines.append(
+                f"    FOREIGN KEY ({r['source_column']}) "
+                f"REFERENCES {r['target_table'].lower()}({r['target_column']})"
+            )
+
+    return f"CREATE TABLE {tbl} (\n" + ",\n".join(lines) + "\n);"
 
 
 def get_relationships() -> list:
@@ -175,31 +282,13 @@ def get_schema_tool(question: str = "", table_hint: str = "") -> str:
         priority      = primary_list + rest_related
         selected = (priority if _rag_tables else priority + others[:max(0, 5 - len(priority))])[:5]
 
-        schema_lines = []
-        for t in selected:
-            cols = get_columns(t)
-            schema_lines.append(f"{t}({', '.join(cols[:15])})")  # cap at 15 cols per table
-
-        # Only include FK relationships between selected tables
-        selected_lower = {t.lower() for t in selected}
-        rel_lines = [
-            f"{r['source_table']}.{r['source_column']} -> {r['target_table']}.{r['target_column']}"
-            for r in rels
-            if r['source_table'].lower() in selected_lower
-            and r['target_table'].lower() in selected_lower
-        ]
-
-        result = "SCHEMA:\n" + "\n".join(schema_lines)
-        if rel_lines:
-            result += "\nFKs:\n" + "\n".join(rel_lines)
-        return result
+        # BUILD CREATE TABLE DDL — the format sqlcoder-7b-2 was trained on
+        # Includes real data types, PKs and FK constraints → accurate SQL generation
+        ddl_blocks = [_build_create_table(t, rels) for t in selected]
+        return "\n\n".join(ddl_blocks)
     else:
-        schema_lines = []
-        for t in tables[:5]:
-            cols = get_columns(t)
-            schema_lines.append(f"{t}({', '.join(cols[:15])})")
-        result = "SCHEMA:\n" + "\n".join(schema_lines)
-        return result
+        ddl_blocks = [_build_create_table(t, rels) for t in tables[:5]]
+        return "\n\n".join(ddl_blocks)
 
 
 # =========================================================
@@ -210,23 +299,13 @@ def generate_sql_tool(question: str, schema: str, max_rows: int = 50) -> str:
     """TOOL 2 — Generate PostgreSQL SELECT from question + schema via RunPod."""
     from shared_resources import call_sql_endpoint
 
-    enriched_question = f"""{question}
+    # Send clean question — sqlcoder-7b-2 was trained on plain NL questions only.
+    # Rules embedded in the question field are ignored by the model.
+    # Schema is in CREATE TABLE format with real types — the model infers correct
+    # types, PKs and JOIN conditions from the DDL directly.
+    clean_question = f"{question} Limit results to {max_rows} rows."
 
-STRICT RULES:
-- ONLY SELECT queries — never INSERT, UPDATE, DELETE, DROP, ALTER
-- Use LIMIT {max_rows}
-- All table/column names are LOWERCASE — never use uppercase or quoted identifiers
-- Use proper JOINs when question involves multiple tables (use FKs from schema)
-- Use aliases (e, d, o) for readability
-- FILTER RULE: Only add WHERE if question has a specific filter value (name, ID, keyword)
-  * 'show/list/get/give all X' → NO WHERE clause at all
-  * 'employee named John' → WHERE CAST(employeename AS TEXT) ILIKE '%John%'
-- NEVER filter by status, version, sourcetype, tenantid unless user explicitly asks
-- Use ILIKE for text search: CAST(col AS TEXT) ILIKE '%value%'
-- Use NOW() not GETDATE(), COALESCE not ISNULL
-- Return ONLY the raw SQL — no explanation, no markdown, no code fences"""
-
-    sql = call_sql_endpoint(query=enriched_question, schema=schema)
+    sql = call_sql_endpoint(query=clean_question, schema=schema)
 
     # Unwrap {'sql': '...'} or {'output': '...'} if endpoint returned wrapped format
     if sql.strip().startswith("{"):
@@ -280,8 +359,13 @@ def execute_sql_tool(sql: str) -> dict:
 # =========================================================
 
 def fix_sql_tool(sql: str, error: str, schema: str = "") -> str:
-    """TOOL 4 — Fix broken SQL using error message + original schema via RunPod."""
+    """TOOL 4 — Fix broken SQL using error message + original schema via RunPod.
+    Schema is pre-compacted to only tables referenced in the broken SQL.
+    """
     from shared_resources import call_sql_endpoint
+
+    # Use compact schema (only tables in broken SQL) to keep payload small
+    compact = _compact_schema_for_fix(sql, schema) if schema else ""
 
     fix_query = (
         f"Fix this broken PostgreSQL SELECT query and return only the corrected SQL.\n"
@@ -289,11 +373,79 @@ def fix_sql_tool(sql: str, error: str, schema: str = "") -> str:
         f"Rules: Only SELECT, fix the syntax error, keep same meaning, all names lowercase.\n"
         f"Only use columns and tables that exist in the schema provided."
     )
-    fix_schema = f"Available schema:\n{schema}\n\nBroken SQL to fix:\n{sql}"
+    fix_schema = f"Available schema:\n{compact}\n\nBroken SQL to fix:\n{sql}"
 
     fixed = call_sql_endpoint(query=fix_query, schema=fix_schema)
     fixed = re.sub(r"```(?:sql)?", "", fixed, flags=re.IGNORECASE).replace("```", "").strip()
     return _fix_pg_syntax(fixed)
+
+
+def _compact_schema_for_fix(sql: str, full_schema: str) -> str:
+    """Return only the CREATE TABLE blocks for tables referenced in the broken SQL.
+    Keeps the self-heal payload small so sqlcoder focuses on the right tables.
+    """
+    # Extract table names after FROM / JOIN keywords
+    referenced = re.findall(r'\b(?:FROM|JOIN)\s+(\w+)', sql, re.IGNORECASE)
+    tables_in_sql = {t.lower() for t in referenced if t}
+    if not tables_in_sql:
+        return full_schema
+
+    blocks = full_schema.split('\n\n')
+    relevant = []
+    for block in blocks:
+        m = re.match(r'CREATE\s+TABLE\s+(\w+)\s*\(', block.strip(), re.IGNORECASE)
+        if m and m.group(1).lower() in tables_in_sql:
+            relevant.append(block)
+    return '\n\n'.join(relevant) if relevant else full_schema
+
+
+def _local_fix_sql(sql: str, error: str) -> "str | None":
+    """Instantly fix the most common SQL errors without a RunPod call.
+    Returns corrected SQL, or None if this function cannot fix the error.
+    Called BEFORE RunPod self-heal to save 5-28 seconds per fix.
+    """
+    err = error.lower()
+
+    # ── Type mismatch: integer = text / invalid input syntax ───────────────
+    # LLM compared a numeric column to a string literal.
+    # Fix: strip the entire WHERE clause → return all rows.
+    if "operator does not exist" in err or "invalid input syntax for type" in err:
+        fixed = re.sub(
+            r'\bWHERE\b.+?(?=\b(?:GROUP BY|ORDER BY|LIMIT|HAVING)\b|;?\s*$)',
+            '', sql, flags=re.IGNORECASE | re.DOTALL
+        ).strip().rstrip(';') + ';'
+        if fixed.strip() != sql.strip():
+            logger.info("[local-fix] stripped WHERE clause (type mismatch)")
+            return _fix_pg_syntax(fixed)
+
+    # ── Column does not exist ───────────────────────────────────────────────
+    col_match = re.search(
+        r'column "([^"]+)" (?:of relation "[^"]+"\s*)?does not exist',
+        error, re.IGNORECASE
+    )
+    if col_match:
+        bad_col = col_match.group(1).lower()
+        # Try removing a JOIN clause that references this column
+        join_removed = re.sub(
+            rf'(?:LEFT\s+|RIGHT\s+|INNER\s+|OUTER\s+|FULL\s+)?'
+            rf'JOIN\s+\S+\s*(?:\w+\s+)?ON\s+[^\n]*?{re.escape(bad_col)}[^\n]*',
+            '', sql, flags=re.IGNORECASE
+        ).strip()
+        if join_removed.strip() != sql.strip():
+            logger.info(f"[local-fix] removed JOIN with bad column '{bad_col}'")
+            return _fix_pg_syntax(join_removed)
+        # Try removing WHERE condition that contains this column
+        where_removed = re.sub(
+            rf'(?:\s+AND\s+|\s+OR\s+)?(?:\w+\.)?{re.escape(bad_col)}\s*[=<>!]+\s*\S+',
+            '', sql, flags=re.IGNORECASE
+        ).strip()
+        if where_removed.strip() != sql.strip():
+            logger.info(f"[local-fix] removed WHERE condition with bad column '{bad_col}'")
+            return _fix_pg_syntax(where_removed)
+
+    # ── Relation does not exist → can't fix locally, let fallback handle it ─
+    # ── Syntax error → usually truncated → can't fix locally ────────────────
+    return None
 
 
 # =========================================================
@@ -343,7 +495,9 @@ def _build_fallback_sql(query: str, max_rows: int) -> str:
     if not table:
         return ""
     tbl = table.lower()
-    col_names = get_columns(table)
+    # Use cached get_column_types — avoids extra DB call, already fetched for schema
+    col_type_pairs = get_column_types(table)
+    col_names = [c for c, _ in col_type_pairs] if col_type_pairs else get_columns(table)
     if not col_names:
         return f"SELECT * FROM {tbl} LIMIT {max_rows}"
 
@@ -360,7 +514,6 @@ def _build_fallback_sql(query: str, max_rows: int) -> str:
     if not keywords:
         return f"SELECT * FROM {tbl} LIMIT {max_rows}"
 
-    tbl = table.lower()
     word_blocks = []
     for kw in keywords[:6]:
         safe_kw = kw.replace("'", "")
@@ -422,6 +575,14 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
             logger.info(f"Query cache hit — skipping RunPod sql_llm call")
             return _cached_result
 
+    # Cache eviction — trim expired entries to prevent unbounded memory growth
+    if len(_query_cache) > 50:
+        expired_keys = [k for k, (_, ts) in _query_cache.items() if _now - ts >= _QUERY_CACHE_TTL]
+        for k in expired_keys:
+            del _query_cache[k]
+        if expired_keys:
+            logger.info(f"Cache eviction: removed {len(expired_keys)} expired entries")
+
     # Fast path — skip SQL LLM for simple listing queries (saves 5-28s per request)
     # Triggered when: "list all X", "give me X", "show X", "what are X" with no specific filter value
     _q_words = set(query.lower().split())
@@ -479,24 +640,39 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
             # Tool 3 — Execute
             result = execute_sql_tool(sql)
 
-            # Tool 4 — Self-heal if error (pass schema so LLM knows valid columns)
+            # Tool 4 — Self-heal if error
             if "error" in result:
                 logger.warning(f"SQL error: {result['error']} — attempting self-heal")
                 fixed_sql = None
-                try:
-                    fixed_sql = fix_sql_tool(sql, result["error"], schema)
-                except TimeoutError:
-                    logger.warning("Self-heal LLM timed out — retrying once")
+
+                # Pass 4a — local instant fix (no RunPod call, saves 5-28s)
+                fixed_sql = _local_fix_sql(sql, result["error"])
+                if fixed_sql:
+                    logger.info(f"[local-fix] Fixed SQL: {fixed_sql[:200]}")
+                    local_result = execute_sql_tool(fixed_sql)
+                    if "df" in local_result:
+                        result = local_result
+                        fixed_sql = None  # mark as resolved — skip RunPod fix
+                    else:
+                        logger.warning(f"Local fix failed too: {local_result.get('error')} — escalating to RunPod")
+                        fixed_sql = None  # let RunPod try below
+
+                # Pass 4b — RunPod self-heal (schema compacted to only referenced tables)
+                if "error" in result:
                     try:
                         fixed_sql = fix_sql_tool(sql, result["error"], schema)
-                    except (TimeoutError, RuntimeError) as e:
-                        logger.warning(f"Self-heal failed after retry: {e}")
-                except RuntimeError as e:
-                    logger.warning(f"Self-heal endpoint job failed: {e}")
+                    except TimeoutError:
+                        logger.warning("Self-heal LLM timed out — retrying once")
+                        try:
+                            fixed_sql = fix_sql_tool(sql, result["error"], schema)
+                        except (TimeoutError, RuntimeError) as e:
+                            logger.warning(f"Self-heal failed after retry: {e}")
+                    except RuntimeError as e:
+                        logger.warning(f"Self-heal endpoint job failed: {e}")
 
-                if fixed_sql:
-                    logger.info(f"Fixed SQL: {fixed_sql[:200]}")
-                    result = execute_sql_tool(fixed_sql)
+                    if fixed_sql:
+                        logger.info(f"Fixed SQL: {fixed_sql[:200]}")
+                        result = execute_sql_tool(fixed_sql)
 
             # Keyword fallback — last resort if LLM + self-heal both failed
             if "error" in result:

@@ -2145,6 +2145,11 @@ For example: "Name: John, Role: developer" """
         # Clean up LLM response if wrapped in {'output': '...'} format
         answer = _extract_clean_response(answer)
 
+        # Format response — converts DB record blocks / numbered lists to clean markdown
+        # Zero latency: pure Python, no LLM call
+        from response_formatter import format_response as _fmt
+        answer = _fmt(question, answer)
+
         logger.info("💾 Storing conversation...")
         await asyncio.to_thread(
             update_enhanced_memory,
