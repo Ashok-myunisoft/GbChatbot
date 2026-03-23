@@ -432,30 +432,9 @@ async def chat(message: Message, Login: str = Header(...)):
         context_str = rag_query.search(user_input, k=10)
         logger.info(f"📄 Context built: {len(context_str)} chars")
 
-        # Supplement with live DB data when RAG context is thin (< 200 chars)
-        # Only for meaningful queries (≥ 3 words with a domain keyword) —
-        # skips vague inputs like "test", "hi", single words, to avoid wasted SQL calls
-        _DB_DOMAIN_WORDS = {
-            'employee', 'salary', 'leave', 'payroll', 'report', 'formula',
-            'menu', 'module', 'project', 'file', 'account', 'finance',
-            'vendor', 'customer', 'invoice', 'purchase', 'sales', 'stock',
-            'budget', 'asset', 'tax', 'ledger', 'voucher', 'department',
-            'role', 'user', 'permission', 'goodbooks', 'erp'
-        }
-        _words = user_input.lower().split()
-        _is_meaningful = (
-            len(_words) >= 3
-            and any(w in _DB_DOMAIN_WORDS for w in _words)
-        )
-        if len(context_str.strip()) < 200 and _is_meaningful:
-            try:
-                import db_query as _dq
-                db_result = _dq.run_db_agent(user_input, max_rows=20)
-                if db_result and not db_result.startswith("No data found") and not db_result.startswith("Error"):
-                    context_str = (context_str + "\n\nLive DB Data:\n" + db_result).strip()
-                    logger.info(f"📊 RAG thin — supplemented with DB: {len(db_result)} chars")
-            except Exception as _e:
-                logger.debug(f"DB supplement skipped: {_e}")
+        # ⚠️ HARD RULE: general bot NEVER calls SQL — RAG only.
+        # SQL is reserved for dedicated bots (formula, report, menu, project, schema).
+        # Removing DB supplement prevents 25-115s latency on general queries.
  
         # Get role-specific system prompt
         role_system_prompt = ROLE_SYSTEM_PROMPTS_GENERAL.get(user_role, ROLE_SYSTEM_PROMPTS_GENERAL["client"])

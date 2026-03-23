@@ -228,7 +228,7 @@ def get_relationships() -> list:
         return []
 
 
-def get_schema_tool(question: str = "", table_hint: str = "", max_tables: int = 3) -> str:
+def get_schema_tool(question: str = "", table_hint: str = "", max_tables: int = 2) -> str:
     """TOOL 1 — Returns tables + columns + FK relationships.
     question:   used for Schema RAG / keyword detection to find relevant tables.
     table_hint: table name forced by the calling bot (e.g. MREPORT, MFORMULA).

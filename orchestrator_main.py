@@ -1433,16 +1433,16 @@ def build_conversational_context(username: str, current_query: str, thread_id: s
         if thread and thread.messages:
             if thread_isolation:
                 context_parts.append(f"=== Current Conversation Thread: {thread.title} ===")
-                recent_messages = thread.messages[-5:]
+                recent_messages = thread.messages[-3:]
             else:
                 context_parts.append(f"=== Recent Conversation ===")
-                recent_messages = thread.messages[-5:]
+                recent_messages = thread.messages[-3:]
 
             if recent_messages:
                 for i, msg in enumerate(recent_messages, 1):
                     context_parts.append(f"\nTurn {i}:")
-                    context_parts.append(f"User: {msg['user_message'][:500]}")
-                    context_parts.append(f"Assistant ({msg['bot_type']}): {msg['bot_response'][:500]}")
+                    context_parts.append(f"User: {msg['user_message'][:300]}")
+                    context_parts.append(f"Assistant ({msg['bot_type']}): {msg['bot_response'][:300]}")
                 context_parts.append("")
     
     memories = enhanced_memory.retrieve_contextual_memories(
@@ -1453,8 +1453,8 @@ def build_conversational_context(username: str, current_query: str, thread_id: s
         context_parts.append("=== Related Past Interactions ===")
         for i, memory in enumerate(memories, 1):
             context_parts.append(f"\nPast Interaction {i}:")
-            context_parts.append(f"Previous Q: {memory.get('user_message', '')[:150]}")
-            context_parts.append(f"Previous A: {memory.get('bot_response', '')[:150]}")
+            context_parts.append(f"Previous Q: {memory.get('user_message', '')[:80]}")
+            context_parts.append(f"Previous A: {memory.get('bot_response', '')[:80]}")
         context_parts.append("")
     
     full_context = "\n".join(context_parts)
@@ -3198,15 +3198,10 @@ async def startup_event():
             except Exception:
                 logger.warning(f"⚠️ {name} bot warm skipped")
 
-        # 🔥 Parallelize sub-bot warmup for faster startup
-        await asyncio.gather(
-            warm_bot(GeneralBotWrapper(), "general"),
-            warm_bot(FormulaBot(), "formula"),
-            warm_bot(ReportBot(), "report"),
-            warm_bot(MenuBot(), "menu"),
-            warm_bot(ProjectBot(), "project"),
-            warm_bot(SchemaBot(), "schema")
-        )
+        # 🔥 Warm general bot only — other bots have no dedicated model to warm.
+        # formula/report/menu/project/schema all use the same shared RunPod endpoint
+        # which is already warmed above. Calling them here only wastes SQL calls.
+        await warm_bot(GeneralBotWrapper(), "general")
 
 
         # --------------------------------------------------
