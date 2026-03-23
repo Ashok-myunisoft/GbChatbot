@@ -168,6 +168,20 @@ Response:
 """
 
 
+def _extract_recent_turns(context: str, n_turns: int = 2, max_chars: int = 1200) -> str:
+    """Extract last N conversation turns from orchestrator context for history."""
+    if not context:
+        return ""
+    import re as _re
+    positions = [m.start() for m in _re.finditer(r'\nTurn \d+:', context)]
+    if not positions:
+        tail = context[-max_chars:] if len(context) > max_chars else context
+        return tail
+    start = positions[-min(n_turns, len(positions))]
+    recent = context[start:].strip()
+    return recent[-max_chars:] if len(recent) > max_chars else recent
+
+
 async def chat(message, Login: str = None):
     """Main chat function for orchestration integration."""
     try:
@@ -257,6 +271,10 @@ async def chat(message, Login: str = None):
                 context_str = "\n".join(result_lines) if len(result_lines) > 1 else header + "\n".join(table_list)
             else:
                 context_str = "No table information available."
+        # Pre-check: empty context → return immediately, skip LLM call
+        if not context_str.strip() or context_str.strip().startswith("No data found") or context_str.strip() == "(no rows)":
+            return {"response": "No data found for this request.", "source_file": "PostgreSQL (live schema)", "bot_name": "Schema Bot"}
+
         if len(context_str) > 8000:
             # Fallback hard truncation (for non-list contexts like query results)
             # Find last newline before limit to avoid cutting mid-word
@@ -271,10 +289,12 @@ async def chat(message, Login: str = None):
             user_role, ROLE_SYSTEM_PROMPTS_SCHEMA["client"]
         )
         orchestrator_context = getattr(message, 'context', '')
-        # Cap orchestrator context — prevents large previous responses from drowning actual data
-        if orchestrator_context and len(orchestrator_context) > 800:
-            orchestrator_context = orchestrator_context[:800] + "\n[...context truncated to prevent prompt pollution...]"
-        history_str          = ""
+        # Extract last 2 turns for history BEFORE capping
+        history_str = _extract_recent_turns(orchestrator_context)
+        if orchestrator_context and len(orchestrator_context) > 1500:
+            _cut = orchestrator_context[:1500]
+            _nl  = _cut.rfind('\n')
+            orchestrator_context = (_cut[:_nl] if _nl > 500 else _cut) + "\n[...context truncated...]"
 
         full_prompt = prompt_template.format(
             role_system_prompt   = role_system_prompt,

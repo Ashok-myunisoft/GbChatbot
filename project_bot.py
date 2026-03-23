@@ -20,6 +20,20 @@ class Message(BaseModel):
     content: str
     context: str = ""
 
+def _extract_recent_turns(context: str, n_turns: int = 2, max_chars: int = 1200) -> str:
+    """Extract last N conversation turns from orchestrator context for history."""
+    if not context:
+        return ""
+    import re as _re
+    positions = [m.start() for m in _re.finditer(r'\nTurn \d+:', context)]
+    if not positions:
+        tail = context[-max_chars:] if len(context) > max_chars else context
+        return tail
+    start = positions[-min(n_turns, len(positions))]
+    recent = context[start:].strip()
+    return recent[-max_chars:] if len(recent) > max_chars else recent
+
+
 def spell_check(text: str) -> str:
     return text  # Placeholder (can add real spell checker later)
 
@@ -227,16 +241,25 @@ async def project_chat(message: Message, Login: str = Header(...)):
         return {"response": formatted_answer}
 
     try:
-        history_str = ""
         orchestrator_context = message.context or ''
-        # Cap orchestrator context — prevents large previous responses from drowning actual data
-        if orchestrator_context and len(orchestrator_context) > 800:
-            orchestrator_context = orchestrator_context[:800] + "\n[...context truncated to prevent prompt pollution...]"
+        # Extract last 2 turns for history BEFORE capping
+        history_str = _extract_recent_turns(orchestrator_context)
+        if orchestrator_context and len(orchestrator_context) > 1500:
+            _cut = orchestrator_context[:1500]
+            _nl  = _cut.rfind('\n')
+            orchestrator_context = (_cut[:_nl] if _nl > 500 else _cut) + "\n[...context truncated...]"
 
         logger.info(f"🔍 Searching PostgreSQL MFILE for: {user_input[:100]}")
         context_str = db_query.query_table("MFILE", user_input)
-        context_str = context_str[:8000]  # Truncate to prevent GPU OOM on RunPod
+        # Truncate at newline boundary to avoid cutting mid-record
+        if len(context_str) > 8000:
+            _cut = context_str.rfind('\n', 0, 8000)
+            context_str = context_str[:(_cut if _cut > 0 else 8000)] + "\n[TRUNCATED]"
         logger.info(f"📚 Project context: {len(context_str)} chars")
+
+        # Pre-check: empty context → return immediately, skip LLM call
+        if not context_str.strip() or context_str.strip().startswith("No data found") or context_str.strip() == "(no rows)":
+            return {"response": "No data found for this request.", "source_file": "MFILE.csv", "bot_name": "Project Bot"}
 
         role_system_prompt = ROLE_SYSTEM_PROMPTS_PROJECT.get(user_role, ROLE_SYSTEM_PROMPTS_PROJECT["client"])
 

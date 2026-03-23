@@ -1601,17 +1601,18 @@ class AIOrchestrationAgent:
             logger.info("🚀 Fast route: formula")
             return "formula"
         
-        # Report bot keywords
+        # Report bot keywords — only explicit report/chart/analysis requests
+        # Removed: 'listing', 'history of', 'show me data', 'display data',
+        #          'performance', 'stats' (too generic — stolen schema/general queries)
         report_keywords = [
             'report', 'analyze', 'analysis', 'chart', 'graph',
-            'dashboard', 'visualize', 'show me data', 'statistics', 'stats',
-            'metric', 'kpi', 'performance', 'trend', 'summary', 'breakdown',
-            'export', 'generate report', 'view report', 'display data',
-            'show chart', 'create graph', 'listing', 'history of',
+            'dashboard', 'visualize', 'kpi', 'trend', 'breakdown',
+            'export', 'generate report', 'view report', 'show chart', 'create graph',
             'ledger', 'balance sheet', 'p&l', 'profit', 'loss',
             'payroll report', 'attendance report', 'sales report',
             'inventory report', 'purchase report', 'financial report',
-            'stock report', 'transaction report'
+            'stock report', 'transaction report', 'performance report',
+            'statistics report', 'monthly report', 'annual report',
         ]
         if any(word in question_lower for word in report_keywords):
             logger.info("🚀 Fast route: report")
@@ -1698,12 +1699,14 @@ class AIOrchestrationAgent:
             logger.info("🚀 Fast route: schema")
             return "schema"
 
-        # General bot keywords — NOTE: 'employee' removed to avoid stealing DB queries
+        # General bot keywords — only when NOT a data/list query
+        # 'what is'/'explain' removed from here; handled after schema check to avoid
+        # stealing DB queries like "what is the status of purchase order 123"
         general_keywords = [
-            'what is', 'who is', 'tell me about', 'explain', 'describe',
-            'help with', 'how does', 'info on', 'company', 'goodbooks',
-            'features', 'modules', 'support', 'contact',
-            'leave policy', 'hr', 'it', 'office'
+            'tell me about', 'help with', 'how does', 'info on',
+            'company', 'goodbooks', 'features', 'modules', 'support',
+            'contact', 'leave policy', 'hr policy', 'office',
+            'about goodbooks', 'what is goodbooks', 'who is',
         ]
         if any(word in question_lower for word in general_keywords):
             logger.info("🚀 Fast route: general")
@@ -2065,6 +2068,50 @@ For example: "Name: John, Role: developer" """
             context = (context + _depth_note) if context else _depth_note
             logger.info("📣 Deep analysis instruction appended to context")
         # ── End Deep Analysis Detection ───────────────────────────────────────
+
+        # ── Follow-up detection: short question referencing previous turn ──────
+        # Reuse last bot_type so "tell me more" / "show more" stay in the same bot
+        # instead of falling through to AI routing (saves 5-15s per follow-up)
+        _FOLLOWUP_PHRASES = {
+            "more", "tell me more", "show more", "continue", "elaborate",
+            "explain more", "go on", "and then", "what about that",
+            "same", "again", "retry", "once more", "expand",
+        }
+        _q_lower = question.lower().strip()
+        _is_followup = (
+            thread_id and is_existing_thread
+            and len(_q_lower.split()) <= 8
+            and any(ph in _q_lower for ph in _FOLLOWUP_PHRASES)
+        )
+        if _is_followup:
+            _thread = history_manager.get_thread(thread_id)
+            if _thread and _thread.messages:
+                _last_bot = _thread.messages[-1].get("bot_type", "")
+                _skip_types = {"greeting", "role_setup", "role_prompt", "out_of_scope", "general_fallback", "error", ""}
+                if _last_bot not in _skip_types:
+                    logger.info(f"🔄 Follow-up detected → reusing last bot: {_last_bot}")
+                    intent = _last_bot
+                    selected_bot = self.bots.get(intent, self.bots["general"])
+                    answer = None
+                    bot_type = intent
+                    logger.info(f"🤖 Executing {intent} bot (follow-up)...")
+                    try:
+                        answer = await asyncio.wait_for(
+                            selected_bot.answer(question, context, user_role, username),
+                            timeout=40.0
+                        )
+                    except (asyncio.TimeoutError, Exception) as _fe:
+                        logger.warning(f"Follow-up bot failed: {_fe} — falling through to normal routing")
+                        answer = None
+                    if answer and len(answer.strip()) >= 10:
+                        answer = _extract_clean_response(answer)
+                        from response_formatter import format_response as _fmt
+                        answer = _fmt(question, answer)
+                        await asyncio.to_thread(update_enhanced_memory, username, question, answer, bot_type, user_role, thread_id)
+                        elapsed = time.time() - start_time
+                        logger.info(f"✅ Follow-up completed in {elapsed:.2f}s")
+                        return {"response": answer, "bot_type": bot_type, "thread_id": thread_id, "user_role": user_role}
+        # ── End follow-up detection ───────────────────────────────────────────
 
         logger.info("🎯 Detecting intent...")
         intent = await self.detect_intent_with_ai(question, context)

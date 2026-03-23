@@ -228,7 +228,7 @@ def get_relationships() -> list:
         return []
 
 
-def get_schema_tool(question: str = "", table_hint: str = "") -> str:
+def get_schema_tool(question: str = "", table_hint: str = "", max_tables: int = 5) -> str:
     """TOOL 1 — Returns tables + columns + FK relationships.
     question:   used for Schema RAG / keyword detection to find relevant tables.
     table_hint: table name forced by the calling bot (e.g. MREPORT, MFORMULA).
@@ -239,10 +239,15 @@ def get_schema_tool(question: str = "", table_hint: str = "") -> str:
 
     if question:
         # Pass 0 — Schema RAG (semantic search, faster + more accurate than keyword)
-        # Fully wrapped: any failure silently falls through to existing keyword logic below
+        # Warm guarantee: if index not ready yet, try loading from disk once (fast if exists)
         _rag_tables: list = []
         try:
-            from schema_rag import is_index_ready, search_schema
+            from schema_rag import is_index_ready, search_schema, build_or_load_index
+            if not is_index_ready():
+                try:
+                    build_or_load_index()   # instant if index already on disk from prev run
+                except Exception:
+                    pass
             if is_index_ready():
                 _rag_tables = search_schema(question, top_k=5)
         except Exception:
@@ -280,7 +285,7 @@ def get_schema_tool(question: str = "", table_hint: str = "") -> str:
         rest_related  = [t for t in tables if t.lower() in related and t.lower() != primary_table]
         others        = [t for t in tables if t.lower() not in related]
         priority      = primary_list + rest_related
-        selected = (priority if _rag_tables else priority + others[:max(0, 5 - len(priority))])[:5]
+        selected = (priority if _rag_tables else priority + others[:max(0, max_tables - len(priority))])[:max_tables]
 
         # BUILD CREATE TABLE DDL — the format sqlcoder-7b-2 was trained on
         # Includes real data types, PKs and FK constraints → accurate SQL generation
@@ -620,8 +625,29 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
                 sql = generate_sql_tool(query, schema, max_rows)
             except (TimeoutError, RuntimeError) as e:
                 logger.warning(f"SQL generation failed after retry: {e} — using keyword fallback")
+        except ValueError as e:
+            # Truncated / too-complex SQL — retry with simplified 2-table schema
+            if any(k in str(e).lower() for k in ("truncated", "unbalanced", "nested", "existence-check")):
+                logger.warning(f"SQL complexity error: {e} — retrying with 2-table schema")
+                try:
+                    simple_schema = get_schema_tool(question=query, table_hint=table_hint, max_tables=2)
+                    sql = generate_sql_tool(query, simple_schema, max_rows)
+                    logger.info("Retry with 2-table schema succeeded")
+                except Exception as _e2:
+                    logger.warning(f"2-table retry also failed: {_e2}")
+            else:
+                logger.warning(f"SQL validation error: {e} — using keyword fallback")
         except RuntimeError as e:
-            logger.warning(f"SQL endpoint job failed: {e} — using keyword fallback")
+            if "schema too large" in str(e).lower():
+                logger.warning(f"Schema too large — retrying with 2-table schema")
+                try:
+                    simple_schema = get_schema_tool(question=query, table_hint=table_hint, max_tables=2)
+                    sql = generate_sql_tool(query, simple_schema, max_rows)
+                    logger.info("2-table retry succeeded after schema-too-large")
+                except Exception as _e2:
+                    logger.warning(f"2-table retry also failed: {_e2} — using keyword fallback")
+            else:
+                logger.warning(f"SQL endpoint job failed: {e} — using keyword fallback")
 
         if sql is None:
             # sql endpoint unavailable — go straight to keyword fallback

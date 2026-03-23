@@ -227,5 +227,19 @@ def format_response(question: str, raw: str) -> str:
         bullets = _numbered_to_bullets(target)
         return f"{header}\n\n{bullets}" if header else bullets
 
-    # ── Prose / LLM answer — just clean whitespace ────────────────────────────
+    # ── Prose / LLM answer ───────────────────────────────────────────────────
+    # If the LLM already used markdown (headers, bold, lists) — preserve it as-is
+    _already_formatted = bool(re.search(r'(^#{1,4}\s|^\*\*[^*]+\*\*|^\s*[-*]\s|\*\*[^*]{3,}\*\*)', text, re.MULTILINE))
+    if _already_formatted:
+        return _clean(text)
+
+    # Plain prose — bold the first sentence so the user gets a quick summary
+    # Sentence boundary: first ". " or ".\n" or end of string if no period found
+    m = re.search(r'([^.!?]+[.!?])', text)
+    if m and len(m.group(1).strip()) >= 10:
+        first_sentence = m.group(1).strip()
+        rest = text[m.end():].strip()
+        bolded = f"**{first_sentence}**"
+        return _clean(f"{bolded}\n\n{rest}" if rest else bolded)
+
     return _clean(text)

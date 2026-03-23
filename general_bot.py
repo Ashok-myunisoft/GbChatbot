@@ -397,8 +397,10 @@ async def chat(message: Message, Login: str = Header(...)):
     # ✅ FIX: Get orchestrator context from message object
     orchestrator_context = getattr(message, 'context', '')
     # Cap orchestrator context — prevents large previous responses (e.g. 252-table list) from drowning actual data
-    if orchestrator_context and len(orchestrator_context) > 800:
-        orchestrator_context = orchestrator_context[:800] + "\n[...context truncated to prevent prompt pollution...]"
+    if orchestrator_context and len(orchestrator_context) > 1500:
+        _cut = orchestrator_context[:1500]
+        _nl  = _cut.rfind('\n')
+        orchestrator_context = (_cut[:_nl] if _nl > 500 else _cut) + "\n[...context truncated...]"
     logger.info(f"📚 Received orchestrator context: {len(orchestrator_context)} chars")
  
     # Greeting check
@@ -429,6 +431,18 @@ async def chat(message: Message, Login: str = Header(...)):
         logger.info(f"🔍 RAG search for: {user_input[:100]}")
         context_str = rag_query.search(user_input, k=10)
         logger.info(f"📄 Context built: {len(context_str)} chars")
+
+        # Supplement with live DB data when RAG context is thin (< 200 chars)
+        # Handles ERP-specific factual questions not covered in static documents
+        if len(context_str.strip()) < 200:
+            try:
+                import db_query as _dq
+                db_result = _dq.run_db_agent(user_input, max_rows=20)
+                if db_result and not db_result.startswith("No data found") and not db_result.startswith("Error"):
+                    context_str = (context_str + "\n\nLive DB Data:\n" + db_result).strip()
+                    logger.info(f"📊 RAG thin — supplemented with DB: {len(db_result)} chars")
+            except Exception as _e:
+                logger.debug(f"DB supplement skipped: {_e}")
  
         # Get role-specific system prompt
         role_system_prompt = ROLE_SYSTEM_PROMPTS_GENERAL.get(user_role, ROLE_SYSTEM_PROMPTS_GENERAL["client"])
