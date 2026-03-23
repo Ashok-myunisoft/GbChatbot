@@ -433,8 +433,21 @@ async def chat(message: Message, Login: str = Header(...)):
         logger.info(f"📄 Context built: {len(context_str)} chars")
 
         # Supplement with live DB data when RAG context is thin (< 200 chars)
-        # Handles ERP-specific factual questions not covered in static documents
-        if len(context_str.strip()) < 200:
+        # Only for meaningful queries (≥ 3 words with a domain keyword) —
+        # skips vague inputs like "test", "hi", single words, to avoid wasted SQL calls
+        _DB_DOMAIN_WORDS = {
+            'employee', 'salary', 'leave', 'payroll', 'report', 'formula',
+            'menu', 'module', 'project', 'file', 'account', 'finance',
+            'vendor', 'customer', 'invoice', 'purchase', 'sales', 'stock',
+            'budget', 'asset', 'tax', 'ledger', 'voucher', 'department',
+            'role', 'user', 'permission', 'goodbooks', 'erp'
+        }
+        _words = user_input.lower().split()
+        _is_meaningful = (
+            len(_words) >= 3
+            and any(w in _DB_DOMAIN_WORDS for w in _words)
+        )
+        if len(context_str.strip()) < 200 and _is_meaningful:
             try:
                 import db_query as _dq
                 db_result = _dq.run_db_agent(user_input, max_rows=20)

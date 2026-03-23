@@ -303,6 +303,29 @@ def get_schema_tool(question: str = "", table_hint: str = "", max_tables: int = 
         return "\n\n".join(ddl_blocks)
 
 
+# ── System-table JOIN sanitizer ────────────────────────────────────────────────
+_SQL_SYS_PREFIXES = ('act_', 'qrtz_', 'conversation_', 'dump', 'bulk_',
+                     'z_', 'tr_', 'aparna', 'temp', 'billtemp', 'chargedetail')
+
+def _strip_system_joins(sql: str) -> str:
+    """Remove JOIN clauses where the joined table is a system/framework table.
+    sqlcoder-7b-2 sometimes hallucinates Activiti/Quartz joins from training data
+    even when those tables are not in the schema DDL.
+    """
+    lines = sql.split('\n')
+    clean = []
+    for line in lines:
+        m = re.search(r'\bJOIN\s+(\w+)', line, re.IGNORECASE)
+        if m and m.group(1).lower().startswith(_SQL_SYS_PREFIXES):
+            logger.debug(f"Stripped hallucinated system JOIN: {line.strip()}")
+            continue
+        clean.append(line)
+    result = '\n'.join(clean).strip()
+    # Remove trailing ON clause orphaned by stripped JOIN (ends with ON or AND)
+    result = re.sub(r'\s+(ON|AND)\s*$', '', result, flags=re.IGNORECASE).strip()
+    return result
+
+
 # =========================================================
 # 🧠 TOOL 2 — GENERATE SQL
 # =========================================================
@@ -626,6 +649,8 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
         sql = None
         try:
             sql = generate_sql_tool(query, schema, max_rows)
+            if sql:
+                sql = _strip_system_joins(sql)
         except TimeoutError:
             logger.warning("SQL LLM timed out (cold start) — retrying once")
             try:
@@ -639,6 +664,8 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
                 try:
                     simple_schema = get_schema_tool(question=query, table_hint=table_hint, max_tables=2)
                     sql = generate_sql_tool(query, simple_schema, max_rows)
+                    if sql:
+                        sql = _strip_system_joins(sql)
                     logger.info("Retry with 2-table schema succeeded")
                 except Exception as _e2:
                     logger.warning(f"2-table retry also failed: {_e2}")
@@ -650,6 +677,8 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
                 try:
                     simple_schema = get_schema_tool(question=query, table_hint=table_hint, max_tables=2)
                     sql = generate_sql_tool(query, simple_schema, max_rows)
+                    if sql:
+                        sql = _strip_system_joins(sql)
                     logger.info("2-table retry succeeded after schema-too-large")
                 except Exception as _e2:
                     if "schema too large" in str(_e2).lower():
