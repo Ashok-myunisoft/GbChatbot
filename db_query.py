@@ -256,6 +256,10 @@ def get_schema_tool(question: str = "", table_hint: str = "", max_tables: int = 
         # table_hint (from calling bot) always takes priority as primary table
         forced = table_hint.lower() if table_hint else ""
 
+        # System table prefixes — never include these in generated SQL schema
+        _SYS_PREFIXES = ('act_', 'qrtz_', 'conversation_', 'dump', 'bulk_',
+                         'z_', 'tr_', 'aparna', 'temp', 'billtemp', 'chargedetail')
+
         if _rag_tables:
             # RAG found relevant tables — only outgoing FKs (source = rag table)
             # Avoids pulling in unrelated tables that merely reference the target
@@ -279,6 +283,9 @@ def get_schema_tool(question: str = "", table_hint: str = "", max_tables: int = 
                 for r in rels:
                     if r['source_table'].lower() == target.lower():
                         related.add(r['target_table'].lower())
+
+        # Strip system/framework tables from related set — prevents bad JOINs + schema bloat
+        related = {t for t in related if not t.startswith(_SYS_PREFIXES)}
 
         # Ensure primary table is always first before the :5 cap
         primary_list = [t for t in tables if t.lower() == primary_table]
@@ -645,7 +652,16 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
                     sql = generate_sql_tool(query, simple_schema, max_rows)
                     logger.info("2-table retry succeeded after schema-too-large")
                 except Exception as _e2:
-                    logger.warning(f"2-table retry also failed: {_e2} — using keyword fallback")
+                    if "schema too large" in str(_e2).lower():
+                        logger.warning(f"2-table still too large — retrying with 1-table schema")
+                        try:
+                            single_schema = get_schema_tool(question=query, table_hint=table_hint, max_tables=1)
+                            sql = generate_sql_tool(query, single_schema, max_rows)
+                            logger.info("1-table retry succeeded after schema-too-large")
+                        except Exception as _e3:
+                            logger.warning(f"1-table retry also failed: {_e3} — using keyword fallback")
+                    else:
+                        logger.warning(f"2-table retry also failed: {_e2} — using keyword fallback")
             else:
                 logger.warning(f"SQL endpoint job failed: {e} — using keyword fallback")
 
