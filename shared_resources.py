@@ -208,7 +208,7 @@ def call_sql_endpoint(query: str, schema: str, timeout: float = 200.0) -> str:
 
     post_resp = requests.post(
         RUNPOD_SQL_ENDPOINT_URL,
-        json={"input": {"query": query, "schema": schema}},
+        json={"input": {"query": query, "schema": schema, "max_new_tokens": 1024}},
         headers=headers,
         timeout=30,
     )

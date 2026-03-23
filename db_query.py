@@ -73,7 +73,7 @@ def get_tables() -> list:
                 _seen_bases.add(base)
                 _deduped.append(t)
         _table_cache = _deduped
-        _table_cache_ts = now
+        _table_cache_ts = now  # noqa: F841
         return _table_cache
     except Exception as e:
         logger.warning(f"Could not get table list: {e}")
@@ -216,11 +216,12 @@ STRICT RULES:
 - ONLY SELECT queries — never INSERT, UPDATE, DELETE, DROP, ALTER
 - Use LIMIT {max_rows}
 - All table/column names are LOWERCASE — never use uppercase or quoted identifiers
-- Use proper JOIN when question involves multiple tables
-- Use aliases (e, d, o, c) for readability
+- Use proper JOINs when question involves multiple tables (use FKs from schema)
+- Use aliases (e, d, o) for readability
 - FILTER RULE: Only add WHERE if question has a specific filter value (name, ID, keyword)
-  * 'show/list/get/give all X' with no filter → NO WHERE clause
+  * 'show/list/get/give all X' → NO WHERE clause at all
   * 'employee named John' → WHERE CAST(employeename AS TEXT) ILIKE '%John%'
+- NEVER filter by status, version, sourcetype, tenantid unless user explicitly asks
 - Use ILIKE for text search: CAST(col AS TEXT) ILIKE '%value%'
 - Use NOW() not GETDATE(), COALESCE not ISNULL
 - Return ONLY the raw SQL — no explanation, no markdown, no code fences"""
@@ -263,7 +264,7 @@ def execute_sql_tool(sql: str) -> dict:
     if not sql_lower.startswith("select"):
         return {"error": "Only SELECT queries are allowed"}
 
-    if any(word in sql_lower for word in ["insert", "update", "delete", "drop", "alter"]):
+    if re.search(r'\b(insert|update|delete|drop|alter|truncate|create)\b', sql_lower):
         return {"error": "Write operations are not allowed"}
 
     try:
@@ -331,18 +332,34 @@ _STOP_WORDS = {
     "any", "some", "more", "also", "please", "now", "do",
 }
 
+_LIST_INTENTS = {"list", "all", "give", "show", "get", "fetch", "display", "what", "which"}
+
 def _build_fallback_sql(query: str, max_rows: int) -> str:
-    """Build a simple ILIKE keyword query when LLM + self-heal both fail."""
+    """Build a simple query when LLM + self-heal both fail.
+    For 'list all / give / show' queries → SELECT * with no WHERE (user wants all records).
+    For specific filter queries → ILIKE keyword search.
+    """
     table = _detect_table_from_question(query)
     if not table:
         return ""
+    tbl = table.lower()
     col_names = get_columns(table)
     if not col_names:
-        return f"SELECT * FROM {table.lower()} LIMIT {max_rows}"
-    raw_words = query.split()
-    keywords = [w for w in raw_words if len(w) > 2 and w.lower() not in _STOP_WORDS]
+        return f"SELECT * FROM {tbl} LIMIT {max_rows}"
+
+    # Detect listing intent — user wants all records, no filter needed
+    q_words = set(query.lower().split())
+    if q_words & _LIST_INTENTS and not any(
+        w for w in query.split()
+        if len(w) > 2 and w.lower() not in _STOP_WORDS and w.lower() not in _LIST_INTENTS
+    ):
+        return f"SELECT * FROM {tbl} LIMIT {max_rows}"
+
+    # Specific filter — extract meaningful keywords
+    keywords = [w for w in query.split() if len(w) > 2 and w.lower() not in _STOP_WORDS and w.lower() not in _LIST_INTENTS]
     if not keywords:
-        keywords = [w for w in raw_words if len(w) > 2] or [query]
+        return f"SELECT * FROM {tbl} LIMIT {max_rows}"
+
     tbl = table.lower()
     word_blocks = []
     for kw in keywords[:6]:
@@ -404,6 +421,27 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
         if _now - _cached_ts < _QUERY_CACHE_TTL:
             logger.info(f"Query cache hit — skipping RunPod sql_llm call")
             return _cached_result
+
+    # Fast path — skip SQL LLM for simple listing queries (saves 5-28s per request)
+    # Triggered when: "list all X", "give me X", "show X", "what are X" with no specific filter value
+    _q_words = set(query.lower().split())
+    _has_list_intent = bool(_q_words & _LIST_INTENTS)
+    _filter_words = [
+        w for w in query.split()
+        if len(w) > 2
+        and w.lower() not in _STOP_WORDS
+        and w.lower() not in _LIST_INTENTS
+        and not any(c.isdigit() for c in w)
+    ]
+    _target_table = table_hint or _detect_table_from_question(query)
+    if _has_list_intent and not _filter_words and _target_table:
+        _fast_sql = f"SELECT * FROM {_target_table.lower()} LIMIT {max_rows}"
+        logger.info(f"Fast path (no LLM): {_fast_sql}")
+        _fast_result = execute_sql_tool(_fast_sql)
+        if "df" in _fast_result:
+            _final = _format_df(_fast_result["df"]) if not _fast_result["df"].empty else "(no rows)"
+            _query_cache[_cache_key] = (_final, _now)
+            return _final
 
     try:
         # Tool 1 — Schema (query-aware: relevant tables first, table_hint forces correct table)
