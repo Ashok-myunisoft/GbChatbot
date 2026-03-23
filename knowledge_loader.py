@@ -44,8 +44,12 @@ def load_all(embeddings) -> None:
 def _load_structured() -> None:
     """Load CSV and xlsx files into DuckDB tables."""
     if not os.path.exists(DATA_DIR):
-        logger.warning(f"DATA_DIR '{DATA_DIR}' not found — skipping DuckDB load.")
-        return
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            logger.info(f"Created DATA_DIR '{DATA_DIR}'")
+        except Exception as exc:
+            logger.error(f"Cannot create DATA_DIR '{DATA_DIR}': {exc} — skipping DuckDB load.")
+            return
 
     conn = duckdb.connect(DUCKDB_PATH)
     try:
@@ -86,8 +90,12 @@ def _load_structured() -> None:
 def _load_rag(embeddings) -> None:
     """Load .txt and .json files into a FAISS vector store for general_bot."""
     if not os.path.exists(DATA_DIR):
-        logger.warning(f"DATA_DIR '{DATA_DIR}' not found — skipping FAISS build.")
-        return
+        try:
+            os.makedirs(DATA_DIR, exist_ok=True)
+            logger.info(f"Created DATA_DIR '{DATA_DIR}'")
+        except Exception as exc:
+            logger.error(f"Cannot create DATA_DIR '{DATA_DIR}': {exc} — skipping FAISS build.")
+            return
 
     all_docs = []
     for fname in os.listdir(DATA_DIR):

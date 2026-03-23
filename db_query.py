@@ -228,7 +228,7 @@ def get_relationships() -> list:
         return []
 
 
-def get_schema_tool(question: str = "", table_hint: str = "", max_tables: int = 5) -> str:
+def get_schema_tool(question: str = "", table_hint: str = "", max_tables: int = 3) -> str:
     """TOOL 1 — Returns tables + columns + FK relationships.
     question:   used for Schema RAG / keyword detection to find relevant tables.
     table_hint: table name forced by the calling bot (e.g. MREPORT, MFORMULA).
@@ -383,6 +383,8 @@ def execute_sql_tool(sql: str) -> dict:
 
     try:
         with _get_engine().connect() as conn:
+            # 10-second statement timeout — cancels runaway queries
+            conn.execute(sa_text("SET LOCAL statement_timeout = '10000'"))
             df = pd.read_sql(sa_text(sql), conn)
         return {"df": df, "count": len(df)}
     except Exception as e:

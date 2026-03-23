@@ -1433,19 +1433,16 @@ def build_conversational_context(username: str, current_query: str, thread_id: s
         if thread and thread.messages:
             if thread_isolation:
                 context_parts.append(f"=== Current Conversation Thread: {thread.title} ===")
-                # Increased from 5 to 10 for better continuity
-                recent_messages = thread.messages[-10:]
+                recent_messages = thread.messages[-5:]
             else:
                 context_parts.append(f"=== Recent Conversation ===")
-                # Increased from 3 to 7
-                recent_messages = thread.messages[-7:]
-            
+                recent_messages = thread.messages[-5:]
+
             if recent_messages:
                 for i, msg in enumerate(recent_messages, 1):
                     context_parts.append(f"\nTurn {i}:")
-                    # Increased truncation limit from 200 to 1000 for better context
-                    context_parts.append(f"User: {msg['user_message'][:1000]}")
-                    context_parts.append(f"Assistant ({msg['bot_type']}): {msg['bot_response'][:1000]}")
+                    context_parts.append(f"User: {msg['user_message'][:500]}")
+                    context_parts.append(f"Assistant ({msg['bot_type']}): {msg['bot_response'][:500]}")
                 context_parts.append("")
     
     memories = enhanced_memory.retrieve_contextual_memories(
@@ -3194,8 +3191,8 @@ async def startup_event():
         async def warm_bot(bot, name):
             try:
                 await asyncio.wait_for(
-                    bot.answer("test", "", "client", "__warmup__"),
-                    timeout=250
+                    bot.answer("hello", "", "client", "__warmup__"),
+                    timeout=30
                 )
                 logger.info(f"🔥 {name} bot warmed")
             except Exception:
