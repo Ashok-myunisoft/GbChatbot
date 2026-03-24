@@ -157,7 +157,8 @@ History: {history}
 [QUESTION]
 {question}
 
-⚠ FINAL INSTRUCTION: The data above is already fetched. Present it DIRECTLY. DO NOT write SQL or suggest running queries.
+⚠ FINAL INSTRUCTION: The data above is already fetched. Answer in natural language only.
+NEVER output SQL queries, SELECT statements, or any code. Present the data directly as plain text.
 
 Answer (use only the Menu Data above):
 
@@ -199,7 +200,7 @@ async def chat(message: Message, Login: str = Header(...)):
         history_str = _extract_recent_turns(message.context or '')
 
         logger.info(f"🔍 Searching PostgreSQL MMENU for: {user_input[:100]}")
-        context_str = db_query.query_table("MMENU", user_input)
+        context_str = db_query.query_table("MMENU", user_input, session_id=username)
         # Truncate at newline boundary to avoid cutting mid-record
         if len(context_str) > 8000:
             _cut = context_str.rfind('\n', 0, 8000)

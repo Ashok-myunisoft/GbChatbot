@@ -161,8 +161,8 @@ TYPE B — SCHEMA / STRUCTURE EXPLANATION (user wants to understand table design
 [USER QUESTION]
 {question}
 
-⚠ FINAL INSTRUCTION: The data above is already fetched from the database. Present it DIRECTLY.
-DO NOT write SQL. DO NOT say "run this query" or "use this command". Just show the data.
+⚠ FINAL INSTRUCTION: The data above is already fetched from the database. Answer in natural language only.
+NEVER output SQL queries, SELECT statements, or any code. DO NOT say "run this query". Just show the data directly as plain text.
 
 Response:
 """
@@ -188,10 +188,12 @@ async def chat(message, Login: str = None):
         user_input = message.content.strip() if hasattr(message, 'content') else str(message).strip()
 
         user_role = "client"
+        username = ""
         if Login:
             try:
                 login_dto = json.loads(Login)
                 user_role = login_dto.get("Role", "client").lower()
+                username = login_dto.get("UserName", "")
             except Exception:
                 pass
 
@@ -223,7 +225,7 @@ async def chat(message, Login: str = None):
             else:
                 context_str = f"No column information available for table '{target_table}'."
         elif target_table:
-            context_str = db_query.query_table(target_table, user_input)
+            context_str = db_query.query_table(target_table, user_input, session_id=username)
         else:
             all_tables = db_query._get_all_tables()
             if all_tables:

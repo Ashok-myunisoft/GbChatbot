@@ -76,6 +76,8 @@ def get_tables() -> list:
         _deduped = []
         for t in _raw:
             base = re.sub(r'(_\d+)+$', '', t.lower())
+            base = re.sub(r'_\d{4,}[a-z0-9]*$', '', base)
+            base = re.sub(r'_[a-z]{2,5}\d{2,4}$', '', base)
             if base not in _seen_bases:
                 _seen_bases.add(base)
                 _deduped.append(t)
@@ -391,7 +393,10 @@ def generate_sql_tool(question: str, schema: str, max_rows: int = 50) -> str:
     # Rules embedded in the question field are ignored by the model.
     # Schema is in CREATE TABLE format with real types — the model infers correct
     # types, PKs and JOIN conditions from the DDL directly.
-    clean_question = f"{question} Limit results to {max_rows} rows."
+    _join_hint = " Use JOINs if the question asks for related data from multiple tables." if any(
+        w in question.lower() for w in ["with their", "and their", "along with", "including", "together with"]
+    ) else ""
+    clean_question = f"{question} Limit results to {max_rows} rows.{_join_hint}"
 
     sql = call_sql_endpoint(query=clean_question, schema=schema)
 
@@ -565,6 +570,95 @@ def _fix_pg_syntax(sql: str) -> str:
 # 🔤 KEYWORD FALLBACK SQL (last resort)
 # =========================================================
 
+# Audit/system columns stripped from fast-path SELECT and listings
+_AUDIT_COLS = {
+    'createdon', 'modifiedon', 'createdbyid', 'modifiedbyid',
+    'version', 'sourcetype', 'tenantid', 'entityid',
+    'webserviceid', 'sortorder', 'addedtype', 'reporturi',
+}
+
+# =========================================================
+# SESSION CONTEXT STORE (follow-up question support)
+# =========================================================
+
+_session_df_store: dict = {}   # session_id -> (DataFrame, query_str, timestamp)
+_SESSION_DF_TTL: int = 600     # 10 minutes
+
+def _store_session_df(session_id: str, df, query: str):
+    if session_id:
+        _session_df_store[session_id] = (df, query, time.time())
+
+def _get_session_df(session_id: str):
+    entry = _session_df_store.get(session_id)
+    if entry and time.time() - entry[2] < _SESSION_DF_TTL:
+        return entry[0], entry[1]
+    return None, None
+
+_FOLLOWUP_INDICATORS = {
+    "those", "that", "them", "these", "above", "previous",
+    "first", "second", "third", "last", "listed",
+}
+
+def _is_followup_question(query: str) -> bool:
+    """Returns True if the question likely refers to a previous result set."""
+    words = set(re.sub(r"[^\w\s]", " ", query).lower().split())
+    return bool(words & _FOLLOWUP_INDICATORS) and len(query.split()) <= 14
+
+def _filter_df_by_question(query: str, df) -> "object | None":
+    """
+    Apply a simple filter/select from a follow-up question to a stored DataFrame.
+    Returns filtered DataFrame or None if no applicable filter found.
+    """
+    import pandas as pd
+    if df is None or df.empty:
+        return None
+    q_lower = re.sub(r"[^\w\s]", " ", query).lower()
+    q_words = q_lower.split()
+    cols_lower = {c.lower(): c for c in df.columns}
+
+    # Ordinal access: "first", "second", "third", "last"
+    ordinal_map = {"first": 0, "second": 1, "third": 2, "last": -1}
+    for ord_word, idx in ordinal_map.items():
+        if ord_word in q_words:
+            try:
+                row = df.iloc[[idx]].reset_index(drop=True)
+                if not row.empty:
+                    return row
+            except IndexError:
+                pass
+
+    # Column+value filter: "which has status Active", "status 1"
+    filter_col = None
+    filter_val = None
+    for i, word in enumerate(q_words):
+        if word in cols_lower:
+            filter_col = cols_lower[word]
+            for j in range(i + 1, min(i + 5, len(q_words))):
+                if q_words[j] not in {"is", "are", "the", "be", "=", "a", "an"}:
+                    filter_val = q_words[j]
+                    break
+            if filter_val:
+                break
+
+    if filter_col and filter_val:
+        col_data = df[filter_col].astype(str).str.lower()
+        filtered = df[col_data.str.contains(filter_val, na=False)]
+        if not filtered.empty:
+            return filtered.reset_index(drop=True)
+
+    # Value-only scan: "active", "inactive", "enabled", "1", "0"
+    scan_words = {"active", "inactive", "enabled", "disabled", "yes", "no", "true", "false", "open", "closed"}
+    for word in q_words:
+        if word in scan_words:
+            for col in df.columns:
+                col_data = df[col].astype(str).str.lower()
+                filtered = df[col_data.str.contains(word, na=False)]
+                if not filtered.empty:
+                    return filtered.reset_index(drop=True)
+
+    return None
+
+
 _STOP_WORDS = {
     "what", "which", "where", "when", "who", "how", "why",
     "are", "is", "was", "were", "has", "have", "had", "does", "did",
@@ -600,8 +694,9 @@ def _build_fallback_sql(query: str, max_rows: int, table_hint: str = "") -> str:
     ):
         return f"SELECT * FROM {tbl} LIMIT {max_rows}"
 
-    # Specific filter — extract meaningful keywords
-    keywords = [w for w in query.split() if len(w) > 2 and w.lower() not in _STOP_WORDS and w.lower() not in _LIST_INTENTS]
+    # Specific filter — extract meaningful keywords (strip punctuation so "Order?" → "Order")
+    _clean_q2 = re.sub(r"[^\w\s]", " ", query)
+    keywords = [w for w in _clean_q2.split() if len(w) > 2 and w.lower() not in _STOP_WORDS and w.lower() not in _LIST_INTENTS]
     if not keywords:
         return f"SELECT * FROM {tbl} LIMIT {max_rows}"
 
@@ -626,6 +721,12 @@ def _build_fallback_sql(query: str, max_rows: int, table_hint: str = "") -> str:
         if word_blocks:
             # AND between filter keywords — "Purchase" AND "Order" won't match "Purchase Requisition"
             return f"SELECT {select_clause} FROM {tbl} WHERE {' AND '.join(word_blocks)} LIMIT {max_rows}"
+
+    # Column-only listing — "list all menuname" → SELECT menuname FROM mmenu LIMIT n
+    # No filter keywords needed — user just wants all values of that column
+    if select_cols and not filter_kws:
+        select_clause = ", ".join(c.lower() for c in select_cols)
+        return f"SELECT {select_clause} FROM {tbl} LIMIT {max_rows}"
 
     # Generic filter — AND between keywords for precision (was OR — caused false positives)
     word_blocks = []
@@ -667,10 +768,267 @@ def _format_df(df: pd.DataFrame) -> str:
 
 
 # =========================================================
+# 🔤 NAME VARIANT MATCHING (compound names like "Basic Salary")
+# =========================================================
+
+def _try_name_variants(phrase: str, target_table: str, select_cols: list,
+                       all_cols: list, max_rows: int) -> "pd.DataFrame | None":
+    """Try 5 phrase variants for compound names: 'Basic Salary' → 'BasicSalary', etc."""
+    tbl = target_table.lower()
+    clean = re.sub(r"[^\w\s]", "", phrase).strip()
+    if not clean:
+        return None
+    no_space  = re.sub(r'\s+', '', clean)
+    underscore = re.sub(r'\s+', '_', clean)
+    sel_clause = ", ".join(c.lower() for c in select_cols) if select_cols else "*"
+
+    for variant in [
+        f"'%{clean}%'",
+        f"'%{no_space}%'",
+        f"'%{underscore}%'",
+    ]:
+        col_conds = " OR ".join(
+            f"CAST({c.lower()} AS TEXT) ILIKE {variant}" for c in all_cols
+        )
+        if not col_conds:
+            continue
+        sql = f"SELECT {sel_clause} FROM {tbl} WHERE {col_conds} LIMIT {max_rows}"
+        res = execute_sql_tool(sql)
+        if "df" in res and not res["df"].empty:
+            logger.info(f"Name variant matched with pattern {variant}")
+            return res["df"]
+    return None
+
+
+# =========================================================
+# 🔗 FK FILTER (e.g. "menus where module is Payroll")
+# =========================================================
+
+def _try_fk_filter(query: str, filter_kws: list, target_table: str,
+                   rels: list, max_rows: int) -> "str | None":
+    """
+    When filter keywords don't match any column in target_table directly,
+    look them up in FK-referenced tables and do a two-step query.
+    Example: 'module=Payroll' → find moduleid in mmodule → filter mmenu by moduleid.
+    """
+    tbl = target_table.lower()
+    target_cols = get_columns(target_table)
+    if not target_cols:
+        return None
+
+    outgoing_fks = [
+        (r['source_column'].lower(), r['target_table'].lower(), r['target_column'].lower())
+        for r in rels if r['source_table'].lower() == tbl
+    ]
+    if not outgoing_fks:
+        return None
+
+    for kw in filter_kws:
+        safe_kw = re.sub(r"[^\w\s]", "", kw).strip()
+        if len(safe_kw) < 2:
+            continue
+        for fk_src_col, fk_tgt_table, fk_tgt_col in outgoing_fks:
+            tgt_cols = get_columns(fk_tgt_table)
+            if not tgt_cols:
+                continue
+            col_conds = " OR ".join(
+                f"CAST({c.lower()} AS TEXT) ILIKE '%{safe_kw}%'" for c in tgt_cols
+            )
+            lookup_sql = (
+                f"SELECT DISTINCT {fk_tgt_col} FROM {fk_tgt_table} "
+                f"WHERE {col_conds} LIMIT 100"
+            )
+            lookup_res = execute_sql_tool(lookup_sql)
+            if "error" in lookup_res or lookup_res["df"].empty:
+                continue
+            ids = [
+                str(v) for v in lookup_res["df"][fk_tgt_col].tolist()
+                if v is not None and str(v).strip() not in ("", "None", "nan")
+            ]
+            if not ids:
+                continue
+            ids_str = ", ".join(ids)
+            sel_cols = [c for c in target_cols if c.lower() not in _AUDIT_COLS]
+            sel_clause = ", ".join(sel_cols) if sel_cols else "*"
+            main_sql = (
+                f"SELECT {sel_clause} FROM {tbl} "
+                f"WHERE {fk_src_col} IN ({ids_str}) LIMIT {max_rows}"
+            )
+            main_res = execute_sql_tool(main_sql)
+            if "df" in main_res and not main_res["df"].empty:
+                logger.info(
+                    f"FK filter: '{kw}' found in {fk_tgt_table} → "
+                    f"matched {len(main_res['df'])} rows in {tbl}"
+                )
+                return (
+                    f"Results for '{query}' ({len(main_res['df'])} rows):\n\n"
+                    + _format_df(main_res["df"])
+                )
+    return None
+
+
+# =========================================================
+# 🔀 MULTI-TABLE PANDAS MERGE (replaces GPT JOINs)
+# =========================================================
+
+def _try_multi_table_merge(query: str, primary_table: str,
+                           rels: list, max_rows: int) -> "str | None":
+    """
+    Execute separate SELECT queries on primary + FK-related tables and merge
+    in Python (pandas). Avoids unreliable GPT-generated multi-table JOIN SQL.
+
+    Triggered for questions like:
+      "Show employees with their department and designation"
+      "List menus with module names"
+      "Show reports with category descriptions"
+    """
+    primary_lower = primary_table.lower()
+    primary_cols = [c for c in get_columns(primary_table) if c.lower() not in _AUDIT_COLS]
+    if not primary_cols:
+        return None
+
+    # Query the primary table
+    p_sql = f"SELECT {', '.join(primary_cols)} FROM {primary_lower} LIMIT {max_rows}"
+    p_res = execute_sql_tool(p_sql)
+    if "error" in p_res or p_res["df"].empty:
+        return None
+
+    merged_df = p_res["df"].copy()
+
+    # Find outgoing FKs from the primary table
+    outgoing_fks = [
+        (r['source_column'].lower(), r['target_table'].lower(), r['target_column'].lower())
+        for r in rels if r['source_table'].lower() == primary_lower
+    ]
+    if not outgoing_fks:
+        return None
+
+    # Score FK relevance: prefer FK targets whose table name appears in the question
+    clean_q = re.sub(r"[^\w\s]", " ", query).lower()
+    q_words = set(clean_q.split())
+
+    def _fk_score(fk_tuple):
+        _, tgt_table, _ = fk_tuple
+        base = re.sub(r'^m', '', tgt_table)           # mmodule → module
+        return sum(1 for w in q_words if w in base or base in w)
+
+    ranked_fks = sorted(outgoing_fks, key=_fk_score, reverse=True)
+
+    joins_done = 0
+    for src_col, tgt_table, tgt_col in ranked_fks:
+        if joins_done >= 2:                            # max 2 merges to keep result readable
+            break
+        if src_col not in merged_df.columns:
+            continue
+
+        tgt_all_cols = [c for c in get_columns(tgt_table) if c.lower() not in _AUDIT_COLS]
+        if not tgt_all_cols:
+            continue
+
+        t_sql = f"SELECT {', '.join(tgt_all_cols)} FROM {tgt_table} LIMIT 1000"
+        t_res = execute_sql_tool(t_sql)
+        if "error" in t_res or t_res["df"].empty:
+            continue
+        if tgt_col not in t_res["df"].columns:
+            continue
+
+        tgt_df = t_res["df"].copy()
+
+        # Rename columns that clash with primary table (keep join key unchanged)
+        rename_map = {
+            c: f"{c}_{tgt_table}"
+            for c in tgt_df.columns
+            if c in merged_df.columns and c != tgt_col
+        }
+        if rename_map:
+            tgt_df = tgt_df.rename(columns=rename_map)
+
+        try:
+            merged_df = merged_df.merge(tgt_df, left_on=src_col,
+                                        right_on=tgt_col, how='left')
+            # Drop redundant pandas _x / _y suffixes if any
+            drop_cols = [c for c in merged_df.columns if c.endswith('_x') or c.endswith('_y')]
+            if drop_cols:
+                merged_df = merged_df.drop(columns=drop_cols)
+            joins_done += 1
+            logger.info(f"Merged {primary_lower} ← {tgt_table} on {src_col}={tgt_col}")
+        except Exception as _me:
+            logger.warning(f"Pandas merge failed ({tgt_table}): {_me}")
+            continue
+
+    if joins_done == 0:
+        return None  # No merge happened — let GPT try
+
+    logger.info(f"Multi-table merge complete: {joins_done} join(s), {len(merged_df)} rows, "
+                f"{len(merged_df.columns)} columns")
+    return (
+        f"Results for '{query}' ({len(merged_df)} rows):\n\n"
+        + _format_df(merged_df)
+    )
+
+
+# =========================================================
+# 🗺️ MENU PATH BUILDER (navigation: HR > Payroll > Setup)
+# =========================================================
+
+def build_menu_path(menu_name: str, max_depth: int = 8) -> str:
+    """
+    Traverse MMENU parentid chain to build full navigation path.
+    Returns "Module > SubModule > Screen" style strings (one per match).
+    """
+    cols = {c.lower() for c in get_columns("mmenu")}
+    if "parentid" not in cols or "menuname" not in cols:
+        return ""
+
+    clean = re.sub(r"[^\w\s]", "", menu_name).strip()
+    if not clean:
+        return ""
+
+    find_sql = (
+        f"SELECT menuid, menuname, parentid FROM mmenu "
+        f"WHERE CAST(menuname AS TEXT) ILIKE '%{clean}%' LIMIT 10"
+    )
+    find_res = execute_sql_tool(find_sql)
+    if "error" in find_res or find_res["df"].empty:
+        return ""
+
+    paths = []
+    for _, row in find_res["df"].iterrows():
+        chain = [str(row["menuname"])]
+        current_parent = row.get("parentid")
+        visited: set = set()
+        depth = 0
+        while (
+            current_parent is not None
+            and str(current_parent).strip() not in ("-1", "None", "nan", "")
+            and depth < max_depth
+        ):
+            key = str(current_parent)
+            if key in visited:
+                break
+            visited.add(key)
+            depth += 1
+            p_sql = (
+                f"SELECT menuid, menuname, parentid FROM mmenu "
+                f"WHERE menuid = {current_parent} LIMIT 1"
+            )
+            p_res = execute_sql_tool(p_sql)
+            if "error" in p_res or p_res["df"].empty:
+                break
+            p_row = p_res["df"].iloc[0]
+            chain.insert(0, str(p_row["menuname"]))
+            current_parent = p_row.get("parentid")
+        if len(chain) > 1:
+            paths.append(" > ".join(chain))
+
+    return "\n".join(paths) if paths else ""
+
+
+# =========================================================
 # 🤖 AGENT ORCHESTRATION (RunPod — no local model needed)
 # =========================================================
 
-def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
+def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "", session_id: str = "") -> str:
     """
     Orchestrates the 4 tools using RunPod SQL endpoint:
       Tool 1: get_schema_tool   → fetch tables + FK relationships
@@ -679,6 +1037,7 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
       Tool 4: fix_sql_tool      → self-heal on SQL error with schema context
       Tool 5: keyword fallback  → last resort ILIKE query if all above fail
     table_hint: optional table name passed by bots via query_table() to force correct table selection.
+    session_id: optional per-user key for follow-up DataFrame context.
     """
     # Check query cache first — skip sql_llm entirely if same question asked recently
     global _query_cache
@@ -698,12 +1057,26 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
         if expired_keys:
             logger.info(f"Cache eviction: removed {len(expired_keys)} expired entries")
 
+    # Follow-up filter — if question references "those/that/first/last", try to answer
+    # directly from the last result DataFrame without any SQL or LLM call
+    if session_id and _is_followup_question(query):
+        _stored_df, _stored_query = _get_session_df(session_id)
+        if _stored_df is not None:
+            _fu_result = _filter_df_by_question(query, _stored_df)
+            if _fu_result is not None and not _fu_result.empty:
+                logger.info(f"Follow-up filter hit — answered from stored DataFrame ({len(_fu_result)} rows)")
+                return (
+                    f"Results for '{query}' ({len(_fu_result)} rows):\n\n"
+                    + _format_df(_fu_result)
+                )
+
     # Fast path — skip SQL LLM for simple listing queries (saves 5-28s per request)
     # Triggered when: "list all X", "give me X", "show X", "what are X" with no specific filter value
     _q_words = set(query.lower().split())
     _has_list_intent = bool(_q_words & _LIST_INTENTS)
+    _clean_q = re.sub(r"[^\w\s]", " ", query)
     _filter_words = [
-        w for w in query.split()
+        w for w in _clean_q.split()
         if len(w) > 2
         and w.lower() not in _STOP_WORDS
         and w.lower() not in _LIST_INTENTS
@@ -711,7 +1084,10 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
     ]
     _target_table = table_hint or _detect_table_from_question(query)
     if _has_list_intent and not _filter_words and _target_table:
-        _fast_sql = f"SELECT * FROM {_target_table.lower()} LIMIT {max_rows}"
+        _all_fast_cols = get_columns(_target_table)
+        _fast_select_cols = [c for c in _all_fast_cols if c.lower() not in _AUDIT_COLS]
+        _fast_col_clause = ", ".join(_fast_select_cols) if _fast_select_cols else "*"
+        _fast_sql = f"SELECT {_fast_col_clause} FROM {_target_table.lower()} LIMIT {max_rows}"
         logger.info(f"Fast path (no LLM): {_fast_sql}")
         _fast_result = execute_sql_tool(_fast_sql)
         if "df" in _fast_result:
@@ -723,6 +1099,7 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
     # If a filter word IS a column name in the target table, the fallback SQL is already correct.
     # Try it immediately (0 RunPod calls) — saves 70-170s of wasted retry attempts.
     # Only skips sqlcoder when direct SQL actually returns data; otherwise falls through normally.
+    _col_set: set = set()
     if _target_table and _filter_words:
         _col_set = {c.lower() for c in get_columns(_target_table)}
         _has_col_keyword = any(w.lower() in _col_set for w in _filter_words)
@@ -731,13 +1108,57 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
             if _preflight_sql and "SELECT *" not in _preflight_sql:
                 _preflight_res = execute_sql_tool(_preflight_sql)
                 if "df" in _preflight_res and not _preflight_res["df"].empty:
-                    logger.info(f"Pre-flight lookup succeeded — skipped RunPod sqlcoder")
+                    logger.info(f"Pre-flight lookup succeeded — skipped GPT")
                     _final = (
                         f"Results for '{query}' ({len(_preflight_res['df'])} rows):\n\n"
                         + _format_df(_preflight_res["df"])
                     )
                     _query_cache[_cache_key] = (_final, _now)
+                    if session_id:
+                        _store_session_df(session_id, _preflight_res["df"], query)
                     return _final
+                else:
+                    # Pre-flight empty — try compound name variants (Basic Salary, Gross Pay, etc.)
+                    _non_col_kws = [w for w in _filter_words if w.lower() not in _col_set]
+                    _sel_col_kws = [w for w in _filter_words if w.lower() in _col_set]
+                    if len(_non_col_kws) >= 2:
+                        _phrase = " ".join(_non_col_kws)
+                        _tbl_cols = get_columns(_target_table)
+                        _variant_df = _try_name_variants(_phrase, _target_table, _sel_col_kws, _tbl_cols, max_rows)
+                        if _variant_df is not None:
+                            logger.info(f"Name variant pre-flight succeeded for '{_phrase}'")
+                            _final = (
+                                f"Results for '{query}' ({len(_variant_df)} rows):\n\n"
+                                + _format_df(_variant_df)
+                            )
+                            _query_cache[_cache_key] = (_final, _now)
+                            return _final
+
+    # FK filter — triggered when filter keywords don't match any column in target table
+    # e.g. "menus where module is Payroll" — "Payroll" is in MMODULE, not MMENU
+    if _target_table and _filter_words:
+        _fk_unmatched = [w for w in _filter_words if w.lower() not in _col_set]
+        if _fk_unmatched:
+            _rels_for_fk = get_relationships()
+            _fk_result = _try_fk_filter(query, _fk_unmatched, _target_table, _rels_for_fk, max_rows)
+            if _fk_result:
+                logger.info(f"FK filter path succeeded — skipped GPT")
+                _query_cache[_cache_key] = (_fk_result, _now)
+                return _fk_result
+
+    # Multi-table merge — Python pandas JOIN for relational questions
+    # e.g. "employees with their department", "menus with module names"
+    # More reliable than GPT-generated SQL JOINs for 2-3 table queries
+    _MERGE_TRIGGERS = {"with their", "and their", "along with", "including their",
+                       "together with", "with the", "and the", "show with", "list with"}
+    _q_lower_merge = query.lower()
+    if _target_table and any(t in _q_lower_merge for t in _MERGE_TRIGGERS):
+        _rels_for_merge = get_relationships()
+        _merge_result = _try_multi_table_merge(query, _target_table, _rels_for_merge, max_rows)
+        if _merge_result:
+            logger.info(f"Multi-table merge succeeded — skipped GPT JOIN")
+            _query_cache[_cache_key] = (_merge_result, _now)
+            return _merge_result
 
     try:
         # Tool 1 — Schema (query-aware: relevant tables first, table_hint forces correct table)
@@ -863,6 +1284,8 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
                 + _format_df(df)
             )
             _query_cache[_cache_key] = (final, time.time())
+            if session_id:
+                _store_session_df(session_id, df, query)
             return final
 
         if "error" in result:
@@ -889,11 +1312,12 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
 # 🚀 PUBLIC API
 # =========================================================
 
-def query_table(table_name: str, search_term: str, max_rows: int = 50) -> str:
+def query_table(table_name: str, search_term: str, max_rows: int = 50, session_id: str = "") -> str:
     """Compatibility wrapper — called by all bots. Delegates to run_db_agent.
     Passes table_name as a hint so Schema RAG always prioritises the correct table.
+    session_id: optional per-user key for follow-up DataFrame context.
     """
-    return run_db_agent(search_term, max_rows, table_hint=table_name)
+    return run_db_agent(search_term, max_rows, table_hint=table_name, session_id=session_id)
 
 
 # =========================================================

@@ -387,7 +387,8 @@ FORMULA KNOWLEDGE BASE (Primary Formula Information — fetched live from Postgr
 ---
 USER QUESTION: {question}
 
-⚠ FINAL INSTRUCTION: The data above is already fetched. Present it DIRECTLY. DO NOT write SQL or suggest running queries.
+⚠ FINAL INSTRUCTION: The data above is already fetched. Answer in natural language only.
+NEVER output SQL queries, SELECT statements, or any code. Present the data directly as plain text.
 
 ---
 CONTEXT-AWARE FORMULA RESPONSE (Synthesize all available information):
@@ -445,7 +446,7 @@ async def chat(message: Message, Login: str = Header(...)):
             orchestrator_context = (_cut[:_nl] if _nl > 500 else _cut) + "\n[...context truncated...]"
 
         logger.info(f"🔍 Searching PostgreSQL MFORMULAFIELD for: {user_input[:100]}")
-        context_str = db_query.query_table("MFORMULAFIELD", user_input)
+        context_str = db_query.query_table("MFORMULAFIELD", user_input, session_id=username)
         # Truncate at newline boundary to avoid cutting mid-record
         if len(context_str) > 8000:
             _cut = context_str.rfind('\n', 0, 8000)

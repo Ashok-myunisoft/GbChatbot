@@ -337,7 +337,8 @@ REPORT KNOWLEDGE BASE (Primary Report Information — fetched live from PostgreS
 ---
 USER QUESTION: {question}
 
-⚠ FINAL INSTRUCTION: The data above is already fetched. Present it DIRECTLY. DO NOT write SQL or suggest running queries.
+⚠ FINAL INSTRUCTION: The data above is already fetched. Answer in natural language only.
+NEVER output SQL queries, SELECT statements, or any code. Present the data directly as plain text.
 
 ---
 CONTEXT-AWARE REPORT RESPONSE (Synthesize all available information):
@@ -379,7 +380,7 @@ async def report_chat(message: Message, Login: str = Header(...)):
 
     try:
         logger.info(f"🔍 Searching PostgreSQL MREPORT for: {user_input[:100]}")
-        context_str = db_query.query_table("MREPORT", user_input)
+        context_str = db_query.query_table("MREPORT", user_input, session_id=username)
         # Truncate at newline boundary to avoid cutting mid-record
         if len(context_str) > 8000:
             _cut = context_str.rfind('\n', 0, 8000)

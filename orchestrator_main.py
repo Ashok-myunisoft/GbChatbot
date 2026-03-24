@@ -2074,11 +2074,14 @@ For example: "Name: John, Role: developer" """
             "more", "tell me more", "show more", "continue", "elaborate",
             "explain more", "go on", "and then", "what about that",
             "same", "again", "retry", "once more", "expand",
+            "those", "that one", "the first", "first one", "second one",
+            "last one", "which of", "which has", "which have", "of those",
+            "of them", "from those", "among those", "above", "listed",
         }
         _q_lower = question.lower().strip()
         _is_followup = (
             thread_id and is_existing_thread
-            and len(_q_lower.split()) <= 8
+            and len(_q_lower.split()) <= 14
             and any(ph in _q_lower for ph in _FOLLOWUP_PHRASES)
         )
         if _is_followup:

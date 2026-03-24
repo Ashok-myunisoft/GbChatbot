@@ -211,7 +211,8 @@ TYPE B — STRUCTURE / EXPLANATION (user wants to understand project setup or co
 [USER QUESTION]
 {question}
 
-⚠ FINAL INSTRUCTION: The data above is already fetched. Present it DIRECTLY. DO NOT write SQL or suggest running queries.
+⚠ FINAL INSTRUCTION: The data above is already fetched. Answer in natural language only.
+NEVER output SQL queries, SELECT statements, or any code. Present the data directly as plain text.
 
 Response:
 """

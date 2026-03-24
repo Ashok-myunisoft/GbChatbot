@@ -225,10 +225,13 @@ def call_sql_endpoint(query: str, schema: str, timeout: float = 200.0) -> str:
         "You are a PostgreSQL SQL expert. Generate a single valid SELECT statement.\n"
         "Rules:\n"
         "- Use ONLY the tables and columns defined in the schema\n"
+        "- NEVER invent or guess column names — if a column you want does not exist in the schema, use the closest available text column with ILIKE '%value%' instead\n"
         "- Use lowercase for all table and column names\n"
         "- Return ONLY the raw SQL — no explanation, no markdown, no code blocks\n"
         "- Always include a LIMIT clause\n"
-        "- End with a semicolon"
+        "- End with a semicolon\n"
+        "- Write simple WHERE clauses — avoid subqueries unless absolutely necessary\n"
+        "- For questions asking to show X with their Y (e.g. 'employees with department'), use JOIN on the FK relationship shown in the schema"
     )
     user_prompt = f"Schema:\n{schema}\n\nQuestion: {query}"
 
