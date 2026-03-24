@@ -1625,11 +1625,20 @@ class AIOrchestrationAgent:
             'shortcut', 'module location',
             'settings', 'toolbar', 'sidebar', 'open screen', 'which screen',
             'how to reach', 'how to get to',
-            'menu path', 'menu location', 'which menu', 'navigate menu'
+            'menu path', 'menu location', 'which menu', 'navigate menu',
+            'menucode', 'menu code',
         ]
         if any(word in question_lower for word in menu_keywords):
             logger.info("🚀 Fast route: menu")
             return "menu"
+        # Compound "menu*" column words (menuname, menupath, menuid, menutype, etc.) → menu bot
+        if any(w.startswith('menu') and len(w) > 4 for w in question_lower.split()):
+            logger.info("🚀 Fast route: menu (menu* column word)")
+            return "menu"
+        # Compound "formula*" column words (formulaexpression, formulaname, formulaid, etc.) → formula bot
+        if any(w.startswith('formula') and len(w) > 7 for w in question_lower.split()):
+            logger.info("🚀 Fast route: formula (formula* column word)")
+            return "formula"
         
         # Structure/schema questions always go to schema bot, even for project-related tables
         # e.g. "what fields does MFILE have?" must not be stolen by project keywords
@@ -1690,7 +1699,7 @@ class AIOrchestrationAgent:
             'all records', 'all rows', 'all entries',
             'give me', 'show me', 'find me', 'fetch me',
             'picklist', 'pick list', 'dropdown', 'lookup', 'masterdata',
-            'master data', 'what are', 'what is the', 'menucode', 'menu code'
+            'master data', 'what are', 'what is the',
         ]
         if any(word in question_lower for word in schema_keywords):
             logger.info("🚀 Fast route: schema")

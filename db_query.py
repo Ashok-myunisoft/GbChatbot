@@ -179,27 +179,65 @@ def get_primary_key(table: str) -> list:
 
 
 def _build_create_table(table: str, rels: list) -> str:
-    """Build a CREATE TABLE DDL string with real types, PKs and FK constraints.
-    This is the format sqlcoder-7b-2 was trained on — gives accurate SQL generation.
+    """Build a compact CREATE TABLE DDL string for sqlcoder-7b-2.
+    Limits columns to key ones (PK + FK + name/status/code) to stay within token limit.
+    Tables with 30+ columns caused 'Schema too large' errors — this fixes that.
     """
     tbl = table.lower()
     col_types = get_column_types(tbl)
-    pk_cols   = get_primary_key(tbl)
+    pk_cols   = set(get_primary_key(tbl))
 
-    lines = [f"    {col} {typ}" for col, typ in col_types]
+    # FK source columns for this table
+    fk_cols = {r['source_column'] for r in rels if r['source_table'].lower() == tbl}
+
+    # Important column name patterns — always keep these
+    _KEY_SUFFIXES = ('id', 'name', 'code', 'status', 'type', 'date', 'description', 'expression', 'location')
+    # Audit/system columns that add size but are rarely needed in queries
+    # NOTE: formulaexpression, filelocation, remarks, purpose removed — they are queryable business data
+    _DROP_COLS = {
+        'createdon', 'modifiedon', 'createdbyid', 'modifiedbyid',
+        'version', 'sourcetype', 'tenantid', 'entityid',
+        'webserviceid', 'sortorder', 'addedtype',
+        'reporturi',
+    }
+
+    essential = []   # PK + FK cols — always included
+    important = []   # name/code/status cols — include if space
+    rest      = []   # everything else — include only up to cap
+
+    for col, typ in col_types:
+        col_l = col.lower()
+        if col_l in _DROP_COLS:
+            continue
+        entry = f"    {col} {typ}"
+        if col_l in pk_cols or col_l in fk_cols:
+            essential.append(entry)
+        elif any(col_l.endswith(s) for s in _KEY_SUFFIXES):
+            important.append(entry)
+        else:
+            rest.append(entry)
+
+    # Cap total columns at 12 to prevent "Schema too large" errors
+    _MAX_COLS = 12
+    selected_cols = essential[:]
+    remaining = _MAX_COLS - len(selected_cols)
+    if remaining > 0:
+        selected_cols += important[:remaining]
+    remaining = _MAX_COLS - len(selected_cols)
+    if remaining > 0:
+        selected_cols += rest[:remaining]
 
     if pk_cols:
-        lines.append(f"    PRIMARY KEY ({', '.join(pk_cols)})")
+        selected_cols.append(f"    PRIMARY KEY ({', '.join(sorted(pk_cols))})")
 
-    # Outgoing FKs only (source = this table)
     for r in rels:
-        if r["source_table"].lower() == tbl:
-            lines.append(
+        if r['source_table'].lower() == tbl and r['source_column'] in fk_cols:
+            selected_cols.append(
                 f"    FOREIGN KEY ({r['source_column']}) "
                 f"REFERENCES {r['target_table'].lower()}({r['target_column']})"
             )
 
-    return f"CREATE TABLE {tbl} (\n" + ",\n".join(lines) + "\n);"
+    return f"CREATE TABLE {tbl} (\n" + ",\n".join(selected_cols) + "\n);"
 
 
 def get_relationships() -> list:
@@ -283,6 +321,13 @@ def get_schema_tool(question: str = "", table_hint: str = "", max_tables: int = 
                 for r in rels:
                     if r['source_table'].lower() == target.lower():
                         related.add(r['target_table'].lower())
+
+        # Second-hop FK expansion — adds FK targets of FK targets (enables 3-table JOINs)
+        # e.g. MMENU → MMODULE → MCATEGORY: MCATEGORY was previously never in DDL
+        for hop2_src in list(related):
+            for r in rels:
+                if r['source_table'].lower() == hop2_src:
+                    related.add(r['target_table'].lower())
 
         # Strip system/framework tables from related set — prevents bad JOINs + schema bloat
         related = {t for t in related if not t.startswith(_SYS_PREFIXES)}
@@ -523,12 +568,13 @@ _STOP_WORDS = {
 
 _LIST_INTENTS = {"list", "all", "give", "show", "get", "fetch", "display", "what", "which"}
 
-def _build_fallback_sql(query: str, max_rows: int) -> str:
+def _build_fallback_sql(query: str, max_rows: int, table_hint: str = "") -> str:
     """Build a simple query when LLM + self-heal both fail.
     For 'list all / give / show' queries → SELECT * with no WHERE (user wants all records).
     For specific filter queries → ILIKE keyword search.
+    table_hint: when provided by the calling bot, always use this table (avoids wrong detection).
     """
-    table = _detect_table_from_question(query)
+    table = table_hint or _detect_table_from_question(query)
     if not table:
         return ""
     tbl = table.lower()
@@ -643,7 +689,9 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
 
     try:
         # Tool 1 — Schema (query-aware: relevant tables first, table_hint forces correct table)
-        schema = get_schema_tool(question=query, table_hint=table_hint)
+        # max_tables=3: safe now that each DDL is capped at 12 cols (~35 chars each = ~1260 chars total)
+        # Retry ladder (schema-too-large path) still falls back to 2→1 tables as safety net
+        schema = get_schema_tool(question=query, table_hint=table_hint, max_tables=3)
 
         # Tool 2 — Generate SQL
         # TimeoutError = cold start → retry once (worker will be warm)
@@ -698,7 +746,7 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
 
         if sql is None:
             # sql endpoint unavailable — go straight to keyword fallback
-            fallback_sql = _build_fallback_sql(query, max_rows)
+            fallback_sql = _build_fallback_sql(query, max_rows, table_hint)
             if fallback_sql:
                 logger.info(f"Keyword fallback SQL (endpoint unavailable): {fallback_sql[:200]}")
                 result = execute_sql_tool(fallback_sql)
@@ -750,7 +798,7 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
             # Keyword fallback — last resort if LLM + self-heal both failed
             if "error" in result:
                 logger.warning(f"SQL failed after self-heal: {result['error']} — trying keyword fallback")
-                fallback_sql = _build_fallback_sql(query, max_rows)
+                fallback_sql = _build_fallback_sql(query, max_rows, table_hint)
                 if fallback_sql:
                     logger.info(f"Fallback SQL: {fallback_sql[:200]}")
                     result = execute_sql_tool(fallback_sql)
@@ -767,6 +815,16 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
 
         if "error" in result:
             logger.warning(f"All attempts failed: {result['error']}")
+            # Detect relational failure from the SQL itself — no hardcoded keyword list
+            # If sqlcoder generated a JOIN query but it still failed → multi-table question
+            _was_join_attempt = sql is not None and bool(re.search(r'\bJOIN\b', sql, re.IGNORECASE))
+            if _was_join_attempt:
+                return (
+                    f"No data found for: {query}\n"
+                    f"Note: This question requires data from multiple tables. "
+                    f"The system attempted a JOIN query but could not retrieve results. "
+                    f"Try asking about a single table directly, e.g. 'list all menus' or 'show all reports'."
+                )
 
         return f"No data found for: {query}"
 
@@ -868,9 +926,27 @@ def _detect_table_from_question(user_question: str) -> "str | None":
                 else:
                     quality = 2
                 partial_hits.append((quality, len(tbl_up), tbl_orig))
+                continue
+            # Reverse check: table base name is a prefix of the question word
+            # Handles compound column words like "employeename" → MEMPLOYEE,
+            # "vendorname" → MVENDOR, "reportcode" → MREPORT
+            # Strip up to 3 leading prefix chars (e.g. M, ML, FW) then check
+            for p in range(min(3, len(tbl_up))):
+                base = tbl_up[p:]
+                if len(base) >= 5 and w_up.startswith(base) and len(w_up) > len(base):
+                    partial_hits.append((1, len(tbl_up), tbl_orig))
+                    break
 
     if partial_hits:
-        partial_hits.sort(key=lambda x: (x[0], 0 if x[2].upper().startswith('M') else 1, x[1]))
+        # Core GoodBooks bot tables take priority over generic/system tables with same match quality
+        # e.g. "menu" → MMENU wins over MENUM, "report" → MREPORT wins over MREPORTTYPE
+        _CORE_TABLES = {'mmenu', 'mreport', 'mformulafield', 'mfile', 'mproject', 'mformula'}
+        partial_hits.sort(key=lambda x: (
+            x[0],                                          # quality: 0=prefix, 1=suffix, 2=other
+            0 if x[2].lower() in _CORE_TABLES else 1,     # core tables first
+            0 if x[2].upper().startswith('M') else 1,     # M-prefix tables before others
+            x[1],                                          # shorter table name first
+        ))
         return partial_hits[0][2]
 
     return None
@@ -882,3 +958,4 @@ def _detect_table_from_question(user_question: str) -> "str | None":
 
 if __name__ == "__main__":
     print(run_db_agent("get employee names with department names"))
+
