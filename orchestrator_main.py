@@ -1976,17 +1976,9 @@ For example: "Name: John, Role: developer" """
         
         logger.info("📚 Building conversational context...")
         if is_existing_thread and thread_id:
-            recent_memories = enhanced_memory.retrieve_contextual_memories(
-                username, question, k=3, thread_id=thread_id, thread_isolation=True
-            )
             context = build_conversational_context(username, question, thread_id, thread_isolation=True)
         else:
-            recent_memories = enhanced_memory.retrieve_contextual_memories(
-                username, question, k=3, thread_id=thread_id, thread_isolation=False
-            )
             context = build_conversational_context(username, question, thread_id, thread_isolation=False)
-
-        logger.info(f"📚 Retrieved {len(recent_memories)} contextual memories")
 
         # Detect "try again" / "retry" — re-use the previous question and intent
         retry_phrases = {"try again", "retry", "try once more", "please retry", "try that again", "again"}
