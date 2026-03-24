@@ -230,12 +230,20 @@ def _build_create_table(table: str, rels: list) -> str:
     if pk_cols:
         selected_cols.append(f"    PRIMARY KEY ({', '.join(sorted(pk_cols))})")
 
+    # Only declare FKs for columns that actually made it into selected_cols
+    # Cap at 5 declarations — tables like MEMPLOYEE have 10+ FKs which bloat the DDL
+    # and cause "Schema too large" errors on the RunPod sqlcoder endpoint
+    _selected_col_names = {e.strip().split()[0].lower() for e in selected_cols}
+    _fk_decl_count = 0
     for r in rels:
-        if r['source_table'].lower() == tbl and r['source_column'] in fk_cols:
+        if _fk_decl_count >= 5:
+            break
+        if r['source_table'].lower() == tbl and r['source_column'].lower() in _selected_col_names:
             selected_cols.append(
                 f"    FOREIGN KEY ({r['source_column']}) "
                 f"REFERENCES {r['target_table'].lower()}({r['target_column']})"
             )
+            _fk_decl_count += 1
 
     return f"CREATE TABLE {tbl} (\n" + ",\n".join(selected_cols) + "\n);"
 
@@ -597,6 +605,29 @@ def _build_fallback_sql(query: str, max_rows: int, table_hint: str = "") -> str:
     if not keywords:
         return f"SELECT * FROM {tbl} LIMIT {max_rows}"
 
+    # Column-aware lookup: detect if any keyword IS a column name in this table
+    # e.g. "what is the menucode for Purchase Order" → menucode is a column
+    # → SELECT menucode WHERE (Purchase AND Order) instead of searching for 'menucode' as a value
+    col_names_lower = {c.lower() for c in col_names}
+    select_cols = [w for w in keywords if w.lower() in col_names_lower]
+    filter_kws  = [w for w in keywords if w.lower() not in col_names_lower]
+
+    if select_cols and filter_kws:
+        select_clause = ", ".join(c.lower() for c in select_cols)
+        word_blocks = []
+        for kw in filter_kws[:5]:
+            safe_kw = kw.replace("'", "")
+            col_conds = " OR ".join(
+                f"CAST({col.lower()} AS TEXT) ILIKE '%{safe_kw}%'"
+                for col in col_names
+            )
+            if col_conds:
+                word_blocks.append(f"({col_conds})")
+        if word_blocks:
+            # AND between filter keywords — "Purchase" AND "Order" won't match "Purchase Requisition"
+            return f"SELECT {select_clause} FROM {tbl} WHERE {' AND '.join(word_blocks)} LIMIT {max_rows}"
+
+    # Generic filter — AND between keywords for precision (was OR — caused false positives)
     word_blocks = []
     for kw in keywords[:6]:
         safe_kw = kw.replace("'", "")
@@ -608,7 +639,8 @@ def _build_fallback_sql(query: str, max_rows: int, table_hint: str = "") -> str:
             word_blocks.append(f"({col_conds})")
     if not word_blocks:
         return f"SELECT * FROM {tbl} LIMIT {max_rows}"
-    return f"SELECT * FROM {tbl} WHERE {' OR '.join(word_blocks)} LIMIT {max_rows}"
+    # AND: every keyword must match — prevents partial matches like "Purchase Requisition" for "Purchase Order"
+    return f"SELECT * FROM {tbl} WHERE {' AND '.join(word_blocks)} LIMIT {max_rows}"
 
 
 # =========================================================
@@ -686,6 +718,26 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "") -> str:
             _final = _format_df(_fast_result["df"]) if not _fast_result["df"].empty else "(no rows)"
             _query_cache[_cache_key] = (_final, _now)
             return _final
+
+    # Pre-flight: specific column lookup — "what is the menucode for Purchase Order?"
+    # If a filter word IS a column name in the target table, the fallback SQL is already correct.
+    # Try it immediately (0 RunPod calls) — saves 70-170s of wasted retry attempts.
+    # Only skips sqlcoder when direct SQL actually returns data; otherwise falls through normally.
+    if _target_table and _filter_words:
+        _col_set = {c.lower() for c in get_columns(_target_table)}
+        _has_col_keyword = any(w.lower() in _col_set for w in _filter_words)
+        if _has_col_keyword:
+            _preflight_sql = _build_fallback_sql(query, max_rows, _target_table)
+            if _preflight_sql and "SELECT *" not in _preflight_sql:
+                _preflight_res = execute_sql_tool(_preflight_sql)
+                if "df" in _preflight_res and not _preflight_res["df"].empty:
+                    logger.info(f"Pre-flight lookup succeeded — skipped RunPod sqlcoder")
+                    _final = (
+                        f"Results for '{query}' ({len(_preflight_res['df'])} rows):\n\n"
+                        + _format_df(_preflight_res["df"])
+                    )
+                    _query_cache[_cache_key] = (_final, _now)
+                    return _final
 
     try:
         # Tool 1 — Schema (query-aware: relevant tables first, table_hint forces correct table)

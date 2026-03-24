@@ -24,6 +24,9 @@ EMBEDDING_DEVICE    = os.getenv("EMBEDDING_DEVICE", "cpu")
 # SQL Agent — separate RunPod endpoint (same API key)
 RUNPOD_SQL_ENDPOINT_URL = os.getenv("RUNPOD_SQL_ENDPOINT_URL", "https://api.runpod.ai/v2/memmd7zoeml0a4/run")
 
+# OpenAI — used for SQL generation (GPT-4o-mini replaces sqlcoder-7b-2)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
 # Derive the GET status base URLs
 _ENDPOINT_BASE        = RUNPOD_ENDPOINT_URL.rsplit("/run", 1)[0]
 RUNPOD_STATUS_URL     = f"{_ENDPOINT_BASE}/status"
@@ -193,64 +196,59 @@ class AIResources:
 
 
 # ===========================
-# SQL Endpoint Direct Caller
+# SQL Generation via GPT-4o-mini
 # ===========================
 def call_sql_endpoint(query: str, schema: str, timeout: float = 200.0) -> str:
     """
-    Call the SQL RunPod endpoint with the correct payload format.
-    The SQL endpoint expects {"input": {"query": ..., "schema": ...}}
-    NOT the standard {"input": {"prompt": ...}} format.
+    Generate PostgreSQL SQL using GPT-4o-mini.
+    Replaces the RunPod sqlcoder-7b-2 endpoint — same function signature,
+    same return value (raw SQL string), same error types (TimeoutError / RuntimeError).
+
+    Only schema DDL + question are sent to OpenAI.
+    Actual database row data never leaves your server.
     """
-    headers = {
-        "Authorization": f"Bearer {RUNPOD_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    if not OPENAI_API_KEY:
+        raise RuntimeError(
+            "OPENAI_API_KEY not set. Add OPENAI_API_KEY=sk-... to your .env file."
+        )
 
-    post_resp = requests.post(
-        RUNPOD_SQL_ENDPOINT_URL,
-        json={"input": {"query": query, "schema": schema, "max_new_tokens": 1024}},
-        headers=headers,
-        timeout=30,
+    try:
+        from openai import OpenAI, APITimeoutError, APIError
+    except ImportError:
+        raise RuntimeError(
+            "openai package not installed. Run: pip install openai"
+        )
+
+    client = OpenAI(api_key=OPENAI_API_KEY, timeout=min(timeout, 30.0))
+
+    system_prompt = (
+        "You are a PostgreSQL SQL expert. Generate a single valid SELECT statement.\n"
+        "Rules:\n"
+        "- Use ONLY the tables and columns defined in the schema\n"
+        "- Use lowercase for all table and column names\n"
+        "- Return ONLY the raw SQL — no explanation, no markdown, no code blocks\n"
+        "- Always include a LIMIT clause\n"
+        "- End with a semicolon"
     )
-    post_resp.raise_for_status()
+    user_prompt = f"Schema:\n{schema}\n\nQuestion: {query}"
 
-    post_data = post_resp.json()
-    job_id = post_data.get("id")
-    if not job_id:
-        raise ValueError(f"RunPod SQL endpoint did not return a job id. Response: {post_data}")
-
-    logger.info(f"[RunPod SQL] Job submitted → id: {job_id}")
-
-    poll_url = f"{RUNPOD_SQL_STATUS_URL}/{job_id}"
-    elapsed = 0.0
-    poll_interval = 0.8
-
-    while elapsed < timeout:
-        time.sleep(poll_interval)
-        elapsed += poll_interval
-
-        get_resp = requests.get(poll_url, headers=headers, timeout=60)
-        get_resp.raise_for_status()
-        data = get_resp.json()
-        status = data.get("status", "UNKNOWN")
-
-        logger.info(f"[RunPod SQL] job {job_id} → {status} ({elapsed:.1f}s)")
-
-        if status == "COMPLETED":
-            output = data.get("output", "")
-            logger.info(f"[RunPod SQL] job {job_id} COMPLETED")
-            if isinstance(output, dict):
-                return output.get("sql", output.get("text", output.get("output", str(output))))
-            return str(output)
-
-        if status in ("FAILED", "CANCELLED"):
-            raise RuntimeError(
-                f"[RunPod SQL] job {job_id} {status}: {data.get('error', 'No error message')}"
-            )
-
-    raise TimeoutError(
-        f"[RunPod SQL] job {job_id} did not complete within {timeout}s"
-    )
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+            temperature=0.1,
+            max_tokens=512,
+        )
+        sql = response.choices[0].message.content.strip()
+        logger.info(f"[GPT-4o-mini] SQL generated ({response.usage.total_tokens} tokens)")
+        return sql
+    except APITimeoutError:
+        raise TimeoutError("[GPT-4o-mini] Request timed out")
+    except APIError as e:
+        raise RuntimeError(f"[GPT-4o-mini] API error: {e}")
 
 
 # Global singleton instance
