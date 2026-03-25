@@ -432,6 +432,16 @@ async def chat(message: Message, Login: str = Header(...)):
         context_str = rag_query.search(user_input, k=10)
         logger.info(f"📄 Context built: {len(context_str)} chars")
 
+        # Hard guard: if RAG returned nothing, exit before LLM call — prevents hallucination
+        _EMPTY_RAG = {"", "No relevant documents found in knowledge base", "(no rows)", "No data found for this request."}
+        if not context_str or context_str.strip() in _EMPTY_RAG:
+            logger.info("RAG returned empty — skipping LLM call to prevent hallucination")
+            return {
+                "response": "No relevant documents found for this request in the knowledge base.",
+                "bot_name": "General Bot",
+                "source_file": "knowledge_base"
+            }
+
         # ⚠️ HARD RULE: general bot NEVER calls SQL — RAG only.
         # SQL is reserved for dedicated bots (formula, report, menu, project, schema).
         # Removing DB supplement prevents 25-115s latency on general queries.

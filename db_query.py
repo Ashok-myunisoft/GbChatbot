@@ -43,7 +43,7 @@ _SCHEMA_CACHE_TTL: int = 3600
 
 # Query result cache — avoids sql_llm RunPod call for repeated questions
 _query_cache: dict = {}
-_QUERY_CACHE_TTL: int = 300  # 5 minutes
+_QUERY_CACHE_TTL: int = 1800  # 30 minutes
 
 
 def _get_engine():
@@ -616,8 +616,12 @@ def _filter_df_by_question(query: str, df) -> "object | None":
     q_words = q_lower.split()
     cols_lower = {c.lower(): c for c in df.columns}
 
-    # Ordinal access: "first", "second", "third", "last"
-    ordinal_map = {"first": 0, "second": 1, "third": 2, "last": -1}
+    # Ordinal access — "first", "second" ... "tenth", "last"
+    ordinal_map = {
+        "first": 0, "second": 1, "third": 2, "fourth": 3, "fifth": 4,
+        "sixth": 5, "seventh": 6, "eighth": 7, "ninth": 8, "tenth": 9,
+        "last": -1, "latest": -1, "previous": -2,
+    }
     for ord_word, idx in ordinal_map.items():
         if ord_word in q_words:
             try:
@@ -628,17 +632,28 @@ def _filter_df_by_question(query: str, df) -> "object | None":
                 pass
 
     # Column+value filter: "which has status Active", "status 1"
+    # Also handles fuzzy column name match: "module" → "modulename"
     filter_col = None
     filter_val = None
     for i, word in enumerate(q_words):
+        # Exact column match
         if word in cols_lower:
             filter_col = cols_lower[word]
+        else:
+            # Fuzzy: question word is substring of a column name or vice-versa
+            if len(word) >= 4:
+                for cl, orig in cols_lower.items():
+                    if word in cl or cl.startswith(word[:4]):
+                        filter_col = orig
+                        break
+        if filter_col:
             for j in range(i + 1, min(i + 5, len(q_words))):
-                if q_words[j] not in {"is", "are", "the", "be", "=", "a", "an"}:
+                if q_words[j] not in {"is", "are", "the", "be", "=", "a", "an", "of", "in"}:
                     filter_val = q_words[j]
                     break
             if filter_val:
                 break
+            filter_col = None  # reset if no value found after this col word
 
     if filter_col and filter_val:
         col_data = df[filter_col].astype(str).str.lower()
@@ -647,7 +662,10 @@ def _filter_df_by_question(query: str, df) -> "object | None":
             return filtered.reset_index(drop=True)
 
     # Value-only scan: "active", "inactive", "enabled", "1", "0"
-    scan_words = {"active", "inactive", "enabled", "disabled", "yes", "no", "true", "false", "open", "closed"}
+    scan_words = {
+        "active", "inactive", "enabled", "disabled", "yes", "no",
+        "true", "false", "open", "closed", "pending", "approved", "rejected",
+    }
     for word in q_words:
         if word in scan_words:
             for col in df.columns:
@@ -666,6 +684,12 @@ _STOP_WORDS = {
     "all", "you", "your", "can", "tell", "find", "fetch", "display",
     "me", "my", "our", "its", "their", "this", "that", "these", "those",
     "any", "some", "more", "also", "please", "now", "do",
+    # ERP table-noun plurals — treat as intent words, not filter values
+    # e.g. "list all menus" → "menus" should NOT be a filter keyword
+    "menus", "formulas", "reports", "modules", "employees", "records",
+    "transactions", "invoices", "orders", "items", "projects", "files",
+    "users", "roles", "groups", "departments", "designations", "categories",
+    "programs", "screens", "components", "parameters", "templates",
 }
 
 _LIST_INTENTS = {"list", "all", "give", "show", "get", "fetch", "display", "what", "which"}
@@ -700,12 +724,69 @@ def _build_fallback_sql(query: str, max_rows: int, table_hint: str = "") -> str:
     if not keywords:
         return f"SELECT * FROM {tbl} LIMIT {max_rows}"
 
-    # Column-aware lookup: detect if any keyword IS a column name in this table
-    # e.g. "what is the menucode for Purchase Order" → menucode is a column
-    # → SELECT menucode WHERE (Purchase AND Order) instead of searching for 'menucode' as a value
+    # ── "what is X for Y" pattern ───────────────────────────────────────────
+    # Split at " for " to cleanly separate column reference from filter value.
+    # Uses len >= 2 for the column side — catches short abbreviations like URI,
+    # SQL, ID that the general substring check (len > 4) would miss.
+    #   "What is the report URI for Ledger Report?" →
+    #       before: ["report","URI"] → SELECT reportname, reporturi
+    #       after:  ["Ledger","Report"] → WHERE ILIKE '%Ledger%' AND ILIKE '%Report%'
+    _for_pat = re.search(r'\bfor\b', _clean_q2, re.IGNORECASE)
+    if _for_pat:
+        _before_for = [
+            w for w in _clean_q2[:_for_pat.start()].split()
+            if len(w) >= 2 and w.lower() not in _STOP_WORDS and w.lower() not in _LIST_INTENTS
+        ]
+        _after_for = [
+            w for w in _clean_q2[_for_pat.end():].split()
+            if len(w) > 2 and w.lower() not in _STOP_WORDS and w.lower() not in _LIST_INTENTS
+        ]
+        if _before_for and _after_for:
+            _pat_select: list = []
+            for _pw in _before_for:
+                _pwl = _pw.lower()
+                if _pwl in col_names_lower:
+                    _pat_select.append(_pwl)
+                else:
+                    _sub = [c for c in col_names if _pwl in c.lower()]
+                    if _sub:
+                        _pat_select.extend(_sub[:2])
+            _pat_select = list(dict.fromkeys(_pat_select))
+            if _pat_select:
+                _pat_clause = ", ".join(_pat_select)
+                _pat_blocks = []
+                for _av in _after_for[:5]:
+                    _safe = _av.replace("'", "")
+                    _conds = " OR ".join(
+                        f"CAST({c.lower()} AS TEXT) ILIKE '%{_safe}%'" for c in col_names
+                    )
+                    if _conds:
+                        _pat_blocks.append(f"({_conds})")
+                if _pat_blocks:
+                    return (
+                        f"SELECT {_pat_clause} FROM {tbl} "
+                        f"WHERE {' AND '.join(_pat_blocks)} LIMIT {max_rows}"
+                    )
+
+    # Column-aware lookup: detect if any keyword IS a column name in this table.
+    # Supports EXACT and SUBSTRING match:
+    #   exact:     "menucode"   → "menucode"            ✓
+    #   substring: "expression" → "formulaexpression"   ✓  (len > 4 avoids noise)
     col_names_lower = {c.lower() for c in col_names}
-    select_cols = [w for w in keywords if w.lower() in col_names_lower]
-    filter_kws  = [w for w in keywords if w.lower() not in col_names_lower]
+    select_cols: list = []
+    _col_matched_words: set = set()
+    for _kw in keywords:
+        _kwl = _kw.lower()
+        if _kwl in col_names_lower:
+            select_cols.append(_kwl)
+            _col_matched_words.add(_kw)
+        elif len(_kwl) > 4:
+            _sub = [c for c in col_names if _kwl in c.lower()]
+            if _sub:
+                select_cols.extend(_sub[:2])
+                _col_matched_words.add(_kw)
+    select_cols = list(dict.fromkeys(select_cols))          # deduplicate, preserve order
+    filter_kws  = [w for w in keywords if w not in _col_matched_words]
 
     if select_cols and filter_kws:
         select_clause = ", ".join(c.lower() for c in select_cols)
@@ -903,14 +984,21 @@ def _try_multi_table_merge(query: str, primary_table: str,
     if not outgoing_fks:
         return None
 
-    # Score FK relevance: prefer FK targets whose table name appears in the question
+    # Score FK relevance: prefer FK targets whose table/column name appears in question
+    # Uses both table base name AND target column names for scoring (improves 3-table accuracy)
     clean_q = re.sub(r"[^\w\s]", " ", query).lower()
     q_words = set(clean_q.split())
 
     def _fk_score(fk_tuple):
-        _, tgt_table, _ = fk_tuple
-        base = re.sub(r'^m', '', tgt_table)           # mmodule → module
-        return sum(1 for w in q_words if w in base or base in w)
+        src_col, tgt_table, tgt_col = fk_tuple
+        base = re.sub(r'^m+', '', tgt_table)           # mmodule → module
+        # Table name match
+        score = sum(2 for w in q_words if len(w) >= 4 and (w in base or base.startswith(w[:4])))
+        # Target column name match (e.g. "designation" → designationname col)
+        score += sum(1 for w in q_words if len(w) >= 4 and w in tgt_col)
+        # Source FK column name match (e.g. question mentions "designationid")
+        score += sum(1 for w in q_words if len(w) >= 4 and w in src_col)
+        return score
 
     ranked_fks = sorted(outgoing_fks, key=_fk_score, reverse=True)
 
@@ -965,6 +1053,263 @@ def _try_multi_table_merge(query: str, primary_table: str,
         f"Results for '{query}' ({len(merged_df)} rows):\n\n"
         + _format_df(merged_df)
     )
+
+
+# =========================================================
+# 🔢 AGGREGATION ENGINE (SUM / COUNT / AVG / MAX / MIN)
+# =========================================================
+
+_AGG_KEYWORDS = {
+    "SUM":   {"total", "sum", "gross total", "altogether"},
+    "COUNT": {"count", "how many", "number of", "total number", "how much"},
+    "AVG":   {"average", "avg", "mean"},
+    "MAX":   {"maximum", "max", "highest", "largest", "most"},
+    "MIN":   {"minimum", "min", "lowest", "smallest", "least"},
+}
+_AGG_COL_HINTS = {"amount", "total", "salary", "pay", "wage", "price", "cost",
+                  "value", "balance", "gross", "net", "tax", "fee", "rate"}
+# Columns that are numeric but should NEVER be aggregated (IDs, flags, counters)
+_NON_METRIC_COLS = {
+    "status", "version", "sortorder", "sort_order", "level", "levels",
+    "sourcetype", "addedtype", "isparentmenu", "gcmtypeid", "tenantid",
+    "entityid", "webserviceid",
+}
+
+
+def _try_aggregation_engine(query: str, target_table: str, max_rows: int) -> "str | None":
+    """
+    Detect aggregation intent (SUM/COUNT/AVG/MAX/MIN) from question keywords
+    and build SQL dynamically from schema — no GPT or hardcoding.
+    e.g. "total gross pay" → SELECT SUM(grosspay) FROM memployee
+         "count of employees" → SELECT COUNT(*) FROM memployee
+    """
+    if not target_table:
+        return None
+    q_lower = query.lower()
+
+    agg_func = None
+    for func, triggers in _AGG_KEYWORDS.items():
+        if any(t in q_lower for t in triggers):
+            agg_func = func
+            break
+    if not agg_func:
+        return None
+
+    tbl = target_table.lower()
+
+    if agg_func == "COUNT":
+        sql = f"SELECT COUNT(*) AS total_count FROM {tbl}"
+        res = execute_sql_tool(sql)
+        if "df" in res and not res["df"].empty:
+            logger.info(f"Aggregation engine (COUNT): {sql}")
+            return f"Results for '{query}':\n\n" + _format_df(res["df"])
+        return None
+
+    # SUM / AVG / MAX / MIN — pick best numeric column by name similarity
+    col_types = get_column_types(tbl)
+    _NUM_TYPES = {"integer", "bigint", "smallint", "numeric", "decimal",
+                  "float", "double", "real", "money"}
+    numeric_cols = [
+        c for c, t in col_types
+        if any(nt in t.lower() for nt in _NUM_TYPES)
+        and c.lower() not in _AUDIT_COLS
+        and c.lower() not in _NON_METRIC_COLS
+        and not c.lower().endswith("id")    # FK/PK id cols are never metrics
+        and not c.lower().endswith("type")  # type flag cols are never metrics
+    ]
+    if not numeric_cols:
+        return None
+
+    q_words = set(re.sub(r"[^\w\s]", " ", query).lower().split())
+
+    def _col_score(col: str) -> int:
+        cl = col.lower()
+        score = sum(2 for w in q_words if len(w) >= 3 and (w in cl or cl in w))
+        score += sum(1 for h in _AGG_COL_HINTS if h in cl)
+        return score
+
+    best_col = max(numeric_cols, key=_col_score)
+    # If best score is still 0, none of the columns match the question — bail out
+    if _col_score(best_col) == 0:
+        return None
+    sql = f"SELECT {agg_func}({best_col}) AS result FROM {tbl}"
+    res = execute_sql_tool(sql)
+    if "df" in res and not res["df"].empty:
+        logger.info(f"Aggregation engine ({agg_func}): {sql}")
+        return f"Results for '{query}':\n\n" + _format_df(res["df"])
+    return None
+
+
+# =========================================================
+# 📊 REPORT ENGINE (GROUP BY aggregation)
+# =========================================================
+
+_GROUP_TRIGGERS = {" by ", " per ", "grouped by", "group by", "per each", "broken down"}
+
+
+def _try_report_engine(query: str, target_table: str, rels: list, max_rows: int) -> "str | None":
+    """
+    Detect GROUP BY intent and build aggregation SQL dynamically.
+    e.g. "reports by category"   → SELECT category, COUNT(*) GROUP BY category
+         "sales per department"  → SELECT dept, SUM(amount) GROUP BY dept
+    No hardcoding of column names — all derived from schema.
+    """
+    if not target_table:
+        return None
+    q_lower = query.lower()
+    if not any(t in q_lower for t in _GROUP_TRIGGERS):
+        return None
+
+    tbl = target_table.lower()
+    col_types = get_column_types(tbl)
+    q_words = re.sub(r"[^\w\s]", " ", query).lower().split()
+
+    def _name_score(col: str) -> int:
+        cl = col.lower()
+        score = 0
+        for w in q_words:
+            if len(w) >= 4:
+                if w == cl or w in cl:
+                    score += 2   # exact substring match — stronger signal
+                elif cl.startswith(w[:4]):
+                    score += 1   # prefix match — weaker signal
+        return score
+
+    # Detect agg function
+    agg_func = "COUNT"
+    agg_col = "*"
+    for func, triggers in _AGG_KEYWORDS.items():
+        if any(t in q_lower for t in triggers) and func != "COUNT":
+            agg_func = func
+            break
+
+    _NUM_TYPES = {"integer", "bigint", "smallint", "numeric", "decimal",
+                  "float", "double", "real", "money"}
+    _TXT_TYPES = {"character", "varchar", "text", "char"}
+
+    # Group cols: text columns only, excluding ID/audit/flag columns
+    text_cols = [
+        c for c, t in col_types
+        if any(tt in t.lower() for tt in _TXT_TYPES)
+        and c.lower() not in _AUDIT_COLS
+        and not c.lower().endswith("id")    # IDs are never group labels
+        and not c.lower().endswith("type")  # type flags are not meaningful groups
+    ]
+    num_cols = [
+        c for c, t in col_types
+        if any(nt in t.lower() for nt in _NUM_TYPES)
+        and c.lower() not in _AUDIT_COLS
+        and c.lower() not in _NON_METRIC_COLS
+        and not c.lower().endswith("id")
+        and not c.lower().endswith("type")
+    ]
+
+    if not text_cols:
+        return None
+
+    # Pick group column — text col with best name match to query
+    group_col = max(text_cols, key=_name_score)
+    if _name_score(group_col) == 0:
+        return None  # No column matches question words — give up
+
+    # If grouping column might be in a related table (FK), resolve via join
+    # e.g. "reports by category" — categoryname is in MREPORTCATEGORY
+    _fk_group_col = None
+    _fk_group_table = None
+    _fk_src_col = None
+    _fk_tgt_col = None  # explicit save to avoid loop-scope ambiguity
+    outgoing_fks = [
+        (r['source_column'].lower(), r['target_table'].lower(), r['target_column'].lower())
+        for r in rels if r['source_table'].lower() == tbl
+    ]
+    for src_col, tgt_tbl, tgt_col in outgoing_fks:
+        tgt_col_types = get_column_types(tgt_tbl)
+        tgt_text = [c for c, t in tgt_col_types
+                    if any(tt in t.lower() for tt in _TXT_TYPES)
+                    and c.lower() not in _AUDIT_COLS
+                    and not c.lower().endswith("id")]
+        if tgt_text:
+            best_fk_col = max(tgt_text, key=_name_score)
+            if _name_score(best_fk_col) > _name_score(group_col):
+                _fk_group_col = best_fk_col
+                _fk_group_table = tgt_tbl
+                _fk_src_col = src_col
+                _fk_tgt_col = tgt_col   # ← explicit save (fixes scope bug)
+                break
+
+    if agg_func != "COUNT" and num_cols:
+        agg_col = max(num_cols, key=_name_score)
+    else:
+        agg_func = "COUNT"
+        agg_col = "*"
+
+    if _fk_group_table and _fk_tgt_col:
+        sql = (
+            f"SELECT {_fk_group_table}.{_fk_group_col}, "
+            f"{agg_func}({agg_col}) AS result "
+            f"FROM {tbl} "
+            f"JOIN {_fk_group_table} "
+            f"  ON {tbl}.{_fk_src_col} = {_fk_group_table}.{_fk_tgt_col} "
+            f"GROUP BY {_fk_group_table}.{_fk_group_col} "
+            f"ORDER BY result DESC LIMIT {max_rows}"
+        )
+    else:
+        sql = (
+            f"SELECT {group_col}, {agg_func}({agg_col}) AS result "
+            f"FROM {tbl} GROUP BY {group_col} "
+            f"ORDER BY result DESC LIMIT {max_rows}"
+        )
+
+    res = execute_sql_tool(sql)
+    if "df" in res and not res["df"].empty:
+        logger.info(f"Report engine ({agg_func} GROUP BY {group_col}): {sql}")
+        return f"Results for '{query}' ({len(res['df'])} rows):\n\n" + _format_df(res["df"])
+
+    # FK JOIN failed — retry with simple GROUP BY on primary table only
+    if _fk_group_table:
+        fallback_sql = (
+            f"SELECT {group_col}, {agg_func}({agg_col}) AS result "
+            f"FROM {tbl} GROUP BY {group_col} "
+            f"ORDER BY result DESC LIMIT {max_rows}"
+        )
+        fb_res = execute_sql_tool(fallback_sql)
+        if "df" in fb_res and not fb_res["df"].empty:
+            logger.info(f"Report engine fallback (no FK JOIN): {fallback_sql}")
+            return f"Results for '{query}' ({len(fb_res['df'])} rows):\n\n" + _format_df(fb_res["df"])
+    return None
+
+
+# =========================================================
+# 🔍 RELATIONAL QUESTION DETECTOR
+# =========================================================
+
+def _is_relational_question(query: str, target_table: str, rels: list) -> bool:
+    """
+    Returns True if the question likely spans multiple tables.
+    Detects entity words in the question that match FK-related table names.
+    Works for ANY phrasing — not limited to "with their" / "and their".
+    """
+    q_words = set(re.sub(r"[^\w\s]", " ", query).lower().split())
+    tbl = target_table.lower()
+
+    # Classic trigger phrases (kept for fast-path)
+    _PHRASE_TRIGGERS = {
+        "with their", "and their", "along with", "including their",
+        "together with", "with the", "and the", "show with", "list with",
+    }
+    if any(t in query.lower() for t in _PHRASE_TRIGGERS):
+        return True
+
+    # Entity detection: question words match FK-target table base names
+    outgoing_fks = [r for r in rels if r['source_table'].lower() == tbl]
+    for r in outgoing_fks:
+        base = re.sub(r'^m+', '', r['target_table'].lower())  # mmodule → module
+        if len(base) >= 4 and any(
+            w == base or w.startswith(base[:4]) or base.startswith(w)
+            for w in q_words if len(w) >= 4
+        ):
+            return True
+    return False
 
 
 # =========================================================
@@ -1102,7 +1447,11 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "", session_i
     _col_set: set = set()
     if _target_table and _filter_words:
         _col_set = {c.lower() for c in get_columns(_target_table)}
-        _has_col_keyword = any(w.lower() in _col_set for w in _filter_words)
+        # Exact OR substring match — "expression" matches "formulaexpression" (len > 4 guard)
+        _has_col_keyword = any(
+            w.lower() in _col_set or (len(w) > 4 and any(w.lower() in c for c in _col_set))
+            for w in _filter_words
+        )
         if _has_col_keyword:
             _preflight_sql = _build_fallback_sql(query, max_rows, _target_table)
             if _preflight_sql and "SELECT *" not in _preflight_sql:
@@ -1146,19 +1495,38 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "", session_i
                 _query_cache[_cache_key] = (_fk_result, _now)
                 return _fk_result
 
+    # Aggregation engine — SUM/COUNT/AVG/MAX/MIN without GPT
+    # e.g. "total gross pay", "count of employees", "average salary"
+    if _target_table:
+        _agg_result = _try_aggregation_engine(query, _target_table, max_rows)
+        if _agg_result:
+            logger.info(f"Aggregation engine succeeded — skipped GPT")
+            _query_cache[_cache_key] = (_agg_result, _now)
+            if session_id:
+                _store_session_df(session_id, pd.DataFrame(), query)
+            return _agg_result
+
+    # Report engine — GROUP BY aggregation without GPT
+    # e.g. "reports by category", "employees per department"
+    if _target_table:
+        _rels_for_report = get_relationships()
+        _report_result = _try_report_engine(query, _target_table, _rels_for_report, max_rows)
+        if _report_result:
+            logger.info(f"Report engine succeeded — skipped GPT")
+            _query_cache[_cache_key] = (_report_result, _now)
+            return _report_result
+
     # Multi-table merge — Python pandas JOIN for relational questions
-    # e.g. "employees with their department", "menus with module names"
+    # Triggered by: classic phrases OR entity detection (FK-target table names in question)
     # More reliable than GPT-generated SQL JOINs for 2-3 table queries
-    _MERGE_TRIGGERS = {"with their", "and their", "along with", "including their",
-                       "together with", "with the", "and the", "show with", "list with"}
-    _q_lower_merge = query.lower()
-    if _target_table and any(t in _q_lower_merge for t in _MERGE_TRIGGERS):
+    if _target_table:
         _rels_for_merge = get_relationships()
-        _merge_result = _try_multi_table_merge(query, _target_table, _rels_for_merge, max_rows)
-        if _merge_result:
-            logger.info(f"Multi-table merge succeeded — skipped GPT JOIN")
-            _query_cache[_cache_key] = (_merge_result, _now)
-            return _merge_result
+        if _is_relational_question(query, _target_table, _rels_for_merge):
+            _merge_result = _try_multi_table_merge(query, _target_table, _rels_for_merge, max_rows)
+            if _merge_result:
+                logger.info(f"Multi-table merge succeeded — skipped GPT JOIN")
+                _query_cache[_cache_key] = (_merge_result, _now)
+                return _merge_result
 
     try:
         # Tool 1 — Schema (query-aware: relevant tables first, table_hint forces correct table)
@@ -1418,8 +1786,8 @@ def _detect_table_from_question(user_question: str) -> "str | None":
         # e.g. "menu" → MMENU wins over MENUM, "report" → MREPORT wins over MREPORTTYPE
         _CORE_TABLES = {'mmenu', 'mreport', 'mformulafield', 'mfile', 'mproject', 'mformula'}
         partial_hits.sort(key=lambda x: (
+            0 if x[2].lower() in _CORE_TABLES else 1,     # core tables FIRST (above quality)
             x[0],                                          # quality: 0=prefix, 1=suffix, 2=other
-            0 if x[2].lower() in _CORE_TABLES else 1,     # core tables first
             0 if x[2].upper().startswith('M') else 1,     # M-prefix tables before others
             x[1],                                          # shorter table name first
         ))

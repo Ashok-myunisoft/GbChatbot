@@ -1,0 +1,103 @@
+=== GBAI TEST START ===
+Time: 21:18:38
+db_query imported OK
+Tables: 264
+MMENU columns: ['menuid', 'menucode', 'menuname', 'moduleid', 'gcmtypeid']
+
+--- TABLE DETECTION ---
+  [FAIL] 'What is the menucode for Purchase Order?' -> None
+  [OK] 'list all formulas' -> mformula
+  [OK] 'show all reports' -> mreport
+  [OK] 'What is the formula expression for Basic Sala' -> mformula
+
+--- FAST PATH (list all menus) ---
+  Time: 22.1s | Chars: 2972
+  Audit cols present: False (should be False)
+  Preview: Results for 'List all menus' (3 rows):
+
+--- Record 1 ---
+  menuid: -1399993547
+  menucode: FW20031
+ 
+
+--- SIMPLE LOOKUP (menucode) ---
+  Time: 0.7s
+  Result: Results for 'What is the menucode for Purchase Order?' (41 rows):
+
+1. FW00025
+2. PU10004
+3. PU10011
+4. PU10008
+5. ST20070
+6. ST20082
+7. PU20007
+8. PU20008
+9. PU20010
+10. PU20014
+11. PU20017
+12. PU2002
+  Wrong answer check: OK
+
+--- COLUMN-ONLY LIST (list all menuname) ---
+  Time: 0.3s
+  Result: Results for 'list all menuname' (50 rows):
+
+1.   Task Summary 
+2.  Attendance Settings Payroll
+3.  Daily Attendance Hours Detail Register
+4.  Debit No
+
+--- FK FILTER (menus where module is Payroll) ---
+  Time: 19.2s
+  Result: Results for 'Show menus where module is Payroll' (3 rows):
+
+--- Record 1 ---
+  menuid: -1399993547
+  menucode: FW20031
+  menuname: Menu Set Details
+  moduleid: -2147483637
+  gcmtypeid: -1
+  section: M
+
+--- MULTI-TABLE MERGE (menus with their module names) ---
+  Time: 19.1s
+  Result: Results for 'Show menus with their module names' (3 rows):
+
+--- Record 1 ---
+  menuid: -1399993547
+  menucode: FW20031
+  menuname: Menu Set Details
+  moduleid: -2147483637
+  gcmtypeid: -1
+  section: M
+
+--- FORMULA LOOKUP (formula expression for Basic Salary) ---
+  Time: 2138.4s
+  Result: No data found for: What is the formula expression for Basic Salary?
+
+--- MENU PATH BUILDER ---
+  'Payroll Setup': EMPTY (0.4s)
+  'Purchase Order': Purchase Transaction > Purchase Order
+Purchase Transaction > Purchase Order Closing
+Report Menu > Pe (8.9s)
+  'Leave Application': EMPTY (0.3s)
+
+--- FOLLOW-UP QUESTION ---
+  Follow-up result: Results for 'Which of those has status 1' (50 rows):
+
+1. 1.0
+2. 1.0
+3. 1.0
+4. 1.0
+5. 1.0
+6. 1.0
+7. 1.0
+8. 1.0
+9. 1.0
+10. 1.0
+11. 1.0
+12. 1.0
+13. 1.0
+1
+
+=== TEST DONE ===

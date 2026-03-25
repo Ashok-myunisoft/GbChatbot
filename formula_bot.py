@@ -445,8 +445,23 @@ async def chat(message: Message, Login: str = Header(...)):
             _nl  = _cut.rfind('\n')
             orchestrator_context = (_cut[:_nl] if _nl > 500 else _cut) + "\n[...context truncated...]"
 
-        logger.info(f"🔍 Searching PostgreSQL MFORMULAFIELD for: {user_input[:100]}")
-        context_str = db_query.query_table("MFORMULAFIELD", user_input, session_id=username)
+        # Route to the correct formula table:
+        #   MFORMULA      → formula-level data: expression, name, code, type, description
+        #   MFORMULAFIELD → field/component-level data: individual fields inside a formula
+        _q_lower = user_input.lower()
+        _field_level_words = {'field', 'component', 'parameter', 'attribute', 'column', 'member'}
+        _formula_table = (
+            "MFORMULAFIELD"
+            if any(w in _q_lower for w in _field_level_words)
+            else "MFORMULA"
+        )
+        logger.info(f"🔍 Searching PostgreSQL {_formula_table} for: {user_input[:100]}")
+        context_str = db_query.query_table(_formula_table, user_input, session_id=username)
+        # If MFORMULA returned empty, fall back to MFORMULAFIELD (and vice versa)
+        _fallback_table = "MFORMULAFIELD" if _formula_table == "MFORMULA" else "MFORMULA"
+        if not context_str.strip() or context_str.strip() in ("(no rows)", "No data found for this request."):
+            logger.info(f"Primary table {_formula_table} empty — trying fallback {_fallback_table}")
+            context_str = db_query.query_table(_fallback_table, user_input, session_id=username)
         # Truncate at newline boundary to avoid cutting mid-record
         if len(context_str) > 8000:
             _cut = context_str.rfind('\n', 0, 8000)
