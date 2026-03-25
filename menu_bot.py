@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import logging
 import traceback
 from typing import List, Dict, Any
@@ -200,7 +201,33 @@ async def chat(message: Message, Login: str = Header(...)):
         history_str = _extract_recent_turns(message.context or '')
 
         logger.info(f"🔍 Searching PostgreSQL MMENU for: {user_input[:100]}")
-        context_str = db_query.query_table("MMENU", user_input, session_id=username)
+
+        # Path/navigation intent — use recursive parentid traversal instead of raw query
+        _PATH_WORDS = {"path", "navigate", "navigation", "route", "breadcrumb",
+                       "full path", "menu path", "how to reach", "how to get",
+                       "steps to", "where is", "locate"}
+        _is_path_q = any(pw in user_input.lower() for pw in _PATH_WORDS)
+        if _is_path_q:
+            # Extract menu name — strip path-related words from question
+            _strip = re.sub(
+                r'\b(what|is|the|full|path|to|menu|navigate|navigation|where|'
+                r'route|how|reach|get|steps|locate|find|show|give|me|for|a|an)\b',
+                ' ', user_input, flags=re.IGNORECASE
+            )
+            _menu_name = re.sub(r'\s+', ' ', _strip).strip().strip('?').strip()
+            if _menu_name:
+                _path_result = db_query.build_menu_path(_menu_name)
+                if _path_result:
+                    context_str = f"Navigation path(s) for '{_menu_name}':\n{_path_result}"
+                    logger.info(f"🗺️ Menu path built: {len(_path_result)} chars")
+                else:
+                    # Path not found — fall back to normal query
+                    context_str = db_query.query_table("MMENU", user_input, session_id=username)
+            else:
+                context_str = db_query.query_table("MMENU", user_input, session_id=username)
+        else:
+            context_str = db_query.query_table("MMENU", user_input, session_id=username)
+
         # Truncate at newline boundary to avoid cutting mid-record
         if len(context_str) > 8000:
             _cut = context_str.rfind('\n', 0, 8000)
