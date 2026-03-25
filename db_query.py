@@ -20,6 +20,15 @@ from dotenv import load_dotenv
 load_dotenv()
 logger = logging.getLogger(__name__)
 
+# Learning store — optional; all hooks wrapped in try/except
+# Removing or missing learning_store.py disables learning silently
+try:
+    import learning_store as _ls
+    _LEARNING_ENABLED = True
+    logger.info("[Learning] Learning store enabled ✅")
+except ImportError:
+    _LEARNING_ENABLED = False
+
 # =========================================================
 # ⚙️ DB CONFIG
 # =========================================================
@@ -1668,6 +1677,31 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "", session_i
                 _query_cache[_cache_key] = (_merge_result, _now)
                 return _merge_result
 
+    # Learning: Pattern cache — re-execute previously successful GPT SQL (skips GPT entirely)
+    # Only fires after all deterministic engines have already been tried and missed.
+    # Cached SQL always runs against live DB — data is never stale.
+    # Auto-invalidates if re-execution fails (schema changed, table renamed, etc.)
+    if _LEARNING_ENABLED and _target_table:
+        try:
+            _cached_sql = _ls.get_pattern(query)
+            if _cached_sql:
+                _pc_res = execute_sql_tool(_cached_sql)
+                if "df" in _pc_res and not _pc_res["df"].empty:
+                    logger.info(f"[Learning] Pattern cache hit — skipped GPT")
+                    _pc_final = (
+                        f"Results for '{query}' ({len(_pc_res['df'])} rows):\n\n"
+                        + _format_df(_pc_res["df"])
+                    )
+                    _query_cache[_cache_key] = (_pc_final, _now)
+                    if session_id:
+                        _store_session_df(session_id, _pc_res["df"], query)
+                    return _pc_final
+                else:
+                    # Cached SQL returned empty/error — schema may have changed, drop it
+                    _ls.invalidate_pattern(query)
+        except Exception:
+            pass
+
     try:
         # Tool 1 — Schema (query-aware: relevant tables first, table_hint forces correct table)
         # max_tables=3: safe now that each DDL is capped at 12 cols (~35 chars each = ~1260 chars total)
@@ -1776,6 +1810,11 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "", session_i
                         logger.info(f"Fixed SQL: {fixed_sql[:200]}")
                         result = execute_sql_tool(fixed_sql)
 
+            # Learning: record SQL error for this table (monitoring + future skip logic)
+            if "error" in result and _LEARNING_ENABLED and _target_table:
+                try: _ls.save_failure(_target_table, result["error"])
+                except Exception: pass
+
             # Keyword fallback — last resort if LLM + self-heal both failed
             if "error" in result:
                 logger.warning(f"SQL failed after self-heal: {result['error']} — trying keyword fallback")
@@ -1794,6 +1833,18 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "", session_i
             _query_cache[_cache_key] = (final, time.time())
             if session_id:
                 _store_session_df(session_id, df, query)
+            # Learning: save successful GPT SQL as pattern + save content words as synonyms
+            if _LEARNING_ENABLED and _target_table:
+                try:
+                    if sql and sql.strip().upper().startswith("SELECT"):
+                        _ls.save_pattern(query, sql, _target_table)
+                    # Save content words from this query as synonyms for the detected table
+                    for _qw in re.findall(r'\b\w{4,}\b', query):
+                        if _qw.lower() not in _STOP_WORDS and _qw.lower() not in _LIST_INTENTS:
+                            _ls.save_synonym(_qw, _target_table)
+                            break  # save only the first meaningful word (most specific)
+                except Exception:
+                    pass
             return final
 
         if "error" in result:
@@ -1842,6 +1893,21 @@ def _get_all_tables() -> list:
 
 def _detect_table_from_question(user_question: str) -> "str | None":
     """Find the most likely table name from the user question (3-pass)."""
+
+    # Pass 0 — learned synonyms (zero DB calls — fastest path)
+    # e.g. "payslip" → MSALARYPROCESSING after first confirmed query
+    if _LEARNING_ENABLED:
+        try:
+            _syn_words = sorted(re.findall(r'\b\w{4,}\b', user_question), key=len, reverse=True)
+            for _sw in _syn_words:
+                if _sw.lower() not in _STOP_WORDS:
+                    _syn_tbl = _ls.get_synonym(_sw)
+                    if _syn_tbl:
+                        logger.info(f"[Learning] Synonym: '{_sw}' → {_syn_tbl}")
+                        return _syn_tbl
+        except Exception:
+            pass
+
     all_tables = get_tables()
     if not all_tables:
         return None
@@ -1853,7 +1919,11 @@ def _detect_table_from_question(user_question: str) -> "str | None":
     # Pass 1 — exact single-word match (case-insensitive)
     for word in words_sorted:
         if word.upper() in tables_upper:
-            return tables_upper[word.upper()]
+            _p1_result = tables_upper[word.upper()]
+            if _LEARNING_ENABLED:
+                try: _ls.save_synonym(word, _p1_result)
+                except Exception: pass
+            return _p1_result
 
     # Pass 2 — compound bigram match for multi-word table names
     # e.g. "purchase order" → "PURCHASEORDER" finds MPURCHASEORDER
@@ -1931,7 +2001,17 @@ def _detect_table_from_question(user_question: str) -> "str | None":
             0 if x[2].upper().startswith('M') else 1,     # M-prefix tables before others
             x[1],                                          # shorter table name first
         ))
-        return partial_hits[0][2]
+        _p3_result = partial_hits[0][2]
+        if _LEARNING_ENABLED:
+            try:
+                # Save the first meaningful content word as synonym for this table
+                for _p3w in words_sorted:
+                    if len(_p3w) >= 4 and _p3w.lower() not in _STOP_WORDS:
+                        _ls.save_synonym(_p3w, _p3_result)
+                        break
+            except Exception:
+                pass
+        return _p3_result
 
     return None
 
