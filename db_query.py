@@ -1497,6 +1497,65 @@ def build_menu_path(menu_name: str, max_depth: int = 8) -> str:
 
 
 # =========================================================
+# 🧠 MICRO-PLANNER (fast internal thinking — no LLM, < 1ms)
+# =========================================================
+
+def should_think(query: str) -> bool:
+    """
+    Return True if the query is complex enough to benefit from micro-planning.
+    Simple listing / greeting queries don't need a plan.
+    """
+    q = query.lower()
+    if len(q.split()) > 6:
+        return True
+    return any(k in q for k in [
+        "with", "by", "per", "total", "sum", "average", "count",
+        "highest", "lowest", "top", "report", "analysis", "group",
+        "join", "and their", "along with",
+    ])
+
+
+def think_fast(query: str, target_table: str, is_relational: bool) -> dict:
+    """
+    Build a lightweight query plan using ALREADY-COMPUTED values from the agent.
+    NO re-detection, NO DB calls, NO LLM calls — pure keyword check on query.
+
+    Uses the same keyword sets as existing engines (_AGG_KEYWORDS, _GROUP_TRIGGERS)
+    so there is zero conflict with deterministic engine routing.
+
+    Only used to enrich the GPT prompt when all deterministic engines have missed.
+    """
+    q     = query.lower()
+    plan  = {
+        "intent":            "general",
+        "primary_table":     target_table or "",
+        "needs_join":        is_relational,           # from _is_relational_question() — already computed
+        "needs_aggregation": False,
+        "needs_group_by":    False,
+    }
+
+    # Aggregation intent — same keywords as _AGG_KEYWORDS (no duplication of logic)
+    if any(t in q for triggers in _AGG_KEYWORDS.values() for t in triggers):
+        plan["intent"]            = "aggregation"
+        plan["needs_aggregation"] = True
+
+    # GROUP BY intent — same triggers as _GROUP_TRIGGERS (no duplication of logic)
+    if any(t in q for t in _GROUP_TRIGGERS):
+        plan["intent"]         = "report"
+        plan["needs_group_by"] = True
+
+    # JOIN overrides general (relational flag already validated by _is_relational_question)
+    if is_relational:
+        plan["intent"] = "join"
+
+    # Most complex: JOIN + aggregation (e.g. "total salary per department")
+    if is_relational and plan["needs_aggregation"]:
+        plan["intent"] = "join_aggregation"
+
+    return plan
+
+
+# =========================================================
 # 🤖 AGENT ORCHESTRATION (RunPod — no local model needed)
 # =========================================================
 
@@ -1668,9 +1727,11 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "", session_i
     # Multi-table merge — Python pandas JOIN for relational questions
     # Triggered by: classic phrases OR entity detection (FK-target table names in question)
     # More reliable than GPT-generated SQL JOINs for 2-3 table queries
+    _was_relational = False   # captured for micro-planner — no logic change
     if _target_table:
         _rels_for_merge = get_relationships()
-        if _is_relational_question(query, _target_table, _rels_for_merge):
+        _was_relational = _is_relational_question(query, _target_table, _rels_for_merge)
+        if _was_relational:
             _merge_result = _try_multi_table_merge(query, _target_table, _rels_for_merge, max_rows)
             if _merge_result:
                 logger.info(f"Multi-table merge succeeded — skipped GPT JOIN")
@@ -1686,7 +1747,12 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "", session_i
             _cached_sql = _ls.get_pattern(query)
             if _cached_sql:
                 _pc_res = execute_sql_tool(_cached_sql)
-                if "df" in _pc_res and not _pc_res["df"].empty:
+                if "error" in _pc_res:
+                    # SQL execution error — schema likely changed, auto-invalidate
+                    logger.info(f"[Learning] Cached SQL broken — invalidating pattern")
+                    _ls.invalidate_pattern(query)
+                elif "df" in _pc_res and not _pc_res["df"].empty:
+                    # Cache hit with data — return immediately, skip GPT
                     logger.info(f"[Learning] Pattern cache hit — skipped GPT")
                     _pc_final = (
                         f"Results for '{query}' ({len(_pc_res['df'])} rows):\n\n"
@@ -1696,11 +1762,25 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "", session_i
                     if session_id:
                         _store_session_df(session_id, _pc_res["df"], query)
                     return _pc_final
-                else:
-                    # Cached SQL returned empty/error — schema may have changed, drop it
-                    _ls.invalidate_pattern(query)
+                # else: valid SQL but empty result — keep pattern, fall through normally
         except Exception:
             pass
+
+    # Micro-planner: build plan from already-computed values (_target_table, _was_relational)
+    # No re-detection, no DB calls, < 1ms. Only enriches GPT prompt — no engine logic touched.
+    _gpt_query = query   # default: unchanged — if plan adds nothing, GPT gets original question
+    if should_think(query) and _target_table:
+        try:
+            _plan = think_fast(query, _target_table, _was_relational)
+            _hints = []
+            if _plan["needs_join"]:         _hints.append("Use JOIN between tables.")
+            if _plan["needs_aggregation"]:  _hints.append("Use SUM/COUNT/AVG.")
+            if _plan["needs_group_by"]:     _hints.append("Use GROUP BY.")
+            if _hints:
+                _gpt_query = f"{query} [{' '.join(_hints)}]"
+                logger.info(f"[MicroPlanner] intent={_plan['intent']} hints={_hints}")
+        except Exception:
+            _gpt_query = query   # safe fallback — never break the GPT path
 
     try:
         # Tool 1 — Schema (query-aware: relevant tables first, table_hint forces correct table)
@@ -1713,13 +1793,13 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "", session_i
         # RuntimeError = job FAILED (endpoint error) → skip straight to keyword fallback
         sql = None
         try:
-            sql = generate_sql_tool(query, schema, max_rows)
+            sql = generate_sql_tool(_gpt_query, schema, max_rows)
             if sql:
                 sql = _strip_system_joins(sql)
         except TimeoutError:
             logger.warning("SQL LLM timed out (cold start) — retrying once")
             try:
-                sql = generate_sql_tool(query, schema, max_rows)
+                sql = generate_sql_tool(_gpt_query, schema, max_rows)
             except (TimeoutError, RuntimeError) as e:
                 logger.warning(f"SQL generation failed after retry: {e} — using keyword fallback")
         except ValueError as e:
@@ -1728,7 +1808,7 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "", session_i
                 logger.warning(f"SQL complexity error: {e} — retrying with 2-table schema")
                 try:
                     simple_schema = get_schema_tool(question=query, table_hint=table_hint, max_tables=2)
-                    sql = generate_sql_tool(query, simple_schema, max_rows)
+                    sql = generate_sql_tool(_gpt_query, simple_schema, max_rows)
                     if sql:
                         sql = _strip_system_joins(sql)
                     logger.info("Retry with 2-table schema succeeded")
@@ -1741,7 +1821,7 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "", session_i
                 logger.warning(f"Schema too large — retrying with 2-table schema")
                 try:
                     simple_schema = get_schema_tool(question=query, table_hint=table_hint, max_tables=2)
-                    sql = generate_sql_tool(query, simple_schema, max_rows)
+                    sql = generate_sql_tool(_gpt_query, simple_schema, max_rows)
                     if sql:
                         sql = _strip_system_joins(sql)
                     logger.info("2-table retry succeeded after schema-too-large")
@@ -1750,7 +1830,7 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "", session_i
                         logger.warning(f"2-table still too large — retrying with 1-table schema")
                         try:
                             single_schema = get_schema_tool(question=query, table_hint=table_hint, max_tables=1)
-                            sql = generate_sql_tool(query, single_schema, max_rows)
+                            sql = generate_sql_tool(_gpt_query, single_schema, max_rows)
                             logger.info("1-table retry succeeded after schema-too-large")
                         except Exception as _e3:
                             logger.warning(f"1-table retry also failed: {_e3} — using keyword fallback")

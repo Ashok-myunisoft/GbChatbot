@@ -15,6 +15,7 @@ Stores (JSON files in LEARNING_DIR):
 """
 
 import os
+import re
 import json
 import time
 import hashlib
@@ -39,6 +40,38 @@ except Exception:
 logger.info(f"[LearningStore] Storage: {_LEARNING_DIR}")
 
 _LOCK = threading.Lock()
+
+# Stopwords stripped during query normalization — covers common ERP question patterns
+_LEARN_STOP_WORDS = {
+    "what", "is", "the", "are", "show", "list", "give", "get", "find",
+    "all", "me", "my", "a", "an", "of", "in", "for", "to", "with",
+    "how", "many", "which", "where", "who", "can", "do", "does", "did",
+    "please", "display", "fetch", "tell", "from", "their", "its", "and",
+    "or", "by", "on", "at", "be", "been", "have", "has", "was", "were",
+    "this", "that", "these", "those", "there", "here", "them", "they",
+    "about", "also", "just", "any", "some", "now",
+}
+
+
+def normalize_query(question: str) -> str:
+    """
+    Normalize a question for similarity-based hashing.
+    Steps: lowercase → remove punctuation → strip stopwords → sort words alphabetically.
+
+    This makes semantically similar questions hash to the same key:
+      "list all menus"    → "menu"
+      "show all menus"    → "menu"
+      "get menu list"     → "menu"
+      → all share the same hash → same pattern cache entry
+    """
+    text  = question.lower().strip()
+    text  = re.sub(r"[^\w\s]", " ", text)          # remove punctuation
+    words = [
+        w for w in text.split()
+        if w and len(w) >= 2 and w not in _LEARN_STOP_WORDS
+    ]
+    words.sort()                                    # order-independent matching
+    return " ".join(words)
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -77,7 +110,8 @@ _PATTERN_TTL  = 7 * 24 * 3600   # 7 days
 
 
 def _qhash(question: str) -> str:
-    return hashlib.md5(question.lower().strip().encode()).hexdigest()
+    """Hash uses normalized query — similar questions map to the same key."""
+    return hashlib.md5(normalize_query(question).encode()).hexdigest()
 
 
 def save_pattern(question: str, sql: str, table: str):
@@ -183,12 +217,17 @@ def save_synonym(word: str, table: str):
         logger.debug(f"[LearningStore] save_synonym: {e}")
 
 
+_SYNONYM_CONFIDENCE = 2   # minimum confirmed_count before a synonym is trusted
+
 def get_synonym(word: str) -> Optional[str]:
-    """Return learned table name for this word, or None if not learned yet."""
+    """
+    Return learned table name for this word only if confirmed_count >= threshold.
+    Prevents one-off wrong mappings from polluting table detection.
+    """
     try:
         store = _load(_SYNONYM_FILE, {})
         entry = store.get(word.lower().strip())
-        if entry:
+        if entry and entry.get("confirmed_count", 0) >= _SYNONYM_CONFIDENCE:
             return entry.get("table")
     except Exception as e:
         logger.debug(f"[LearningStore] get_synonym: {e}")
