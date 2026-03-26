@@ -87,6 +87,8 @@ def get_tables() -> list:
             base = re.sub(r'(_\d+)+$', '', t.lower())
             base = re.sub(r'_\d{4,}[a-z0-9]*$', '', base)
             base = re.sub(r'_[a-z]{2,5}\d{2,4}$', '', base)
+            base = re.sub(r'_p\d+$', '', base)    # partition suffix: _p1, _p2, _p3
+            base = re.sub(r'_q\d+.*$', '', base)  # partition suffix: _q1, _q1_2024
             if base not in _seen_bases:
                 _seen_bases.add(base)
                 _deduped.append(t)

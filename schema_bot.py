@@ -284,8 +284,21 @@ async def chat(message, Login: str = None):
             cutoff = cutoff if cutoff > 0 else 8000
             context_str = context_str[:cutoff] + "\n\n[TRUNCATED: Context exceeded limit. Ask about a specific table for full details.]"
 
-        # Always pass fetched data through the LLM so it can extract the exact
-        # relevant answer from the results instead of dumping raw rows to the user.
+        # Fast path: simple list/show/count question with a known table → skip RunPod
+        _q_first = user_input.lower().split()[0] if user_input.split() else ""
+        _is_simple = (
+            _q_first in {"list", "show", "get", "fetch", "display", "give"}
+            or user_input.lower().startswith("what are")
+            or user_input.lower().startswith("how many")
+            or user_input.lower().startswith("find all")
+        )
+        if target_table and _is_simple:
+            logger.info("[FastPath] Simple data question — returning direct data, skipping RunPod")
+            return {
+                "response":    context_str,
+                "source_file": f"PostgreSQL table: {target_table}",
+                "bot_name":    "Schema Bot",
+            }
 
         role_system_prompt = ROLE_SYSTEM_PROMPTS_SCHEMA.get(
             user_role, ROLE_SYSTEM_PROMPTS_SCHEMA["client"]

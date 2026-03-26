@@ -262,6 +262,22 @@ async def project_chat(message: Message, Login: str = Header(...)):
         if not context_str.strip() or context_str.strip().startswith("No data found") or context_str.strip() == "(no rows)":
             return {"response": "No data found for this request.", "source_file": "MFILE.csv", "bot_name": "Project Bot"}
 
+        # Fast path: simple list/show/count question → skip RunPod
+        _q_first = user_input.lower().split()[0] if user_input.split() else ""
+        _is_simple = (
+            _q_first in {"list", "show", "get", "fetch", "display", "give"}
+            or user_input.lower().startswith("what are")
+            or user_input.lower().startswith("how many")
+            or user_input.lower().startswith("find all")
+        )
+        if _is_simple:
+            logger.info("[FastPath] Simple data question — returning direct data, skipping RunPod")
+            return {
+                "response":    context_str,
+                "source_file": "MFILE.csv",
+                "bot_name":    "Project Bot",
+            }
+
         role_system_prompt = ROLE_SYSTEM_PROMPTS_PROJECT.get(user_role, ROLE_SYSTEM_PROMPTS_PROJECT["client"])
 
         cross_bot_context = ""
