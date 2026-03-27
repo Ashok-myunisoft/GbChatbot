@@ -8,20 +8,22 @@ import asyncio
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-from fastapi import FastAPI, Header, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Header, Request, UploadFile, File
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
+
+# Configure logging first — before any module-level log calls
+logging.basicConfig(level=logging.INFO)
 # RunPodLLM via shared_resources — ChatOllama no longer used
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
-from concurrent.futures import ThreadPoolExecutor
 import psycopg2
 import psycopg2.extras
 from db_setup import get_pg_conn, release_pg_conn, create_tables
 from shared_resources import ai_resources
+from response_formatter import format_response as _fmt_response
 import knowledge_loader
 
 # Import bot modules
@@ -73,18 +75,25 @@ except ImportError as e:
     SCHEMA_BOT_AVAILABLE = False
     logging.warning(f"Schema bot not available: {e}")
 
-logging.basicConfig(level=logging.INFO)
+try:
+    import file_engine
+    FILE_ENGINE_AVAILABLE = True
+    logging.info("File engine imported successfully")
+except ImportError as e:
+    FILE_ENGINE_AVAILABLE = False
+    logging.warning(f"File engine not available: {e}")
+
+try:
+    import export_engine
+    EXPORT_ENGINE_AVAILABLE = True
+    logging.info("Export engine imported successfully")
+except ImportError as e:
+    EXPORT_ENGINE_AVAILABLE = False
+    logging.warning(f"Export engine not available: {e}")
+
 logger = logging.getLogger(__name__)
 
 
-# ===========================
-# EXECUTOR (FOR BLOCKING I/O ONLY)
-# ===========================
-EXECUTOR = ThreadPoolExecutor(max_workers=4)
-
-def run_bg(func, *args):
-    """Helper to run blocking I/O in thread pool"""
-    return asyncio.to_thread(func, *args)
 
 class UserRole:
     DEVELOPER = "developer"
@@ -95,6 +104,7 @@ class UserRole:
     SYSTEM_ADMIN = "system admin"
     MANAGER = "manager"
     SALES = "sales"
+    
 
 # ===========================
 # ===========================
@@ -200,8 +210,8 @@ ROLEID_TO_NAME = {
 # Memory storage
 MEMORY_VECTORSTORE_PATH = "conversational_memory_vectorstore"
 chats_db = {}
-conversational_memory_metadata = {}
-user_sessions = {}
+user_sessions = {}          # { key → session_data }; evicted hourly
+_USER_SESSION_TTL = 86400   # 24 hours
 
 # ===========================
 # RATE LIMITER (no extra library — pure Python)
@@ -615,8 +625,46 @@ class ConversationHistoryManager:
             logger.error(f"Error upserting thread {thread.thread_id}: {e}")
 
     def save_threads(self):
-        for thread in self.threads.values():
-            self._upsert_thread(thread)
+        """Batch-upsert all in-memory threads in a single DB round-trip."""
+        threads = [t for t in self.threads.values() if t.username != "__warmup__"]
+        if not threads:
+            return
+        try:
+            conn = get_pg_conn()
+            with conn.cursor() as cur:
+                psycopg2.extras.execute_values(
+                    cur,
+                    """
+                    INSERT INTO conversation_threads
+                        (thread_id, username, title, created_at, updated_at,
+                         messages, is_active, user_role, user_name)
+                    VALUES %s
+                    ON CONFLICT (thread_id) DO UPDATE SET
+                        title      = EXCLUDED.title,
+                        updated_at = EXCLUDED.updated_at,
+                        messages   = EXCLUDED.messages,
+                        is_active  = EXCLUDED.is_active,
+                        user_role  = EXCLUDED.user_role,
+                        user_name  = EXCLUDED.user_name
+                    """,
+                    [
+                        (
+                            t.thread_id, t.username, t.title,
+                            t.created_at, t.updated_at,
+                            psycopg2.extras.Json(t.messages),
+                            t.is_active, t.user_role, t.user_name,
+                        )
+                        for t in threads
+                    ],
+                )
+            conn.commit()
+            release_pg_conn(conn)
+            logger.info(f"✅ Batch-saved {len(threads)} threads to PostgreSQL")
+        except Exception as e:
+            logger.error(f"Error in save_threads batch upsert: {e}")
+            # Fallback: individual upserts
+            for t in threads:
+                self._upsert_thread(t)
 
     def create_new_thread(self, username: str, initial_message: str = None) -> str:
         thread_id = str(uuid.uuid4())
@@ -624,7 +672,9 @@ class ConversationHistoryManager:
         if initial_message:
             thread.title = thread._generate_title_from_message(initial_message)
         self.threads[thread_id] = thread
-        self._upsert_thread(thread)
+        # Skip DB write for warmup — don't pollute conversation_threads table
+        if username != "__warmup__":
+            self._upsert_thread(thread)
         logger.info(f"Created new thread {thread_id} for {username}")
         return thread_id
 
@@ -783,16 +833,6 @@ class EnhancedConversationalMemory:
             )
             self.memory_vectorstore.add_documents([memory_doc])
 
-            conversational_memory_metadata[memory_id] = {
-                "username":     username,
-                "user_role":    user_role,
-                "timestamp":    timestamp,
-                "user_message": user_message,
-                "bot_response": bot_response[:1000],
-                "bot_type":     bot_type,
-                "thread_id":    thread_id
-            }
-
             # Persist to PostgreSQL immediately (replaces GCS upload)
             conn = get_pg_conn()
             with conn.cursor() as cur:
@@ -824,31 +864,10 @@ class EnhancedConversationalMemory:
 
     def retrieve_contextual_memories(self, username: str, query: str, k: int = 3, thread_id: str = None, thread_isolation: bool = False) -> List[Dict]:
         try:
-            # Enhanced memory retrieval with multiple strategies
-            all_docs = []
-
-            # Primary search with original query
-            docs = self.memory_vectorstore.similarity_search(query, k=k * 3)
-            all_docs.extend(docs)
-
-            # Secondary search with simplified query for broader matching
-            if len(query.split()) > 4:
-                simplified_query = " ".join(query.split()[:4])  # First 4 words
-                try:
-                    simplified_docs = self.memory_vectorstore.similarity_search(simplified_query, k=k)
-                    all_docs.extend(simplified_docs)
-                except Exception as e:
-                    logger.warning(f"Simplified query search failed: {e}")
-
-            # Tertiary search with keywords only
-            keywords = [word for word in query.lower().split() if len(word) > 3 and word not in ['what', 'how', 'when', 'where', 'why', 'which', 'that', 'this', 'there', 'here']]
-            if keywords:
-                keyword_query = " ".join(keywords[:3])  # Top 3 keywords
-                try:
-                    keyword_docs = self.memory_vectorstore.similarity_search(keyword_query, k=k)
-                    all_docs.extend(keyword_docs)
-                except Exception as e:
-                    logger.warning(f"Keyword query search failed: {e}")
+            # Single FAISS search — fetches k*3 to allow deduplication and filtering
+            # Removed secondary/tertiary searches: same model, same index, same embeddings
+            # → results were near-identical duplicates, just wasting 3x CPU per request
+            all_docs = self.memory_vectorstore.similarity_search(query, k=k * 3)
 
             user_memories = {}
             seen_memories = set()
@@ -1672,7 +1691,8 @@ class AIOrchestrationAgent:
         formula_keywords = [
             'calculate', 'compute', 'formula', 'math', 'sum', 'average', 'total',
             'count', 'percentage', 'divide', 'multiply', 'subtract', 'add',
-            'equation', 'expression', 'result of', 'what is', 'how much',
+            'equation', 'expression', 'result of',
+            # NOTE: 'what is' and 'how much' removed — too broad; stolen general questions
             '+', '-', '*', '/', '=', '%', 'mean', 'median', 'gst', 'tax', 'discount',
             'net amount', 'gross', 'valuation', 'variance',
             'interest', 'deduction', 'allowance', 'commission', 'wage',
@@ -1696,7 +1716,8 @@ class AIOrchestrationAgent:
         report_keywords = [
             'report', 'analyze', 'analysis', 'chart', 'graph',
             'dashboard', 'visualize', 'kpi', 'trend', 'breakdown',
-            'export', 'generate report', 'view report', 'show chart', 'create graph',
+            'generate report', 'view report', 'show chart', 'create graph',
+            # NOTE: 'export' removed — conflicts with export engine keyword detection
             'ledger', 'balance sheet', 'p&l', 'profit', 'loss',
             'payroll report', 'attendance report', 'sales report',
             'inventory report', 'purchase report', 'financial report',
@@ -1789,9 +1810,10 @@ class AIOrchestrationAgent:
             'data model', 'entity', 'primary key', 'foreign key',
             'get all', 'list all', 'fetch all', 'show all', 'display all',
             'all records', 'all rows', 'all entries',
-            'give me', 'show me', 'find me', 'fetch me',
             'picklist', 'pick list', 'dropdown', 'lookup', 'masterdata',
-            'master data', 'what are', 'what is the',
+            'master data',
+            # NOTE: 'give me', 'show me', 'find me', 'fetch me', 'what are', 'what is the'
+            # removed — too broad; stolen general/menu/report queries
         ]
         if any(word in question_lower for word in schema_keywords):
             logger.info("🚀 Fast route: schema")
@@ -1874,12 +1896,17 @@ class AIOrchestrationAgent:
                     intent = "general"
                 logger.info(f"📊 Fallback analysis selected (with context): {intent}")
             
-            self.intent_cache[question.lower().strip()] = intent
+            key = question.lower().strip()
+            if len(self.intent_cache) >= 500:
+                # Evict oldest half to keep memory bounded
+                keep = list(self.intent_cache.items())[250:]
+                self.intent_cache = dict(keep)
+            self.intent_cache[key] = intent
             logger.info(f"✅ Final routing decision: {intent}")
             return intent
             
         except asyncio.TimeoutError:
-            logger.error("⏱️ Intent detection timeout (10s), using intelligent fallback")
+            logger.error("⏱️ Intent detection timeout (70s), using intelligent fallback")
             fallback = self._get_cached_intent(question)
             if not fallback:
                 question_lower = question.lower()
@@ -2082,6 +2109,27 @@ For example: "Name: John, Role: developer" """
                 "user_role": user_role
             }
         
+        # ── File Intelligence: answer from uploaded file first ────────────────
+        if FILE_ENGINE_AVAILABLE and file_engine.has_file(username):
+            file_context = await asyncio.to_thread(file_engine.search, username, question)
+            if file_context and len(file_context.strip()) >= 20:
+                logger.info(f"[FileEngine] Answering from user file for {username}")
+                _file_answer = file_context
+                # Export check on file-sourced answer
+                if EXPORT_ENGINE_AVAILABLE:
+                    _efmt = export_engine.detect_export_format(question)
+                    if _efmt:
+                        _edf    = file_engine.get_dataframe(username)
+                        _ehint  = (file_engine.get_filename(username) or "export").rsplit(".", 1)[0]
+                        _efile_id = await asyncio.to_thread(
+                            export_engine.build_export, _efmt, _file_answer, _edf, _ehint
+                        )
+                        if _efile_id:
+                            _file_answer += f"\n\n[Download your {_efmt.upper()} file here: /gbaiapi/download/{_efile_id}]"
+                await asyncio.to_thread(update_enhanced_memory, username, question, _file_answer, "file_intelligence", user_role, thread_id)
+                return {"response": _file_answer, "bot_type": "file_intelligence", "thread_id": thread_id, "user_role": user_role}
+        # ── End File Intelligence ─────────────────────────────────────────────
+
         logger.info("📚 Building conversational context...")
         if is_existing_thread and thread_id:
             context = build_conversational_context(username, question, thread_id, thread_isolation=True)
@@ -2117,7 +2165,6 @@ For example: "Name: John, Role: developer" """
         # ── Deep Analysis Detection ───────────────────────────────────────────
         # Triggers when user is dissatisfied OR repeats the same question.
         # Only modifies the context string — no bot logic or routing is changed.
-        import re as _re_deep
         deep_analysis_needed = False
 
         # Signal 1: User explicitly expresses dissatisfaction or asks for more
@@ -2143,8 +2190,8 @@ For example: "Name: John, Role: developer" """
                 # Skip if the previous message was itself a retry command
                 _retry_commands = {"try again", "retry", "again", "try once more"}
                 if _prev_q and _prev_q.lower().strip() not in _retry_commands:
-                    _curr_words = set(_re_deep.findall(r'\b\w{4,}\b', question.lower()))
-                    _prev_words = set(_re_deep.findall(r'\b\w{4,}\b', _prev_q.lower()))
+                    _curr_words = set(re.findall(r'\b\w{4,}\b', question.lower()))
+                    _prev_words = set(re.findall(r'\b\w{4,}\b', _prev_q.lower()))
                     if _curr_words and _prev_words:
                         _overlap = len(_curr_words & _prev_words) / max(len(_curr_words), len(_prev_words))
                         if _overlap >= 0.7:
@@ -2176,6 +2223,9 @@ For example: "Name: John, Role: developer" """
             "those", "that one", "the first", "first one", "second one",
             "last one", "which of", "which has", "which have", "of those",
             "of them", "from those", "among those", "above", "listed",
+            # user wants more info on the same item
+            "also", "as well", "additionally", "and also", "too",
+            "the above", "that record", "that item", "that entry",
         }
         _q_lower = question.lower().strip()
         _is_followup = (
@@ -2205,8 +2255,7 @@ For example: "Name: John, Role: developer" """
                         answer = None
                     if answer and len(answer.strip()) >= 10:
                         answer = _extract_clean_response(answer)
-                        from response_formatter import format_response as _fmt
-                        answer = _fmt(question, answer)
+                        answer = _fmt_response(question, answer)
                         await asyncio.to_thread(update_enhanced_memory, username, question, answer, bot_type, user_role, thread_id)
                         elapsed = time.time() - start_time
                         logger.info(f"✅ Follow-up completed in {elapsed:.2f}s")
@@ -2294,8 +2343,22 @@ For example: "Name: John, Role: developer" """
 
         # Format response — converts DB record blocks / numbered lists to clean markdown
         # Zero latency: pure Python, no LLM call
-        from response_formatter import format_response as _fmt
-        answer = _fmt(question, answer)
+        answer = _fmt_response(question, answer)
+
+        # ── Export check: user asked for a downloadable file ──────────────────
+        if EXPORT_ENGINE_AVAILABLE:
+            _export_fmt = export_engine.detect_export_format(question)
+            if _export_fmt:
+                import db_query as _dbq
+                _export_df  = _dbq.get_session_df(username) if hasattr(_dbq, "get_session_df") else None
+                _export_hint = bot_type
+                _export_id   = await asyncio.to_thread(
+                    export_engine.build_export, _export_fmt, answer, _export_df, _export_hint
+                )
+                if _export_id:
+                    answer += f"\n\n[Download your {_export_fmt.upper()} file here: /gbaiapi/download/{_export_id}]"
+                    logger.info(f"[ExportEngine] Built {_export_fmt} export → {_export_id}")
+        # ── End export check ──────────────────────────────────────────────────
 
         logger.info("💾 Storing conversation...")
         await asyncio.to_thread(
@@ -2947,7 +3010,7 @@ async def system_status():
         "total_users": len(chats_db),
         "total_sessions": len(user_sessions),
         "total_conversations": sum(len(chats) for chats in chats_db.values()),
-        "total_memories": len(conversational_memory_metadata),
+        "total_memories": enhanced_memory.memory_counter if enhanced_memory else 0,
         "total_threads": len(history_manager.threads),
         "active_threads": len([t for t in history_manager.threads.values() if t.is_active])
     }
@@ -3191,6 +3254,51 @@ async def clear_intent_cache():
         "current_cache_size": len(ai_orchestrator.intent_cache)
     }
 
+@app.post("/gbaiapi/upload", tags=["File Intelligence"])
+async def upload_file(file: UploadFile = File(...), Login: str = Header(...)):
+    """
+    Upload a file (PDF, CSV, Excel, JSON, TXT — max 10 MB).
+    The system builds a per-user FAISS index so you can ask questions about it.
+    """
+    if not FILE_ENGINE_AVAILABLE:
+        return JSONResponse(status_code=503, content={"response": "File intelligence not available. Install: pymupdf, faiss-cpu"})
+    try:
+        login_dto = json.loads(Login)
+        username  = login_dto.get("UserName", "anonymous")
+    except Exception:
+        return JSONResponse(status_code=400, content={"response": "Invalid login header."})
+
+    content  = await file.read()
+    filename = file.filename or "upload"
+
+    status_msg = await asyncio.to_thread(
+        file_engine.process, username, filename, content, ai_resources.embeddings
+    )
+    logger.info(f"[Upload] {username} → '{filename}': {status_msg[:80]}")
+    return {"response": status_msg, "filename": filename}
+
+
+@app.get("/gbaiapi/download/{file_id}", tags=["Export"])
+async def download_export(file_id: str):
+    """
+    Download a previously generated export file (PDF / CSV / Excel / JSON).
+    Files expire after 10 minutes.
+    """
+    if not EXPORT_ENGINE_AVAILABLE:
+        return JSONResponse(status_code=503, content={"detail": "Export engine not available. Install: fpdf2, openpyxl"})
+
+    entry = export_engine.get_file(file_id)
+    if not entry:
+        return JSONResponse(status_code=404, content={"detail": "File not found or has expired."})
+
+    import io as _io
+    return StreamingResponse(
+        _io.BytesIO(entry["bytes"]),
+        media_type=entry["mime"],
+        headers={"Content-Disposition": f'attachment; filename="{entry["filename"]}"'},
+    )
+
+
 @app.get("/health", tags=["System Health"])
 async def health_check():
     """Health check endpoint"""
@@ -3319,6 +3427,21 @@ async def startup_event():
         asyncio.create_task(
             asyncio.to_thread(history_manager.cleanup_old_threads, 180)
         )
+
+        async def _periodic_cleanup():
+            """Hourly: purge shared context registry + evict stale user_sessions."""
+            while True:
+                await asyncio.sleep(3600)
+                shared_context_registry.cleanup_old_contexts()
+                _now = time.time()
+                stale = [k for k, v in list(user_sessions.items())
+                         if _now - v.get("last_seen", 0) > _USER_SESSION_TTL]
+                for k in stale:
+                    user_sessions.pop(k, None)
+                if stale:
+                    logger.info(f"🧹 Evicted {len(stale)} stale user sessions")
+
+        asyncio.create_task(_periodic_cleanup())
 
         logger.info("=" * 80)
         logger.info("✅ ALL SYSTEMS READY - App startup complete")

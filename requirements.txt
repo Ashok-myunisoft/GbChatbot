@@ -19,3 +19,8 @@ sqlalchemy
 # --- Structured knowledge base ---
 duckdb
 openpyxl
+langchain-text-splitters
+# --- File intelligence ---
+pymupdf
+# --- Export engine ---
+fpdf2

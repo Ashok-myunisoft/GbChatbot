@@ -612,9 +612,16 @@ def _get_session_df(session_id: str):
         return entry[0], entry[1]
     return None, None
 
+
+def get_session_df(session_id: str):
+    """Public accessor — returns the last stored DataFrame for session_id (or None)."""
+    df, _ = _get_session_df(session_id)
+    return df
+
 _FOLLOWUP_INDICATORS = {
     "those", "that", "them", "these", "above", "previous",
     "first", "second", "third", "last", "listed",
+    "also", "too", "additionally",   # "I want a description also"
 }
 
 def _is_followup_question(query: str) -> bool:
@@ -1597,8 +1604,10 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "", session_i
         if expired_keys:
             logger.info(f"Cache eviction: removed {len(expired_keys)} expired entries")
 
-    # Follow-up filter — if question references "those/that/first/last", try to answer
-    # directly from the last result DataFrame without any SQL or LLM call
+    # Follow-up filter — if question references "those/that/first/last/above/also", try to answer
+    # directly from the last result DataFrame without any SQL or LLM call.
+    # If the stored DF can't answer (missing column), enrich the GPT query with stored
+    # context so GPT knows what "the above one" / "also" refers to.
     if session_id and _is_followup_question(query):
         _stored_df, _stored_query = _get_session_df(session_id)
         if _stored_df is not None:
@@ -1609,6 +1618,11 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "", session_i
                     f"Results for '{query}' ({len(_fu_result)} rows):\n\n"
                     + _format_df(_fu_result)
                 )
+            # Stored DF couldn't answer (e.g. asked for "description" but DF only has "menucode").
+            # Enrich the GPT query with the stored question so GPT understands the reference.
+            if _stored_query:
+                query = f"{query} [referring to previous result: {_stored_query}]"
+                logger.info(f"[Follow-up] Enriched query with stored context: '{_stored_query[:80]}'")
 
     # Fast path — skip SQL LLM for simple listing queries (saves 5-28s per request)
     # Triggered when: "list all X", "give me X", "show X", "what are X" with no specific filter value
