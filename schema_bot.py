@@ -10,6 +10,32 @@ import db_query
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ── Qwen gating: full-sentence intent detection ───────────────────────────────
+_EXPLANATION_SIGNALS = {
+    "explain", "why", "how does", "how do i", "how to", "steps to",
+    "what is the difference", "compare", "reason", "cause", "impact",
+    "suggest", "recommend", "what happens", "tell me about", "describe",
+    "analyze", "analyse", "best way", "guide", "help me understand",
+    "walk me through", "what does it mean", "meaning of", "purpose of",
+}
+_DATA_SIGNALS = {
+    "list", "show", "get", "fetch", "display", "give", "find",
+    "all ", "every ", "how many", "count", "total number",
+    "what are", "what is the", "which ", "who are",
+    "tell me all", "i need", "i want to see", "can you show",
+    "give me", "pull", "retrieve", "view all", "see all",
+}
+
+def _is_data_only_question(question: str) -> bool:
+    """Return True when question needs only data — Qwen can be skipped."""
+    q = question.lower().strip()
+    if any(s in q for s in _EXPLANATION_SIGNALS):
+        return False   # needs reasoning → Qwen required
+    if any(s in q for s in _DATA_SIGNALS):
+        return True    # pure fetch → skip Qwen
+    return False       # safe default: use Qwen
+# ─────────────────────────────────────────────────────────────────────────────
+
 # Use centralized AI resources
 llm = ai_resources.response_llm
 
@@ -284,15 +310,8 @@ async def chat(message, Login: str = None):
             cutoff = cutoff if cutoff > 0 else 8000
             context_str = context_str[:cutoff] + "\n\n[TRUNCATED: Context exceeded limit. Ask about a specific table for full details.]"
 
-        # Fast path: simple list/show/count question with a known table → skip RunPod
-        _q_first = user_input.lower().split()[0] if user_input.split() else ""
-        _is_simple = (
-            _q_first in {"list", "show", "get", "fetch", "display", "give"}
-            or user_input.lower().startswith("what are")
-            or user_input.lower().startswith("how many")
-            or user_input.lower().startswith("find all")
-        )
-        if target_table and _is_simple:
+        # Fast path: data-only question with a known table → skip RunPod
+        if target_table and _is_data_only_question(user_input):
             logger.info("[FastPath] Simple data question — returning direct data, skipping RunPod")
             return {
                 "response":    context_str,

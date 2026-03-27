@@ -15,7 +15,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 
 # Configure logging first — before any module-level log calls
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO)s
 # RunPodLLM via shared_resources — ChatOllama no longer used
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
