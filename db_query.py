@@ -13,6 +13,7 @@ import os
 import re
 import time
 import logging
+import threading
 import pandas as pd
 from sqlalchemy import create_engine, text as sa_text
 from dotenv import load_dotenv
@@ -28,6 +29,12 @@ try:
     logger.info("[Learning] Learning store enabled ✅")
 except ImportError:
     _LEARNING_ENABLED = False
+
+# Thread-local: tracks how confident the table detection was for this request.
+# "high"   = Pass 0 (confirmed synonym) or Pass 1 (exact word match)
+# "low"    = Pass 2 (compound guess) or Pass 3 (partial match) or no match
+# Used to gate save_pattern / save_synonym — prevents caching wrong answers.
+_tls = threading.local()
 
 # =========================================================
 # ⚙️ DB CONFIG
@@ -1915,8 +1922,10 @@ def run_db_agent(query: str, max_rows: int = 50, table_hint: str = "", session_i
             _query_cache[_cache_key] = (final, time.time())
             if session_id:
                 _store_session_df(session_id, df, query)
-            # Learning: save successful GPT SQL as pattern + save content words as synonyms
-            if _LEARNING_ENABLED and _target_table:
+            # Learning: only save pattern + synonym when table detection was high-confidence.
+            # Low-confidence (Pass 2/3 guesses) may have found the wrong table —
+            # caching that SQL would repeat the wrong answer forever.
+            if _LEARNING_ENABLED and _target_table and getattr(_tls, "detect_confidence", "low") == "high":
                 try:
                     if sql and sql.strip().upper().startswith("SELECT"):
                         _ls.save_pattern(query, sql, _target_table)
@@ -1986,6 +1995,7 @@ def _detect_table_from_question(user_question: str) -> "str | None":
                     _syn_tbl = _ls.get_synonym(_sw)
                     if _syn_tbl:
                         logger.info(f"[Learning] Synonym: '{_sw}' → {_syn_tbl}")
+                        _tls.detect_confidence = "high"
                         return _syn_tbl
         except Exception:
             pass
@@ -2002,6 +2012,7 @@ def _detect_table_from_question(user_question: str) -> "str | None":
     for word in words_sorted:
         if word.upper() in tables_upper:
             _p1_result = tables_upper[word.upper()]
+            _tls.detect_confidence = "high"
             if _LEARNING_ENABLED:
                 try: _ls.save_synonym(word, _p1_result)
                 except Exception: pass
@@ -2026,6 +2037,7 @@ def _detect_table_from_question(user_question: str) -> "str | None":
                         break
     if compound_hits:
         compound_hits.sort(key=lambda x: (x[0], x[1], x[2]))
+        _tls.detect_confidence = "low"
         return compound_hits[0][2]
 
     skip_words = {
@@ -2084,15 +2096,9 @@ def _detect_table_from_question(user_question: str) -> "str | None":
             x[1],                                          # shorter table name first
         ))
         _p3_result = partial_hits[0][2]
-        if _LEARNING_ENABLED:
-            try:
-                # Save the first meaningful content word as synonym for this table
-                for _p3w in words_sorted:
-                    if len(_p3w) >= 4 and _p3w.lower() not in _STOP_WORDS:
-                        _ls.save_synonym(_p3w, _p3_result)
-                        break
-            except Exception:
-                pass
+        _tls.detect_confidence = "low"
+        # Pass 3 is a fuzzy/partial match — do NOT save synonym here.
+        # Synonym will only be saved after data is confirmed correct (high-confidence path).
         return _p3_result
 
     return None

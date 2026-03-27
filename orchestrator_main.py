@@ -204,6 +204,32 @@ conversational_memory_metadata = {}
 user_sessions = {}
 
 # ===========================
+# RATE LIMITER (no extra library — pure Python)
+# 30 requests per user per 60 seconds.
+# Prevents a single user from burning RunPod credits.
+# ===========================
+_rate_store: Dict[str, List[float]] = {}
+_RATE_MAX    = int(os.getenv("RATE_LIMIT_MAX",    "30"))   # requests
+_RATE_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))   # seconds
+
+def _is_rate_limited(username: str) -> bool:
+    now = time.time()
+    if username not in _rate_store:
+        _rate_store[username] = []
+    # drop timestamps outside the window
+    _rate_store[username] = [t for t in _rate_store[username] if now - t < _RATE_WINDOW]
+    if len(_rate_store[username]) >= _RATE_MAX:
+        return True
+    _rate_store[username].append(now)
+    # Evict users with no recent requests to prevent unbounded dict growth
+    if len(_rate_store) > 1000:
+        _rate_store.update({u: ts for u, ts in _rate_store.items() if ts})
+        dead = [u for u, ts in _rate_store.items() if not ts]
+        for u in dead:
+            del _rate_store[u]
+    return False
+
+# ===========================
 # PERFORMANCE MONITORING MIDDLEWARE
 # ===========================
 class PerformanceMonitoringMiddleware(BaseHTTPMiddleware):
@@ -1572,6 +1598,72 @@ class AIOrchestrationAgent:
         
         self.intent_cache = {}
     
+    def _understand_query(self, question: str) -> Optional[str]:
+        """
+        Pure Python query understanding layer — runs BEFORE keyword matching.
+        Understands user INTENT from natural language, not just exact keywords.
+        Covers ~30% of questions that miss the keyword cache and fall to RunPod.
+        Zero LLM calls — pure pattern matching, < 1ms.
+        """
+        q = question.lower().strip()
+        words = set(re.findall(r'\b\w+\b', q))
+
+        # --- Navigation intent (any phrasing meaning "find a screen/menu") ---
+        _NAV_PATTERNS = [
+            'how to reach', 'how to get to', 'how to open', 'how to access',
+            'where can i find', 'where do i go', 'which screen', 'which menu',
+            'how do i navigate', 'steps to open', 'path for', 'path to',
+            'take me to', 'open the screen', 'open the module',
+        ]
+        if any(p in q for p in _NAV_PATTERNS):
+            return "menu"
+
+        # --- Calculation intent ---
+        _CALC_PATTERNS = [
+            'calculate', 'compute', 'what is the formula', 'how is it calculated',
+            'how to calculate', 'how is salary calculated', 'formula for',
+        ]
+        if any(p in q for p in _CALC_PATTERNS):
+            return "formula"
+
+        # --- ERP entity words — strong signal that user wants DB data ---
+        _SCHEMA_ENTITIES = {
+            'employee', 'employees', 'staff', 'worker', 'workers', 'personnel',
+            'salary', 'salaries', 'payslip', 'payroll', 'payment', 'payments',
+            'department', 'departments', 'division', 'designation', 'designations',
+            'order', 'orders', 'purchase', 'purchases', 'invoice', 'invoices',
+            'voucher', 'vouchers', 'stock', 'inventory', 'item', 'items',
+            'customer', 'customers', 'vendor', 'vendors', 'supplier', 'suppliers',
+            'account', 'accounts', 'transaction', 'transactions',
+            'attendance', 'leave', 'leaves', 'holiday', 'holidays',
+            'user', 'users', 'role', 'roles', 'group', 'groups',
+        }
+        _REPORT_ENTITIES = {'report', 'reports', 'analysis', 'summary', 'breakdown', 'analytics'}
+        _MENU_ENTITIES   = {'menu', 'menus', 'screen', 'screens', 'navigation', 'module', 'modules'}
+        _FORMULA_ENTITIES= {'formula', 'formulas', 'expression', 'expressions'}
+        _PROJECT_ENTITIES= {'project', 'projects', 'task', 'tasks', 'milestone', 'milestones'}
+
+        # --- Data retrieval verbs (informal + formal) ---
+        _DATA_VERBS = {
+            'show', 'list', 'get', 'fetch', 'display', 'give', 'find', 'retrieve',
+            'pull', 'view', 'see', 'check', 'need', 'want', 'gimme',
+            'provide', 'return', 'bring', 'tell', 'can i see', 'let me see',
+        }
+        _COUNT_PHRASES = {'how many', 'count of', 'number of', 'total number', 'how much'}
+
+        has_data_verb  = bool(words & _DATA_VERBS) or any(p in q for p in ['can i see', 'let me see', 'i want to see', 'i need to see'])
+        has_count      = any(p in q for p in _COUNT_PHRASES)
+        is_data_intent = has_data_verb or has_count
+
+        if is_data_intent:
+            if words & _REPORT_ENTITIES:  return "report"
+            if words & _MENU_ENTITIES:    return "menu"
+            if words & _FORMULA_ENTITIES: return "formula"
+            if words & _PROJECT_ENTITIES: return "project"
+            if words & _SCHEMA_ENTITIES:  return "schema"
+
+        return None   # fall through to keyword cache + AI routing
+
     def _get_cached_intent(self, question: str) -> Optional[str]:
         """Enhanced keyword-based routing with broader patterns"""
         question_lower = question.lower().strip()
@@ -1728,6 +1820,13 @@ class AIOrchestrationAgent:
     async def detect_intent_with_ai(self, question: str, context: str) -> str:
         """Enhanced intent detection with better fallback logic"""
         try:
+            # Step 0: Natural language understanding (catches informal phrasing)
+            understood = self._understand_query(question)
+            if understood:
+                logger.info(f"[NLU] Understood intent: {understood}")
+                return understood
+
+            # Step 1: Exact keyword cache
             cached_intent = self._get_cached_intent(question)
             if cached_intent:
                 return cached_intent
@@ -2099,7 +2198,7 @@ For example: "Name: John, Role: developer" """
                     try:
                         answer = await asyncio.wait_for(
                             selected_bot.answer(question, context, user_role, username),
-                            timeout=40.0
+                            timeout=120.0
                         )
                     except (asyncio.TimeoutError, Exception) as _fe:
                         logger.warning(f"Follow-up bot failed: {_fe} — falling through to normal routing")
@@ -2149,11 +2248,11 @@ For example: "Name: John, Role: developer" """
         try:
             answer = await asyncio.wait_for(
                 selected_bot.answer(question, context, user_role, username),
-                timeout=40.0
+                timeout=120.0
             )
             logger.info(f"📥 {intent} bot response received: {len(answer) if answer else 0} chars")
         except asyncio.TimeoutError:
-            logger.error(f"⏱️ Bot {intent} execution timeout (40s)")
+            logger.error(f"⏱️ Bot {intent} execution timeout (120s)")
             answer = None
         except Exception as e:
             logger.error(f"❌ Bot {intent} execution error: {e}", exc_info=True)
@@ -2167,7 +2266,7 @@ For example: "Name: John, Role: developer" """
                 try:
                     answer = await asyncio.wait_for(
                         self.bots["general"].answer(question, context, user_role, username),
-                        timeout=40.0
+                        timeout=120.0
                     )
                     if answer and len(answer.strip()) >= 10:
                         logger.info(f"✅ General bot fallback successful: {len(answer)} chars")
@@ -2450,6 +2549,10 @@ async def ai_role_based_chat(message: Message, Login: str = Header(...)):
     if not user_input:
         return JSONResponse(status_code=400, content={"response": "Please provide a message"})
 
+    if _is_rate_limited(username):
+        logger.warning(f"[RateLimit] {username} exceeded {_RATE_MAX} req/{_RATE_WINDOW}s")
+        return JSONResponse(status_code=429, content={"response": "Too many requests. Please wait a moment before sending another message."})
+
     try:
         # Create new thread first — thread_id is unique per conversation/device
         thread_id = await asyncio.to_thread(history_manager.create_new_thread, username, user_input)
@@ -2605,6 +2708,10 @@ async def ai_thread_chat(request: ThreadRequest, Login: str = Header(...)):
 
     if not thread_id:
         return JSONResponse(status_code=400, content={"response": "Thread ID is required"})
+
+    if _is_rate_limited(username):
+        logger.warning(f"[RateLimit] {username} exceeded {_RATE_MAX} req/{_RATE_WINDOW}s")
+        return JSONResponse(status_code=429, content={"response": "Too many requests. Please wait a moment before sending another message."})
 
     # Use thread_id as session key — isolates sessions per device/conversation
     session_info = user_sessions.get(thread_id, {})
@@ -3020,7 +3127,7 @@ async def test_bot(bot_name: str, question: str = "What is GoodBooks?", Login: s
         selected_bot = ai_orchestrator.bots[bot_name]
         answer = await asyncio.wait_for(
             selected_bot.answer(question, "", user_role, username),
-            timeout=40.0
+            timeout=120.0
         )
         
         elapsed = time.time() - start_time
@@ -3108,14 +3215,12 @@ async def startup_event():
         # --------------------------------------------------
         # 🔥 INITIALIZE HEAVY COMPONENTS FIRST
         # --------------------------------------------------
-        logger.info("📦 Loading embeddings model...")
-        embeddings = HuggingFaceEmbeddings(
-            model_name="sentence-transformers/all-MiniLM-L6-v2", 
-            model_kwargs={'device': 'cpu'}, 
-            encode_kwargs={'batch_size': 1}
-        )
-        logger.info("✅ Embeddings loaded")
-        
+        # Reuse the already-loaded embeddings from ai_resources singleton — avoids loading
+        # the same 500MB model twice and prevents OOM crashes on low-memory containers.
+        logger.info("📦 Reusing shared embeddings from ai_resources...")
+        embeddings = ai_resources.embeddings
+        logger.info("✅ Embeddings ready (shared)")
+
         logger.info("💾 Loading conversation memory from PostgreSQL...")
         enhanced_memory = EnhancedConversationalMemory(
             vectorstore_path="memory_store",
@@ -3232,9 +3337,12 @@ async def shutdown_event():
         await asyncio.to_thread(history_manager.save_threads)
         logger.info("✅ All thread data saved to Firestore")
         
-        logger.info("💾 Saving memory vectorstore...")
-        await asyncio.to_thread(enhanced_memory.memory_vectorstore.save_local, MEMORY_VECTORSTORE_PATH)
-        logger.info("✅ Memory vectorstore saved")
+        if enhanced_memory and enhanced_memory.memory_vectorstore:
+            logger.info("💾 Saving memory vectorstore...")
+            await asyncio.to_thread(enhanced_memory.memory_vectorstore.save_local, MEMORY_VECTORSTORE_PATH)
+            logger.info("✅ Memory vectorstore saved")
+        else:
+            logger.info("⚠️ No memory vectorstore to save (no conversations yet)")
         
     except Exception as e:
         logger.error(f"❌ Shutdown save error: {e}")
