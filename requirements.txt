@@ -25,3 +25,5 @@ langchain-text-splitters
 pymupdf
 # --- Export engine ---
 fpdf2
+
+

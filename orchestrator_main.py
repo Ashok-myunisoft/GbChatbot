@@ -540,6 +540,13 @@ class ConversationThread:
         title = re.sub(r'^(what\s+is\s+|tell\s+me\s+about\s+|how\s+to\s+|can\s+you\s+)', '', title, flags=re.IGNORECASE)
         return (title[:47] + "...") if len(title) > 50 else title.capitalize() if title else "New Conversation"
 
+    def update_title(self, thread_id: str, title: str):
+        """Update thread title in memory and persist to DB."""
+        if thread_id in self.threads:
+            self.threads[thread_id].title = title
+            self.threads[thread_id].updated_at = datetime.now().isoformat()
+            self._upsert_thread(self.threads[thread_id])
+
     def to_dict(self) -> Dict:
         return {
             "thread_id": self.thread_id,
@@ -2125,7 +2132,7 @@ For example: "Name: John, Role: developer" """
                             export_engine.build_export, _efmt, _file_answer, _edf, _ehint
                         )
                         if _efile_id:
-                            _file_answer += f"\n\n[Download your {_efmt.upper()} file here: /gbaiapi/download/{_efile_id}]"
+                            _file_answer += f"\n\n[📥 Download {_efmt.upper()} file](/gbaiapi/download/{_efile_id})"
                 await asyncio.to_thread(update_enhanced_memory, username, question, _file_answer, "file_intelligence", user_role, thread_id)
                 return {"response": _file_answer, "bot_type": "file_intelligence", "thread_id": thread_id, "user_role": user_role}
         # ── End File Intelligence ─────────────────────────────────────────────
@@ -2356,7 +2363,7 @@ For example: "Name: John, Role: developer" """
                     export_engine.build_export, _export_fmt, answer, _export_df, _export_hint
                 )
                 if _export_id:
-                    answer += f"\n\n[Download your {_export_fmt.upper()} file here: /gbaiapi/download/{_export_id}]"
+                    answer += f"\n\n[📥 Download {_export_fmt.upper()} file](/gbaiapi/download/{_export_id})"
                     logger.info(f"[ExportEngine] Built {_export_fmt} export → {_export_id}")
         # ── End export check ──────────────────────────────────────────────────
 
@@ -2365,6 +2372,12 @@ For example: "Name: John, Role: developer" """
             update_enhanced_memory,
             username, question, answer, bot_type, user_role, thread_id
         )
+
+        # Generate ChatGPT-style title for the first message of a new thread
+        if thread_id and thread_id in history_manager.threads:
+            thread = history_manager.threads[thread_id]
+            if len(thread.messages) == 1:
+                asyncio.create_task(_generate_thread_title(thread_id, question))
         
         elapsed = time.time() - start_time
         logger.info("="*80)
@@ -2547,11 +2560,38 @@ def update_enhanced_memory(username: str, question: str, answer: str, bot_type: 
     try:
         if thread_id:
             history_manager.add_message_to_thread(thread_id, question, answer, bot_type)
-        
+
         enhanced_memory.store_conversation_turn(username, question, answer, bot_type, user_role, thread_id)
         logger.info("💾 Memory stored successfully")
     except Exception as e:
         logger.error(f"Error storing memory: {e}")
+
+
+async def _generate_thread_title(thread_id: str, user_message: str):
+    """
+    Generate a ChatGPT-style short title for a new conversation using the LLM.
+    Runs as a fire-and-forget background task — never blocks the response.
+    Falls back silently if the LLM fails.
+    """
+    try:
+        prompt = (
+            f"Generate a short 4-6 word conversation title for this user message. "
+            f"Reply with ONLY the title, no quotes, no punctuation at the end, no explanation.\n\n"
+            f"User message: {user_message[:300]}"
+        )
+        raw = await asyncio.wait_for(
+            ai_resources.routing_llm.ainvoke(prompt),
+            timeout=15.0
+        )
+        title = str(raw).strip().strip('"\'').strip()
+        # Sanitize: remove newlines, truncate
+        title = title.splitlines()[0].strip()
+        title = (title[:57] + "...") if len(title) > 60 else title
+        if title:
+            await asyncio.to_thread(history_manager.update_title, thread_id, title)
+            logger.info(f"[TitleGen] Thread {thread_id} titled: '{title}'")
+    except Exception as e:
+        logger.warning(f"[TitleGen] Could not generate title for {thread_id}: {e}")
 
 # ===========================
 # FASTAPI APP INITIALIZATION

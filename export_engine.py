@@ -29,12 +29,19 @@ _lock  = threading.Lock()
 
 _EXPORT_KEYWORDS = {
     "as pdf", "as csv", "as excel", "as xlsx", "as json",
+    "as a pdf", "as a csv", "as a excel", "as an excel", "as a json",
     "to pdf", "to csv", "to excel", "to xlsx", "to json",
+    "in pdf", "in csv", "in excel", "in json",
     "give pdf", "give csv", "give excel", "give xlsx", "give json",
     "export pdf", "export csv", "export excel", "export json",
     "download pdf", "download csv", "download excel", "download json",
+    "pdf download", "csv download", "excel download", "json download",
+    "pdf to download", "csv to download", "excel to download",
     "save as pdf", "save as csv", "save as excel", "save as json",
     "convert to pdf", "convert to csv", "convert to excel", "convert to json",
+    "give as pdf", "give as csv", "give as excel", "give as json",
+    "get pdf", "get csv", "get excel", "get json",
+    "generate pdf", "generate csv", "generate excel", "generate json",
 }
 
 
