@@ -221,6 +221,7 @@ _USER_SESSION_TTL = 86400   # 24 hours
 _rate_store: Dict[str, List[float]] = {}
 _RATE_MAX    = int(os.getenv("RATE_LIMIT_MAX",    "30"))   # requests
 _RATE_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))   # seconds
+BASE_URL     = os.getenv("BASE_URL", "").rstrip("/")        # e.g. http://183.82.250.223:92
 
 def _is_rate_limited(username: str) -> bool:
     now = time.time()
@@ -676,8 +677,7 @@ class ConversationHistoryManager:
     def create_new_thread(self, username: str, initial_message: str = None) -> str:
         thread_id = str(uuid.uuid4())
         thread = ConversationThread(thread_id, username)
-        if initial_message:
-            thread.title = thread._generate_title_from_message(initial_message)
+        # Title will be set by LLM after first response — keep as "New Conversation" for now
         self.threads[thread_id] = thread
         # Skip DB write for warmup — don't pollute conversation_threads table
         if username != "__warmup__":
@@ -2131,10 +2131,12 @@ For example: "Name: John, Role: developer" """
                         _efile_id = await asyncio.to_thread(
                             export_engine.build_export, _efmt, _file_answer, _edf, _ehint
                         )
+                        _edownload_url = None
                         if _efile_id:
-                            _file_answer += f"\n\n[📥 Download {_efmt.upper()} file](/gbaiapi/download/{_efile_id})"
+                            _edownload_url = f"{BASE_URL}/gbaiapi/download/{_efile_id}"
+                            _file_answer += f"\n\n📥 Download {_efmt.upper()}: {_edownload_url}"
                 await asyncio.to_thread(update_enhanced_memory, username, question, _file_answer, "file_intelligence", user_role, thread_id)
-                return {"response": _file_answer, "bot_type": "file_intelligence", "thread_id": thread_id, "user_role": user_role}
+                return {"response": _file_answer, "bot_type": "file_intelligence", "thread_id": thread_id, "user_role": user_role, "download_url": _edownload_url}
         # ── End File Intelligence ─────────────────────────────────────────────
 
         logger.info("📚 Building conversational context...")
@@ -2353,6 +2355,7 @@ For example: "Name: John, Role: developer" """
         answer = _fmt_response(question, answer)
 
         # ── Export check: user asked for a downloadable file ──────────────────
+        _download_url = None
         if EXPORT_ENGINE_AVAILABLE:
             _export_fmt = export_engine.detect_export_format(question)
             if _export_fmt:
@@ -2363,7 +2366,8 @@ For example: "Name: John, Role: developer" """
                     export_engine.build_export, _export_fmt, answer, _export_df, _export_hint
                 )
                 if _export_id:
-                    answer += f"\n\n[📥 Download {_export_fmt.upper()} file](/gbaiapi/download/{_export_id})"
+                    _download_url = f"{BASE_URL}/gbaiapi/download/{_export_id}"
+                    answer += f"\n\n📥 Download {_export_fmt.upper()}: {_download_url}"
                     logger.info(f"[ExportEngine] Built {_export_fmt} export → {_export_id}")
         # ── End export check ──────────────────────────────────────────────────
 
@@ -2373,12 +2377,12 @@ For example: "Name: John, Role: developer" """
             username, question, answer, bot_type, user_role, thread_id
         )
 
-        # Generate ChatGPT-style title for the first message of a new thread
+        # Generate ChatGPT-style title synchronously on first message so
+        # the sidebar shows the correct title as soon as the response arrives
         if thread_id and thread_id in history_manager.threads:
-            thread = history_manager.threads[thread_id]
-            if len(thread.messages) == 1:
-                asyncio.create_task(_generate_thread_title(thread_id, question))
-        
+            if len(history_manager.threads[thread_id].messages) == 1:
+                await _generate_thread_title(thread_id, question)
+
         elapsed = time.time() - start_time
         logger.info("="*80)
         logger.info(f"✅ REQUEST COMPLETED in {elapsed:.2f}s")
@@ -2386,12 +2390,13 @@ For example: "Name: John, Role: developer" """
         logger.info(f"📏 Response Length: {len(answer)} chars")
         logger.info(f"👤 User Role: {user_role}")
         logger.info("="*80)
-        
+
         return {
             "response": answer,
             "bot_type": bot_type,
             "thread_id": thread_id,
-            "user_role": user_role
+            "user_role": user_role,
+            "download_url": _download_url
         }
 
 # Initialize as None - will be loaded at startup
@@ -2569,9 +2574,9 @@ def update_enhanced_memory(username: str, question: str, answer: str, bot_type: 
 
 async def _generate_thread_title(thread_id: str, user_message: str):
     """
-    Generate a ChatGPT-style short title for a new conversation using the LLM.
-    Runs as a fire-and-forget background task — never blocks the response.
-    Falls back silently if the LLM fails.
+    Generate a ChatGPT-style short title using the LLM synchronously before
+    the response is returned, so the sidebar shows the correct title immediately.
+    Falls back silently to the truncated message if the LLM fails.
     """
     try:
         prompt = (
@@ -2580,18 +2585,22 @@ async def _generate_thread_title(thread_id: str, user_message: str):
             f"User message: {user_message[:300]}"
         )
         raw = await asyncio.wait_for(
-            ai_resources.routing_llm.ainvoke(prompt),
+            asyncio.to_thread(ai_resources.routing_llm.invoke, prompt),
             timeout=15.0
         )
         title = str(raw).strip().strip('"\'').strip()
-        # Sanitize: remove newlines, truncate
         title = title.splitlines()[0].strip()
         title = (title[:57] + "...") if len(title) > 60 else title
         if title:
             await asyncio.to_thread(history_manager.update_title, thread_id, title)
             logger.info(f"[TitleGen] Thread {thread_id} titled: '{title}'")
+        else:
+            raise ValueError("Empty title returned")
     except Exception as e:
-        logger.warning(f"[TitleGen] Could not generate title for {thread_id}: {e}")
+        logger.warning(f"[TitleGen] Falling back to truncated title for {thread_id}: {e}")
+        # Fallback: truncate the user message as title
+        fallback = (user_message[:47] + "...") if len(user_message) > 50 else user_message.capitalize()
+        await asyncio.to_thread(history_manager.update_title, thread_id, fallback)
 
 # ===========================
 # FASTAPI APP INITIALIZATION
