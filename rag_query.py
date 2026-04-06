@@ -9,6 +9,7 @@ to disk. This module loads it lazily on the first search() call.
 """
 
 import os
+import hashlib
 import logging
 
 logger = logging.getLogger(__name__)
@@ -17,6 +18,27 @@ DATA_DIR   = "/app/data"
 FAISS_PATH = os.path.join(DATA_DIR, "general_faiss")
 
 _vectorstore = None
+
+
+def _save_index_hash(index_dir: str) -> None:
+    """Compute SHA-256 of the FAISS index file and write it alongside."""
+    index_file = os.path.join(index_dir, "index.faiss")
+    if not os.path.exists(index_file):
+        return
+    sha = hashlib.sha256(open(index_file, "rb").read()).hexdigest()
+    with open(os.path.join(index_dir, "index.sha256"), "w") as f:
+        f.write(sha)
+
+
+def _verify_index_hash(index_dir: str) -> bool:
+    """Return True only if the stored hash matches the current index file."""
+    index_file = os.path.join(index_dir, "index.faiss")
+    sig_file   = os.path.join(index_dir, "index.sha256")
+    if not os.path.exists(index_file) or not os.path.exists(sig_file):
+        return False
+    current = hashlib.sha256(open(index_file, "rb").read()).hexdigest()
+    stored  = open(sig_file).read().strip()
+    return current == stored
 
 
 def _get_vectorstore():
@@ -35,6 +57,9 @@ def _get_vectorstore():
     try:
         from langchain_community.vectorstores import FAISS
         from shared_resources import ai_resources
+        if not _verify_index_hash(FAISS_PATH):
+            logger.error("RAG: FAISS index integrity check failed — refusing to load potentially tampered file.")
+            return None
         _vectorstore = FAISS.load_local(
             FAISS_PATH,
             ai_resources.embeddings,

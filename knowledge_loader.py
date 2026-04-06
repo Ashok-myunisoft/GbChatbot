@@ -7,6 +7,7 @@ Runs once at FastAPI startup.
 """
 
 import os
+import hashlib
 import logging
 import duckdb
 import pandas as pd
@@ -116,10 +117,16 @@ def _load_rag(embeddings) -> None:
         logger.warning("No .txt/.json documents found — FAISS store not built.")
         return
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    splitter = RecursiveCharacterTextSplitter(chunk_size=600, chunk_overlap=120)
     chunks   = splitter.split_documents(all_docs)
     vs       = FAISS.from_documents(chunks, embeddings)
     vs.save_local(FAISS_PATH)
+    # Write integrity hash so rag_query.py can verify before loading
+    index_file = os.path.join(FAISS_PATH, "index.faiss")
+    if os.path.exists(index_file):
+        sha = hashlib.sha256(open(index_file, "rb").read()).hexdigest()
+        with open(os.path.join(FAISS_PATH, "index.sha256"), "w") as f:
+            f.write(sha)
     logger.info(
         f"FAISS: built from {len(all_docs)} docs "
         f"({len(chunks)} chunks), saved to '{FAISS_PATH}'"

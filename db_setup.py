@@ -52,6 +52,7 @@ def create_tables():
     conn = get_pg_conn()
     try:
         with conn.cursor() as cur:
+            cur.execute("SET LOCAL statement_timeout = '15s'")
 
             # ------------------------------------------------------------------
             # Table 1: conversation_threads
@@ -93,7 +94,7 @@ def create_tables():
                     username     TEXT NOT NULL,
                     user_role    TEXT,
                     bot_type     TEXT,
-                    thread_id    TEXT,
+                    thread_id    TEXT REFERENCES conversation_threads(thread_id) ON DELETE CASCADE,
                     content      TEXT NOT NULL,
                     user_message TEXT,
                     bot_response TEXT,

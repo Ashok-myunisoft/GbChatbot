@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import logging
@@ -133,6 +134,13 @@ class ConversationalMemory:
         """Load existing FAISS memory vectorstore or create a new empty one."""
         try:
             if os.path.exists(self.vectorstore_path):
+                index_file = os.path.join(self.vectorstore_path, "index.faiss")
+                sig_file   = os.path.join(self.vectorstore_path, "index.sha256")
+                if os.path.exists(sig_file) and os.path.exists(index_file):
+                    current = hashlib.sha256(open(index_file, "rb").read()).hexdigest()
+                    if current != open(sig_file).read().strip():
+                        logger.error("report_bot: FAISS integrity check failed — skipping load.")
+                        raise ValueError("integrity check failed")
                 self.memory_vectorstore = FAISS.load_local(
                     self.vectorstore_path,
                     self.embeddings,

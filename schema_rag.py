@@ -9,6 +9,7 @@ Safe by design:
   - search_schema() returns [] on any failure
   - get_schema_tool() falls back to existing keyword logic when [] is returned
 """
+import hashlib
 import json
 import logging
 import os
@@ -103,6 +104,13 @@ def build_or_load_index() -> None:
                 with open(_META_FILE) as f:
                     meta = json.load(f)
                 if meta.get("table_count") == current_count:
+                    sig_file   = os.path.join(_CACHE_DIR, "index.sha256")
+                    index_file = os.path.join(_CACHE_DIR, "index.faiss")
+                    if os.path.exists(sig_file) and os.path.exists(index_file):
+                        current_sha = hashlib.sha256(open(index_file, "rb").read()).hexdigest()
+                        if current_sha != open(sig_file).read().strip():
+                            logger.error("Schema RAG: index integrity check failed — rebuilding.")
+                            raise ValueError("integrity")
                     loaded = FAISS.load_local(
                         _CACHE_DIR,
                         ai_resources.embeddings,
@@ -128,6 +136,11 @@ def build_or_load_index() -> None:
         # ── Save to disk ───────────────────────────────────────────────────────
         os.makedirs(_CACHE_DIR, exist_ok=True)
         new_index.save_local(_CACHE_DIR)
+        index_file = os.path.join(_CACHE_DIR, "index.faiss")
+        if os.path.exists(index_file):
+            sha = hashlib.sha256(open(index_file, "rb").read()).hexdigest()
+            with open(os.path.join(_CACHE_DIR, "index.sha256"), "w") as fh:
+                fh.write(sha)
         with open(_META_FILE, "w") as f:
             json.dump({"table_count": current_count}, f)
 

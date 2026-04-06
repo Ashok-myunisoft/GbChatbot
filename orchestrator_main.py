@@ -219,26 +219,27 @@ _USER_SESSION_TTL = 86400   # 24 hours
 # Prevents a single user from burning RunPod credits.
 # ===========================
 _rate_store: Dict[str, List[float]] = {}
+_rate_lock   = threading.Lock()
 _RATE_MAX    = int(os.getenv("RATE_LIMIT_MAX",    "30"))   # requests
 _RATE_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))   # seconds
 BASE_URL     = os.getenv("BASE_URL", "").rstrip("/")        # e.g. http://183.82.250.223:92
 
 def _is_rate_limited(username: str) -> bool:
-    now = time.time()
-    if username not in _rate_store:
-        _rate_store[username] = []
-    # drop timestamps outside the window
-    _rate_store[username] = [t for t in _rate_store[username] if now - t < _RATE_WINDOW]
-    if len(_rate_store[username]) >= _RATE_MAX:
-        return True
-    _rate_store[username].append(now)
-    # Evict users with no recent requests to prevent unbounded dict growth
-    if len(_rate_store) > 1000:
-        _rate_store.update({u: ts for u, ts in _rate_store.items() if ts})
-        dead = [u for u, ts in _rate_store.items() if not ts]
-        for u in dead:
-            del _rate_store[u]
-    return False
+    with _rate_lock:
+        now = time.time()
+        if username not in _rate_store:
+            _rate_store[username] = []
+        # drop timestamps outside the window
+        _rate_store[username] = [t for t in _rate_store[username] if now - t < _RATE_WINDOW]
+        if len(_rate_store[username]) >= _RATE_MAX:
+            return True
+        _rate_store[username].append(now)
+        # Evict users with no recent requests to prevent unbounded dict growth
+        if len(_rate_store) > 1000:
+            dead = [u for u, ts in _rate_store.items() if not ts]
+            for u in dead:
+                del _rate_store[u]
+        return False
 
 # ===========================
 # PERFORMANCE MONITORING MIDDLEWARE
@@ -601,8 +602,8 @@ class ConversationHistoryManager:
 
     def _upsert_thread(self, thread: 'ConversationThread'):
         """Upsert a single thread to PostgreSQL."""
+        conn = get_pg_conn()
         try:
-            conn = get_pg_conn()
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO conversation_threads
@@ -628,9 +629,11 @@ class ConversationHistoryManager:
                     thread.user_name,
                 ))
             conn.commit()
-            release_pg_conn(conn)
         except Exception as e:
+            conn.rollback()
             logger.error(f"Error upserting thread {thread.thread_id}: {e}")
+        finally:
+            release_pg_conn(conn)
 
     def save_threads(self):
         """Batch-upsert all in-memory threads in a single DB round-trip."""
@@ -814,7 +817,11 @@ class EnhancedConversationalMemory:
                 self.memory_vectorstore = FAISS.from_documents([dummy_doc], self.embeddings)
                 logger.info("✅ Created fresh FAISS memory vectorstore.")
         except Exception as e:
-            logger.error(f"Error loading memory from PostgreSQL, creating new one: {e}")
+            logger.error(
+                f"CRITICAL: Failed to load conversation memory from PostgreSQL — "
+                f"all prior user context is unavailable this session: {e}",
+                exc_info=True
+            )
             dummy_doc = Document(page_content="Memory system initialized", metadata={"memory_id": "init"})
             self.memory_vectorstore = FAISS.from_documents([dummy_doc], self.embeddings)
 
@@ -897,7 +904,7 @@ class EnhancedConversationalMemory:
                                 hours_old = (datetime.now() - memory_time).total_seconds() / 3600
                                 if hours_old > 2:  # Skip old memories from other threads
                                     continue
-                            except:
+                            except Exception:
                                 continue  # Skip if can't parse timestamp
 
                     memory_id = doc.metadata.get("memory_id")
@@ -957,7 +964,7 @@ class EnhancedConversationalMemory:
                 score += 0.3
             elif hours_old < 168:  # 1 week
                 score += 0.1
-        except:
+        except Exception:
             pass
 
         # Query term matching bonus
@@ -988,39 +995,47 @@ class SharedContextRegistry:
 
     def __init__(self):
         self.context_store = {}  # {username: {bot_type: {context_key: context_data}}}
+        self._lock = threading.Lock()
         self.max_context_age = 3600  # 1 hour in seconds
         self.max_contexts_per_bot = 10
 
     def store_bot_context(self, username: str, bot_type: str, context_key: str, context_data: Dict):
         """Store context from a bot for potential sharing with other bots"""
-        if username not in self.context_store:
-            self.context_store[username] = {}
+        with self._lock:
+            if username not in self.context_store:
+                self.context_store[username] = {}
 
-        if bot_type not in self.context_store[username]:
-            self.context_store[username][bot_type] = {}
+            if bot_type not in self.context_store[username]:
+                self.context_store[username][bot_type] = {}
 
-        # Add timestamp for context aging
-        context_data['_timestamp'] = time.time()
-        context_data['_bot_type'] = bot_type
+            # Add timestamp for context aging
+            context_data['_timestamp'] = time.time()
+            context_data['_bot_type'] = bot_type
 
-        # Store context with key
-        self.context_store[username][bot_type][context_key] = context_data
+            # Store context with key
+            self.context_store[username][bot_type][context_key] = context_data
 
-        # Limit number of contexts per bot to prevent memory bloat
-        if len(self.context_store[username][bot_type]) > self.max_contexts_per_bot:
-            # Remove oldest context
-            oldest_key = min(
-                self.context_store[username][bot_type].keys(),
-                key=lambda k: self.context_store[username][bot_type][k]['_timestamp']
-            )
-            del self.context_store[username][bot_type][oldest_key]
+            # Limit number of contexts per bot to prevent memory bloat
+            if len(self.context_store[username][bot_type]) > self.max_contexts_per_bot:
+                # Remove oldest context
+                oldest_key = min(
+                    self.context_store[username][bot_type].keys(),
+                    key=lambda k: self.context_store[username][bot_type][k]['_timestamp']
+                )
+                del self.context_store[username][bot_type][oldest_key]
 
         logger.info(f"📚 Stored context '{context_key}' for {username}:{bot_type}")
 
     def get_relevant_contexts(self, username: str, current_bot_type: str, query: str, max_contexts: int = 3) -> List[Dict]:
         """Get relevant contexts from other bots that might help with the current query"""
-        if username not in self.context_store:
-            return []
+        with self._lock:
+            if username not in self.context_store:
+                return []
+            # Snapshot to avoid holding lock during relevance scoring
+            store_snapshot = {
+                bt: dict(ctxs)
+                for bt, ctxs in self.context_store[username].items()
+            }
 
         relevant_contexts = []
         current_time = time.time()
@@ -1037,11 +1052,11 @@ class SharedContextRegistry:
         related_bots = bot_relationships.get(current_bot_type, [])
 
         for bot_type in related_bots:
-            if bot_type not in self.context_store[username]:
+            if bot_type not in store_snapshot:
                 continue
 
             # Get contexts from related bot, sorted by recency
-            bot_contexts = self.context_store[username][bot_type]
+            bot_contexts = store_snapshot[bot_type]
             sorted_contexts = sorted(
                 bot_contexts.items(),
                 key=lambda x: x[1]['_timestamp'],
@@ -1623,6 +1638,7 @@ class AIOrchestrationAgent:
         }
         
         self.intent_cache = {}
+        self._intent_cache_lock = threading.Lock()
     
     def _understand_query(self, question: str) -> Optional[str]:
         """
@@ -1839,8 +1855,9 @@ class AIOrchestrationAgent:
             logger.info("🚀 Fast route: general")
             return "general"
         
-        if question_lower in self.intent_cache:
-            cached = self.intent_cache[question_lower]
+        with self._intent_cache_lock:
+            cached = self.intent_cache.get(question_lower)
+        if cached:
             logger.info(f"🚀 Cache hit: {cached}")
             return cached
         
@@ -1904,11 +1921,11 @@ class AIOrchestrationAgent:
                 logger.info(f"📊 Fallback analysis selected (with context): {intent}")
             
             key = question.lower().strip()
-            if len(self.intent_cache) >= 500:
-                # Evict oldest half to keep memory bounded
-                keep = list(self.intent_cache.items())[250:]
-                self.intent_cache = dict(keep)
-            self.intent_cache[key] = intent
+            with self._intent_cache_lock:
+                if len(self.intent_cache) >= 500:
+                    keep = list(self.intent_cache.items())[250:]
+                    self.intent_cache = dict(keep)
+                self.intent_cache[key] = intent
             logger.info(f"✅ Final routing decision: {intent}")
             return intent
             
@@ -2093,20 +2110,27 @@ For example: "Name: John, Role: developer" """
             greeting_response = get_greeting_response(user_role)
 
             # Skip all slow operations for greetings - do them in background
-            asyncio.create_task(
+            def _log_task_error(task: asyncio.Task):
+                exc = task.exception()
+                if exc:
+                    logger.error(f"Background memory write failed for {username}: {exc}")
+
+            t1 = asyncio.create_task(
                 asyncio.to_thread(
                     enhanced_memory.store_conversation_turn,
                     username, question, greeting_response, "greeting", user_role, thread_id
                 )
             )
+            t1.add_done_callback(_log_task_error)
 
             if thread_id:
-                asyncio.create_task(
+                t2 = asyncio.create_task(
                     asyncio.to_thread(
                         history_manager.add_message_to_thread,
                         thread_id, question, greeting_response, "greeting"
                     )
                 )
+                t2.add_done_callback(_log_task_error)
 
             # Return immediately without waiting for background tasks
             return {
@@ -2609,12 +2633,13 @@ app = FastAPI(title="GoodBooks AI-Powered Role-Based ERP Assistant - FIXED")
 
 app.add_middleware(PerformanceMonitoringMiddleware)
 
+_CORS_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_CORS_ORIGINS or ["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "Login"],
 )
 
 @app.on_event("startup")
@@ -2652,7 +2677,7 @@ async def ai_role_based_chat(message: Message, Login: str = Header(...)):
         username = login_dto.get("UserName", "anonymous")
         # ✅ FIX: Always get user_role from login_dto, not from session
         role_id = str(login_dto.get("roleid", ""))
-        user_role = ROLEID_TO_NAME.get(role_id, login_dto.get("Role", "client")).lower()
+        user_role = ROLEID_TO_NAME.get(role_id, "client").lower()
     except Exception:
         return JSONResponse(status_code=400, content={"response": "Invalid login header. Must include UserName"})
 
@@ -2808,7 +2833,7 @@ async def ai_thread_chat(request: ThreadRequest, Login: str = Header(...)):
         username = login_dto.get("UserName", "anonymous")
         # Get default role from login_dto
         role_id = str(login_dto.get("roleid", ""))
-        user_role = ROLEID_TO_NAME.get(role_id, login_dto.get("Role", "client")).lower()
+        user_role = ROLEID_TO_NAME.get(role_id, "client").lower()
     except Exception:
         return JSONResponse(status_code=400, content={"response": "Invalid login header"})
 
@@ -2941,8 +2966,8 @@ async def get_conversation_threads(Login: str = Header(...), limit: int = 50):
         
         # ✅ Map roleid to role name if present, otherwise fallback to "Role"
         role_id = str(login_dto.get("roleid", ""))
-        user_role = ROLEID_TO_NAME.get(role_id, login_dto.get("Role", "client")).lower()
-    except:
+        user_role = ROLEID_TO_NAME.get(role_id, "client").lower()
+    except Exception:
         return JSONResponse(status_code=400, content={"response": "Invalid login header"})
     
     threads = history_manager.get_user_threads(username, limit)
@@ -2962,7 +2987,7 @@ async def get_thread_details(thread_id: str, Login: str = Header(...)):
     try:
         login_dto = json.loads(Login)
         username = login_dto.get("UserName", "anonymous")
-    except:
+    except Exception:
         return JSONResponse(status_code=400, content={"response": "Invalid login header"})
     
     thread = history_manager.get_thread(thread_id)
@@ -2978,7 +3003,7 @@ async def delete_thread(thread_id: str, Login: str = Header(...)):
     try:
         login_dto = json.loads(Login)
         username = login_dto.get("UserName", "anonymous")
-    except:
+    except Exception:
         return JSONResponse(status_code=400, content={"response": "Invalid login header"})
     
     success = history_manager.delete_thread(thread_id, username)
@@ -2994,7 +3019,7 @@ async def rename_thread(thread_id: str, request: ThreadRenameRequest, Login: str
     try:
         login_dto = json.loads(Login)
         username = login_dto.get("UserName", "anonymous")
-    except:
+    except Exception:
         return JSONResponse(status_code=400, content={"response": "Invalid login header"})
     
     success = history_manager.rename_thread(thread_id, username, request.new_title)
@@ -3116,8 +3141,8 @@ async def get_user_statistics(Login: str = Header(...)):
         
         # ✅ Map roleid to role name if present, otherwise fallback to "Role"
         role_id = str(login_dto.get("roleid", ""))
-        user_role = ROLEID_TO_NAME.get(role_id, login_dto.get("Role", "client")).lower()
-    except:
+        user_role = ROLEID_TO_NAME.get(role_id, "client").lower()
+    except Exception:
         return JSONResponse(status_code=400, content={"response": "Invalid login header"})
     
     session_info = user_sessions.get(username, {})
@@ -3143,7 +3168,7 @@ async def get_user_statistics(Login: str = Header(...)):
                 recent_activity["this_week"] += 1
             if time_diff.days <= 30:
                 recent_activity["this_month"] += 1
-        except:
+        except Exception:
             continue
     
     return {
@@ -3167,11 +3192,11 @@ async def cleanup_old_data(Login: str = Header(...), days_to_keep: int = 90):
         
         # ✅ Map roleid to role name if present, otherwise fallback to "Role"
         role_id = str(login_dto.get("roleid", ""))
-        user_role = ROLEID_TO_NAME.get(role_id, login_dto.get("Role", "client")).lower()
+        user_role = ROLEID_TO_NAME.get(role_id, "client").lower()
         
         if user_role != "admin":
             return JSONResponse(status_code=403, content={"response": "Admin access required"})
-    except:
+    except Exception:
         return JSONResponse(status_code=400, content={"response": "Invalid login header"})
     
     try:
@@ -3225,8 +3250,8 @@ async def test_bot(bot_name: str, question: str = "What is GoodBooks?", Login: s
         
         # ✅ Map roleid to role name if present, otherwise fallback to "Role"
         role_id = str(login_dto.get("roleid", ""))
-        user_role = ROLEID_TO_NAME.get(role_id, login_dto.get("Role", "client")).lower()
-    except:
+        user_role = ROLEID_TO_NAME.get(role_id, "client").lower()
+    except Exception:
         return JSONResponse(status_code=400, content={"response": "Invalid login header"})
     
     if bot_name not in ai_orchestrator.bots:

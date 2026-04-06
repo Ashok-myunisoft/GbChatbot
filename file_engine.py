@@ -35,7 +35,22 @@ MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 _store: dict = {}
 _lock  = threading.Lock()
 
-_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=100)
+_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=100)
+
+
+def _evict_expired() -> None:
+    """Background thread: remove expired file sessions every 5 minutes."""
+    while True:
+        time.sleep(300)
+        with _lock:
+            now = time.time()
+            expired = [u for u, e in _store.items() if now - e["ts"] > FILE_TTL]
+            for u in expired:
+                del _store[u]
+                logger.info(f"[FileEngine] Evicted expired session for {u}")
+
+
+threading.Thread(target=_evict_expired, daemon=True, name="file-engine-evict").start()
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
