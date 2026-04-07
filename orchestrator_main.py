@@ -2146,7 +2146,23 @@ For example: "Name: John, Role: developer" """
             file_context = await asyncio.to_thread(file_engine.search, username, question)
             if file_context and len(file_context.strip()) >= 20:
                 logger.info(f"[FileEngine] Answering from user file for {username}")
-                _file_answer = file_context
+                _edownload_url = None
+                # Pass file context through LLM to generate a proper answer
+                _file_prompt = (
+                    f"You are a helpful assistant. Use the following file content to answer the user's question.\n\n"
+                    f"File Content:\n{file_context}\n\n"
+                    f"User Question: {question}\n\n"
+                    f"Answer based only on the file content above:"
+                )
+                try:
+                    _llm_resp = await asyncio.wait_for(
+                        self.response_llm.ainvoke(_file_prompt),
+                        timeout=70.0
+                    )
+                    _file_answer = (_llm_resp.content if hasattr(_llm_resp, 'content') else str(_llm_resp)).strip()
+                except Exception as _fe:
+                    logger.warning(f"[FileEngine] LLM call failed, falling back to raw context: {_fe}")
+                    _file_answer = file_context
                 # Export check on file-sourced answer
                 if EXPORT_ENGINE_AVAILABLE:
                     _efmt = export_engine.detect_export_format(question)
@@ -3350,7 +3366,34 @@ async def upload_file(file: UploadFile = File(...), Login: str = Header(...)):
         file_engine.process, username, filename, content, ai_resources.embeddings
     )
     logger.info(f"[Upload] {username} → '{filename}': {status_msg[:80]}")
-    return {"response": status_msg, "filename": filename}
+
+    # Auto-summarize after successful indexing
+    summary = status_msg
+    if "uploaded successfully" in status_msg:
+        try:
+            full_text = file_engine.get_full_text(username)
+            if full_text:
+                _summary_prompt = (
+                    f"You have been given the content of a file named **{filename}**.\n\n"
+                    f"File Content:\n{full_text[:6000]}\n\n"
+                    f"Please provide a clear and concise summary of this file. "
+                    f"Mention the key topics, data, or sections it contains."
+                )
+                _summary_response = await asyncio.wait_for(
+                    ai_resources.response_llm.ainvoke(_summary_prompt),
+                    timeout=70.0
+                )
+                _summary_text = (_summary_response.content if hasattr(_summary_response, 'content') else str(_summary_response)).strip()
+                summary = (
+                    f"File **{filename}** uploaded and analyzed successfully.\n\n"
+                    f"**Summary:**\n{_summary_text}\n\n"
+                    f"You can now ask me any questions about this file."
+                )
+                logger.info(f"[Upload] Summary generated for {username} → '{filename}'")
+        except Exception as _se:
+            logger.warning(f"[Upload] Summary generation failed, returning default message: {_se}")
+
+    return {"response": summary, "filename": filename}
 
 
 @app.get("/gbaiapi/download/{file_id}", tags=["Export"])

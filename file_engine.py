@@ -109,14 +109,16 @@ def process(username: str, filename: str, content: bytes, embeddings) -> str:
 
         chunks = _splitter.split_documents(docs)
         index  = FAISS.from_documents(chunks, embeddings)
+        full_text = "\n\n".join(d.page_content for d in docs)
 
         with _lock:
             _store[username] = {
-                "index":    index,
-                "filename": filename,
-                "df":       df,
-                "ts":       time.time(),
-                "chunks":   len(chunks),
+                "index":     index,
+                "filename":  filename,
+                "df":        df,
+                "ts":        time.time(),
+                "chunks":    len(chunks),
+                "full_text": full_text,
             }
 
         logger.info(f"[FileEngine] {username} → '{filename}' ({len(chunks)} chunks indexed)")
@@ -184,6 +186,13 @@ def get_filename(username: str) -> Optional[str]:
     with _lock:
         entry = _store.get(username)
         return entry["filename"] if entry else None
+
+
+def get_full_text(username: str) -> Optional[str]:
+    """Return full parsed text of the uploaded file (for summarization)."""
+    with _lock:
+        entry = _store.get(username)
+        return entry.get("full_text") if entry else None
 
 
 def clear(username: str):
