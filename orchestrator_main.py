@@ -26,6 +26,7 @@ from db_setup import get_pg_conn, release_pg_conn, create_tables
 from shared_resources import ai_resources
 from response_formatter import format_response as _fmt_response
 import knowledge_loader
+import voice_engine
 
 # Import bot modules
 try:
@@ -3344,6 +3345,85 @@ async def clear_intent_cache():
         "previous_cache_size": cache_size,
         "current_cache_size": len(ai_orchestrator.intent_cache)
     }
+
+@app.post("/gbaiapi/voice_chat", tags=["Voice AI"])
+async def voice_chat(request: Request, Login: str = Header(...)):
+    """
+    Real-time multilingual voice AI endpoint.
+    - Detects language of input automatically
+    - Translates to English → processes via existing orchestrator → translates back
+    - Streams response sentence-by-sentence via Server-Sent Events (SSE)
+    - Uses existing RunPod LLM — zero extra cost
+    """
+    try:
+        login_dto = json.loads(Login)
+        username  = login_dto.get("UserName", "anonymous")
+        role_id   = str(login_dto.get("roleid", ""))
+        user_role = ROLEID_TO_NAME.get(role_id, "client").lower()
+    except Exception:
+        return JSONResponse(status_code=400, content={"response": "Invalid login header."})
+
+    try:
+        body       = await request.json()
+        user_input = (body.get("message") or body.get("content") or "").strip()
+        language   = (body.get("language") or "").strip().lower()  # optional override
+        thread_id  = body.get("thread_id")
+    except Exception:
+        return JSONResponse(status_code=400, content={"response": "Invalid request body. Expected JSON with 'message' field."})
+
+    if not user_input:
+        return JSONResponse(status_code=400, content={"response": "Please provide a message."})
+
+    if _is_rate_limited(username):
+        return JSONResponse(status_code=429, content={"response": "Too many requests. Please wait a moment."})
+
+    # ── Language detection & translation to English ───────────────────────────
+    detected_lang = language if language else voice_engine.detect_language(user_input)
+    english_input = voice_engine.translate_to_english(user_input, detected_lang)
+    logger.info(f"[Voice] {username} | lang={detected_lang} | input: {user_input[:60]}")
+
+    # ── Process via existing orchestrator (same as /chat and /thread_chat) ────
+    _thread_obj = await asyncio.to_thread(history_manager.get_thread, thread_id) if thread_id else None
+    is_existing = bool(thread_id and _thread_obj)
+    if not thread_id:
+        thread_id = await asyncio.to_thread(history_manager.create_new_thread, username, english_input)
+
+    try:
+        result = await ai_orchestrator.process_request(
+            username, user_role, english_input, thread_id, is_existing_thread=is_existing
+        )
+    except Exception as e:
+        logger.error(f"[Voice] Orchestrator error: {e}")
+        return JSONResponse(status_code=500, content={"response": "An error occurred. Please try again."})
+
+    raw_response = result.get("response", "")
+    bot_type     = result.get("bot_type", "general")
+
+    # ── Voice post-processing ─────────────────────────────────────────────────
+    voice_text    = voice_engine.prepare_response_for_voice(raw_response)
+    final_text    = voice_engine.translate_from_english(voice_text, detected_lang)
+    sentences     = voice_engine.split_into_sentences(final_text)
+
+    # ── Stream sentences via SSE ──────────────────────────────────────────────
+    async def sentence_stream():
+        # Send metadata first as a comment
+        yield f"data: {json.dumps({'type': 'meta', 'thread_id': thread_id, 'bot_type': bot_type, 'language': detected_lang})}\n\n"
+        for sentence in sentences:
+            if sentence.strip():
+                yield f"data: {json.dumps({'type': 'sentence', 'text': sentence})}\n\n"
+                await asyncio.sleep(0.05)   # small delay for natural pacing
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    return StreamingResponse(
+        sentence_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control":               "no-cache",
+            "X-Accel-Buffering":           "no",
+            "Access-Control-Allow-Origin": "*",
+        }
+    )
+
 
 @app.post("/gbaiapi/upload", tags=["File Intelligence"])
 async def upload_file(file: UploadFile = File(...), Login: str = Header(...)):
