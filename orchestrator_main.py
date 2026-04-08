@@ -27,6 +27,7 @@ from shared_resources import ai_resources
 from response_formatter import format_response as _fmt_response
 import knowledge_loader
 import voice_engine
+import formatter_agent
 
 # Import bot modules
 try:
@@ -2307,10 +2308,11 @@ For example: "Name: John, Role: developer" """
                     if answer and len(answer.strip()) >= 10:
                         answer = _extract_clean_response(answer)
                         answer = _fmt_response(question, answer)
+                        _formatted = formatter_agent.format(question, answer)
                         await asyncio.to_thread(update_enhanced_memory, username, question, answer, bot_type, user_role, thread_id)
                         elapsed = time.time() - start_time
                         logger.info(f"✅ Follow-up completed in {elapsed:.2f}s")
-                        return {"response": answer, "bot_type": bot_type, "thread_id": thread_id, "user_role": user_role}
+                        return {"response": answer, "formatted": _formatted, "bot_type": bot_type, "thread_id": thread_id, "user_role": user_role}
         # ── End follow-up detection ───────────────────────────────────────────
 
         logger.info("🎯 Detecting intent...")
@@ -2395,6 +2397,7 @@ For example: "Name: John, Role: developer" """
         # Format response — converts DB record blocks / numbered lists to clean markdown
         # Zero latency: pure Python, no LLM call
         answer = _fmt_response(question, answer)
+        _formatted = formatter_agent.format(question, answer)
 
         # ── Export check: user asked for a downloadable file ──────────────────
         _download_url = None
@@ -2435,6 +2438,7 @@ For example: "Name: John, Role: developer" """
 
         return {
             "response": answer,
+            "formatted": _formatted,
             "bot_type": bot_type,
             "thread_id": thread_id,
             "user_role": user_role,
