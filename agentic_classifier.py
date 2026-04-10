@@ -27,7 +27,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # ── External agentic chatbot API ──────────────────────────────────────────────
-_CHAT_INTERFACE_URL = "http://217.217.249.121:8000/gbaiapi/chat_interface"
+_CHAT_INTERFACE_URL = "http://217.217.249.121:8000/gbaiapi/chat_Interface"
 _API_TIMEOUT        = 30.0   # seconds — prevents blocking the main thread
 
 
