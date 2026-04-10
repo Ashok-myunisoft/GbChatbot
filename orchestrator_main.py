@@ -28,6 +28,7 @@ from response_formatter import format_response as _fmt_response
 import knowledge_loader
 import voice_engine
 import formatter_agent
+import agentic_classifier
 
 # Import bot modules
 try:
@@ -2066,10 +2067,12 @@ Rewritten Answer:"""
                     logger.info(f"🎭 User set role to: {user_role}, name: {user_name} for thread {thread_id}")
                     confirmation = f"Hello {user_name if user_name else username}! I've set your role to {user_role}. How can I help you with GoodBooks ERP today?"
                     return {
-                        "response": confirmation,
-                        "bot_type": "role_setup",
-                        "thread_id": thread_id,
-                        "user_role": user_role
+                        "response":     confirmation,
+                        "formatted":    await asyncio.to_thread(formatter_agent.format, question, confirmation),
+                        "bot_type":     "role_setup",
+                        "thread_id":    thread_id,
+                        "user_role":    user_role,
+                        "download_url": None
                     }
                 else:
                     # Ask for name and role ONLY for new threads
@@ -2082,10 +2085,12 @@ Available roles: developer, implementation, marketing, client, admin, system adm
 For example: "Name: John, Role: developer" """
 
                     return {
-                        "response": prompt,
-                        "bot_type": "role_prompt",
-                        "thread_id": thread_id,
-                        "user_role": "client"  # Default until set
+                        "response":     prompt,
+                        "formatted":    await asyncio.to_thread(formatter_agent.format, question, prompt),
+                        "bot_type":     "role_prompt",
+                        "thread_id":    thread_id,
+                        "user_role":    "client",
+                        "download_url": None
                     }
 
         # For existing threads, use the stored role or fallback to provided role
@@ -2137,10 +2142,12 @@ For example: "Name: John, Role: developer" """
 
             # Return immediately without waiting for background tasks
             return {
-                "response": greeting_response,
-                "bot_type": "greeting",
-                "thread_id": thread_id,
-                "user_role": user_role
+                "response":     greeting_response,
+                "formatted":    await asyncio.to_thread(formatter_agent.format, question, greeting_response),
+                "bot_type":     "greeting",
+                "thread_id":    thread_id,
+                "user_role":    user_role,
+                "download_url": None
             }
         
         # ── File Intelligence: answer from uploaded file first ────────────────
@@ -2179,8 +2186,39 @@ For example: "Name: John, Role: developer" """
                             _edownload_url = f"{BASE_URL}/gbaiapi/download/{_efile_id}"
                             _file_answer += f"\n\n📥 Download {_efmt.upper()}: {_edownload_url}"
                 await asyncio.to_thread(update_enhanced_memory, username, question, _file_answer, "file_intelligence", user_role, thread_id)
-                return {"response": _file_answer, "bot_type": "file_intelligence", "thread_id": thread_id, "user_role": user_role, "download_url": _edownload_url}
+                return {
+                    "response":     _file_answer,
+                    "formatted":    await asyncio.to_thread(formatter_agent.format, question, _file_answer),
+                    "bot_type":     "file_intelligence",
+                    "thread_id":    thread_id,
+                    "user_role":    user_role,
+                    "download_url": _edownload_url
+                }
         # ── End File Intelligence ─────────────────────────────────────────────
+
+        # ── Agentic Classifier: personal + action intents → Chat Interface API ─
+        _agentic_intent = await asyncio.to_thread(agentic_classifier.classify, question)
+        if _agentic_intent in ("personal", "action"):
+            _agentic_response = await asyncio.to_thread(
+                agentic_classifier.call_chat_interface, question, username
+            )
+            if _agentic_response:
+                await asyncio.to_thread(
+                    update_enhanced_memory,
+                    username, question, _agentic_response, _agentic_intent, user_role, thread_id
+                )
+                logger.info(f"[AgenticClassifier] Returning API response for intent={_agentic_intent}")
+                return {
+                    "response":  _agentic_response,
+                    "formatted": await asyncio.to_thread(formatter_agent.format, question, _agentic_response),
+                    "bot_type":  _agentic_intent,
+                    "thread_id": thread_id,
+                    "user_role": user_role,
+                    "download_url": None
+                }
+            # API failed → log and fall through to existing bots
+            logger.warning(f"[AgenticClassifier] API unavailable for intent={_agentic_intent} — falling back to existing bots")
+        # ── End Agentic Classifier ────────────────────────────────────────────
 
         logger.info("📚 Building conversational context...")
         if is_existing_thread and thread_id:
@@ -2308,11 +2346,18 @@ For example: "Name: John, Role: developer" """
                     if answer and len(answer.strip()) >= 10:
                         answer = _extract_clean_response(answer)
                         answer = _fmt_response(question, answer)
-                        _formatted = formatter_agent.format(question, answer)
+                        _formatted = await asyncio.to_thread(formatter_agent.format, question, answer)
                         await asyncio.to_thread(update_enhanced_memory, username, question, answer, bot_type, user_role, thread_id)
                         elapsed = time.time() - start_time
                         logger.info(f"✅ Follow-up completed in {elapsed:.2f}s")
-                        return {"response": answer, "formatted": _formatted, "bot_type": bot_type, "thread_id": thread_id, "user_role": user_role}
+                        return {
+                            "response":     answer,
+                            "formatted":    _formatted,
+                            "bot_type":     bot_type,
+                            "thread_id":    thread_id,
+                            "user_role":    user_role,
+                            "download_url": None
+                        }
         # ── End follow-up detection ───────────────────────────────────────────
 
         logger.info("🎯 Detecting intent...")
@@ -2397,7 +2442,7 @@ For example: "Name: John, Role: developer" """
         # Format response — converts DB record blocks / numbered lists to clean markdown
         # Zero latency: pure Python, no LLM call
         answer = _fmt_response(question, answer)
-        _formatted = formatter_agent.format(question, answer)
+        _formatted = await asyncio.to_thread(formatter_agent.format, question, answer)
 
         # ── Export check: user asked for a downloadable file ──────────────────
         _download_url = None
