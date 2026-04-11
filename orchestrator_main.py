@@ -2197,27 +2197,52 @@ For example: "Name: John, Role: developer" """
         # ── End File Intelligence ─────────────────────────────────────────────
 
         # ── Agentic Classifier: personal + action intents → Chat Interface API ─
-        _agentic_intent = await asyncio.to_thread(agentic_classifier.classify, question)
-        if _agentic_intent in ("personal", "action"):
+        # Check FIRST: is user already mid-session (slot-filling in progress)?
+        _in_session = await asyncio.to_thread(agentic_classifier.is_in_session, username)
+        if _in_session:
+            # Route ALL messages directly to API — bypass classifier
             _agentic_response = await asyncio.to_thread(
                 agentic_classifier.call_chat_interface, question, username
             )
             if _agentic_response:
                 await asyncio.to_thread(
                     update_enhanced_memory,
-                    username, question, _agentic_response, _agentic_intent, user_role, thread_id
+                    username, question, _agentic_response, "session", user_role, thread_id
                 )
-                logger.info(f"[AgenticClassifier] Returning API response for intent={_agentic_intent}")
+                logger.info(f"[AgenticClassifier] Slot-filling session active — returning API response for {username}")
                 return {
                     "response":  _agentic_response,
                     "formatted": await asyncio.to_thread(formatter_agent.format, question, _agentic_response),
-                    "bot_type":  _agentic_intent,
+                    "bot_type":  "action",
                     "thread_id": thread_id,
                     "user_role": user_role,
                     "download_url": None
                 }
-            # API failed → log and fall through to existing bots
-            logger.warning(f"[AgenticClassifier] API unavailable for intent={_agentic_intent} — falling back to existing bots")
+            # Session API failed → fall through to existing bots
+            logger.warning(f"[AgenticClassifier] Session API failed for {username} — falling back to existing bots")
+        else:
+            # No active session — classify the intent fresh
+            _agentic_intent = await asyncio.to_thread(agentic_classifier.classify, question)
+            if _agentic_intent in ("personal", "action"):
+                _agentic_response = await asyncio.to_thread(
+                    agentic_classifier.call_chat_interface, question, username
+                )
+                if _agentic_response:
+                    await asyncio.to_thread(
+                        update_enhanced_memory,
+                        username, question, _agentic_response, _agentic_intent, user_role, thread_id
+                    )
+                    logger.info(f"[AgenticClassifier] Returning API response for intent={_agentic_intent}")
+                    return {
+                        "response":  _agentic_response,
+                        "formatted": await asyncio.to_thread(formatter_agent.format, question, _agentic_response),
+                        "bot_type":  _agentic_intent,
+                        "thread_id": thread_id,
+                        "user_role": user_role,
+                        "download_url": None
+                    }
+                # API failed → log and fall through to existing bots
+                logger.warning(f"[AgenticClassifier] API unavailable for intent={_agentic_intent} — falling back to existing bots")
         # ── End Agentic Classifier ────────────────────────────────────────────
 
         logger.info("📚 Building conversational context...")

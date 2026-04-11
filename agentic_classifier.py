@@ -1,26 +1,30 @@
 """
 agentic_classifier.py
 
-Intent classifier + API wrapper for the external agentic chatbot.
+Intent classifier + session tracker + API wrapper for the external agentic chatbot.
 
 Responsibilities:
-  1. classify(question) → "personal" | "action" | "general"
-  2. call_chat_interface(question, username) → response string
+  1. classify(question)            → "personal" | "action" | "general"
+  2. call_chat_interface(q, user)  → response string or None
+  3. Session tracker               → keeps user in API conversation until slot filling completes
 
-Routing rules:
-  - personal  : user-specific queries ("my leave balance", "my permission")
-  - action    : action-based queries  ("apply leave", "request permission")
-  - general   : informational queries ("leave policy", "how to apply leave")
-                → falls through to existing bots, this module does nothing
+Slot-filling session logic:
+  - When a user triggers a personal/action intent → session starts
+  - ALL follow-up messages in the same thread go directly to the API (bypass classifier)
+  - Session ends when API signals completion (no more questions)
+  - Session ends on API failure → falls back to existing bots
+  - Greetings are never sent to the API
 
 Zero impact on existing system:
-  - Only called from one place in process_request()
-  - Never modifies any existing routing logic
-  - On any API failure → returns None so caller falls back to existing bots
+  - Only called from process_request() in orchestrator_main.py
+  - On any API failure or session end → caller falls back to existing bots
 """
 
 import re
+import json
+import time
 import logging
+import threading
 import requests
 from typing import Optional
 
@@ -28,11 +32,85 @@ logger = logging.getLogger(__name__)
 
 # ── External agentic chatbot API ──────────────────────────────────────────────
 _CHAT_INTERFACE_URL = "http://217.217.249.121:8000/gbaiapi/chat_Interface"
-_API_TIMEOUT        = 30.0   # seconds — prevents blocking the main thread
+_API_TIMEOUT        = 30.0    # seconds
+_SESSION_TTL        = 300.0   # 5 minutes — auto-expire idle sessions
 
 
 # =============================================================================
-# 1. INTENT CLASSIFIER
+# 1. SESSION TRACKER
+# =============================================================================
+
+_sessions: dict = {}        # { username: { "active": bool, "ts": float } }
+_session_lock   = threading.Lock()
+
+# Keywords that signal the API has finished collecting all slots
+_COMPLETION_SIGNALS = {
+    "successfully", "has been applied", "has been submitted",
+    "has been created", "has been approved", "has been rejected",
+    "has been cancelled", "has been withdrawn", "leave applied",
+    "leave submitted", "request submitted", "time slip submitted",
+    "pack created", "done", "completed", "recorded",
+}
+
+# Greetings — never sent to the API, handled by existing greeting flow
+_GREETING_WORDS = {
+    "hi", "hello", "hey", "good morning", "good afternoon",
+    "good evening", "howdy", "greetings", "sup", "what's up",
+}
+
+
+def is_greeting(question: str) -> bool:
+    """Return True if the message is a greeting — should never hit the API."""
+    q = question.lower().strip()
+    return q in _GREETING_WORDS or any(
+        q.startswith(g) for g in _GREETING_WORDS
+    )
+
+
+def start_session(username: str) -> None:
+    """Mark user as being in an active slot-filling session."""
+    with _session_lock:
+        _sessions[username] = {"active": True, "ts": time.time()}
+    logger.info(f"[AgenticSession] Session STARTED for {username}")
+
+
+def end_session(username: str) -> None:
+    """Clear the user's slot-filling session."""
+    with _session_lock:
+        _sessions.pop(username, None)
+    logger.info(f"[AgenticSession] Session ENDED for {username}")
+
+
+def is_in_session(username: str) -> bool:
+    """
+    Return True if user is currently in an active slot-filling session.
+    Auto-expires sessions idle for more than SESSION_TTL seconds.
+    """
+    with _session_lock:
+        entry = _sessions.get(username)
+        if not entry:
+            return False
+        if time.time() - entry["ts"] > _SESSION_TTL:
+            del _sessions[username]
+            logger.info(f"[AgenticSession] Session EXPIRED for {username}")
+            return False
+        entry["ts"] = time.time()   # refresh TTL on each access
+        return True
+
+
+def _is_completion(response_text: str) -> bool:
+    """
+    Detect if the API response signals task completion (no more slots needed).
+    If response still contains a question → still collecting slots.
+    """
+    if "?" in response_text:
+        return False
+    lower = response_text.lower()
+    return any(signal in lower for signal in _COMPLETION_SIGNALS)
+
+
+# =============================================================================
+# 2. INTENT CLASSIFIER
 # =============================================================================
 
 # Personal intent: user asking about their own data
@@ -58,7 +136,7 @@ _PERSONAL_PATTERNS = [
     r"\bleft\s+leaves?\b",
 ]
 
-# Action intent: user wants to do something (trigger a workflow)
+# Action intent: user wants to trigger a workflow
 _ACTION_PATTERNS = [
     r"\bapply\s+(for\s+)?leave\b",
     r"\bapply\s+(a\s+)?leave\b",
@@ -78,73 +156,75 @@ _ACTION_PATTERNS = [
     r"\bmark\s+attendance\b",
 ]
 
-# General informational — should stay with existing bots
-# (listed here only for logging clarity — not used in logic)
-_GENERAL_SIGNALS = [
-    "policy", "how to apply", "rules for", "what is leave",
-    "explain leave", "types of leave", "leave types",
-    "permission rules", "what is permission",
-]
-
 
 def classify(question: str) -> str:
     """
-    Classify the question into one of three intents.
+    Classify question intent.
+    Greetings always return "general" — never routed to the API.
 
     Returns:
         "personal"  → route to Chat Interface API
         "action"    → route to Chat Interface API
         "general"   → fall through to existing bot routing
     """
+    # Greetings must never go to the API
+    if is_greeting(question):
+        logger.info(f"[AgenticClassifier] GREETING — skipping API: '{question[:60]}'")
+        return "general"
+
     q = question.lower().strip()
 
-    # Check personal intent first (highest priority)
     for pattern in _PERSONAL_PATTERNS:
         if re.search(pattern, q):
-            logger.info(f"[AgenticClassifier] PERSONAL intent detected: '{question[:60]}'")
+            logger.info(f"[AgenticClassifier] PERSONAL intent: '{question[:60]}'")
             return "personal"
 
-    # Check action intent second
     for pattern in _ACTION_PATTERNS:
         if re.search(pattern, q):
-            logger.info(f"[AgenticClassifier] ACTION intent detected: '{question[:60]}'")
+            logger.info(f"[AgenticClassifier] ACTION intent: '{question[:60]}'")
             return "action"
 
-    # Default — let existing routing handle it
     logger.info(f"[AgenticClassifier] GENERAL intent — passing to existing bots: '{question[:60]}'")
     return "general"
 
 
 # =============================================================================
-# 2. API HANDLER
+# 3. API HANDLER
 # =============================================================================
 
 def call_chat_interface(question: str, username: str) -> Optional[str]:
     """
-    Call the external agentic chatbot API.
+    Call the external agentic chatbot API and manage session state.
 
-    Args:
-        question : the user's original question
-        username : for logging purposes
-
-    Returns:
-        Response string on success.
-        None on any failure — caller should fall back to existing bots.
+    - Starts session on first call
+    - Refreshes session TTL on each subsequent call
+    - Ends session when API signals completion or on any failure
+    - Returns None on failure → caller falls back to existing bots
     """
+    # Never send greetings to the API
+    if is_greeting(question):
+        logger.info(f"[AgenticClassifier] Greeting blocked from API for {username}")
+        end_session(username)
+        return None
+
     payload = {"message": question}
+    headers = {
+        "Content-Type": "application/json",
+        "Login":         json.dumps({"UserName": username}),
+    }
 
     try:
-        logger.info(f"[AgenticClassifier] Calling Chat Interface API for {username}: '{question[:60]}'")
+        logger.info(f"[AgenticClassifier] → API call for {username}: '{question[:60]}'")
         resp = requests.post(
             _CHAT_INTERFACE_URL,
             json=payload,
+            headers=headers,
             timeout=_API_TIMEOUT,
         )
         resp.raise_for_status()
 
-        data = resp.json()
-
-        # Accept various response key names
+        data   = resp.json()
+        status = data.get("status", "")
         answer = (
             data.get("response")
             or data.get("message")
@@ -153,22 +233,38 @@ def call_chat_interface(question: str, username: str) -> Optional[str]:
             or data.get("output")
         )
 
-        if answer and str(answer).strip():
-            logger.info(f"[AgenticClassifier] API success for {username} ({len(str(answer))} chars)")
-            return str(answer).strip()
+        if not answer or not str(answer).strip():
+            logger.warning(f"[AgenticClassifier] Empty API response for {username}: {data}")
+            end_session(username)
+            return None
 
-        logger.warning(f"[AgenticClassifier] API returned empty response for {username}: {data}")
-        return None
+        answer = str(answer).strip()
+        logger.info(f"[AgenticClassifier] API response ({len(answer)} chars): '{answer[:80]}'")
+
+        # Start or keep alive the session
+        if not is_in_session(username):
+            start_session(username)
+
+        # End session if task is complete or API returned error status
+        if status == "error" or _is_completion(answer):
+            end_session(username)
+            logger.info(f"[AgenticClassifier] Task complete — session closed for {username}")
+
+        return answer
 
     except requests.Timeout:
         logger.error(f"[AgenticClassifier] API timeout ({_API_TIMEOUT}s) for {username}")
+        end_session(username)
         return None
     except requests.ConnectionError:
-        logger.error(f"[AgenticClassifier] API connection error — is {_CHAT_INTERFACE_URL} reachable?")
+        logger.error(f"[AgenticClassifier] API connection error — {_CHAT_INTERFACE_URL}")
+        end_session(username)
         return None
     except requests.HTTPError as e:
         logger.error(f"[AgenticClassifier] API HTTP error for {username}: {e}")
+        end_session(username)
         return None
     except Exception as e:
-        logger.error(f"[AgenticClassifier] Unexpected API error for {username}: {e}")
+        logger.error(f"[AgenticClassifier] Unexpected error for {username}: {e}")
+        end_session(username)
         return None
