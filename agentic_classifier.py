@@ -45,11 +45,13 @@ _session_lock   = threading.Lock()
 
 # Keywords that signal the API has finished collecting all slots
 _COMPLETION_SIGNALS = {
-    "successfully", "has been applied", "has been submitted",
+    "has been applied", "has been submitted",
     "has been created", "has been approved", "has been rejected",
     "has been cancelled", "has been withdrawn", "leave applied",
     "leave submitted", "request submitted", "time slip submitted",
-    "pack created", "done", "completed", "recorded",
+    "pack created", "successfully submitted", "successfully applied",
+    "successfully created", "successfully recorded",
+    "task completed", "process completed",
 }
 
 # Greetings — never sent to the API, handled by existing greeting flow
@@ -60,11 +62,9 @@ _GREETING_WORDS = {
 
 
 def is_greeting(question: str) -> bool:
-    """Return True if the message is a greeting — should never hit the API."""
-    q = question.lower().strip()
-    return q in _GREETING_WORDS or any(
-        q.startswith(g) for g in _GREETING_WORDS
-    )
+    """Return True if the entire message is a greeting — should never hit the API."""
+    q = question.lower().strip().rstrip("!.,?")
+    return q in _GREETING_WORDS
 
 
 def start_session(username: str) -> None:
@@ -79,6 +79,15 @@ def end_session(username: str) -> None:
     with _session_lock:
         _sessions.pop(username, None)
     logger.info(f"[AgenticSession] Session ENDED for {username}")
+
+
+def _start_session_if_needed(username: str) -> None:
+    """Atomically start a session only if one is not already active."""
+    with _session_lock:
+        entry = _sessions.get(username)
+        if not entry or time.time() - entry["ts"] > _SESSION_TTL:
+            _sessions[username] = {"active": True, "ts": time.time()}
+            logger.info(f"[AgenticSession] Session STARTED for {username}")
 
 
 def is_in_session(username: str) -> bool:
@@ -101,12 +110,14 @@ def is_in_session(username: str) -> bool:
 def _is_completion(response_text: str) -> bool:
     """
     Detect if the API response signals task completion (no more slots needed).
-    If response still contains a question → still collecting slots.
+    Completion signals take priority — a trailing "?" (e.g. "Submitted! Anything else?")
+    must not suppress detection of a genuine completion.
+    Only if there is no completion signal do we treat a "?" as "still collecting".
     """
-    if "?" in response_text:
-        return False
     lower = response_text.lower()
-    return any(signal in lower for signal in _COMPLETION_SIGNALS)
+    if any(signal in lower for signal in _COMPLETION_SIGNALS):
+        return True
+    return False
 
 
 # =============================================================================
@@ -192,38 +203,54 @@ def classify(question: str) -> str:
 # 3. API HANDLER
 # =============================================================================
 
-def call_chat_interface(question: str, username: str) -> Optional[str]:
+def call_chat_interface(
+    question: str,
+    username: str,
+    login_dto: dict
+) -> Optional[str]:
     """
-    Call the external agentic chatbot API and manage session state.
+    Call the external agentic chatbot API with dynamic login DTO.
 
+    - Requires login_dto (must include BaseURL)
     - Starts session on first call
-    - Refreshes session TTL on each subsequent call
-    - Ends session when API signals completion or on any failure
-    - Returns None on failure → caller falls back to existing bots
+    - Ends session on completion or failure
     """
-    # Never send greetings to the API
+
+    # 🚫 Block greetings — preserve any active session so slot-filling is not aborted
     if is_greeting(question):
-        logger.info(f"[AgenticClassifier] Greeting blocked from API for {username}")
+        logger.info(f"[AgenticClassifier] Greeting blocked from API for {username} — session preserved")
+        return None
+
+    # ❌ Validate login_dto
+    if not login_dto or "BaseURL" not in login_dto:
+        logger.error(f"[AgenticClassifier] ❌ Missing login_dto/BaseURL for {username}")
         end_session(username)
         return None
 
-    payload = {"message": question}
+    payload = {
+        "message": question
+    }
+
     headers = {
         "Content-Type": "application/json",
-        "Login":         json.dumps({"UserName": username}),
+        "Login": json.dumps(login_dto)   # ✅ FULL DTO PASSED HERE
     }
 
     try:
         logger.info(f"[AgenticClassifier] → API call for {username}: '{question[:60]}'")
+        logger.debug(f"[AgenticClassifier] Login DTO sent: {login_dto}")
+
         resp = requests.post(
             _CHAT_INTERFACE_URL,
             json=payload,
             headers=headers,
             timeout=_API_TIMEOUT,
         )
+
         resp.raise_for_status()
 
-        data   = resp.json()
+        data = resp.json()
+
         status = data.get("status", "")
         answer = (
             data.get("response")
@@ -239,13 +266,13 @@ def call_chat_interface(question: str, username: str) -> Optional[str]:
             return None
 
         answer = str(answer).strip()
+
         logger.info(f"[AgenticClassifier] API response ({len(answer)} chars): '{answer[:80]}'")
 
-        # Start or keep alive the session
-        if not is_in_session(username):
-            start_session(username)
+        # ✅ Start or maintain session (atomic check+set)
+        _start_session_if_needed(username)
 
-        # End session if task is complete or API returned error status
+        # ✅ End session on completion
         if status == "error" or _is_completion(answer):
             end_session(username)
             logger.info(f"[AgenticClassifier] Task complete — session closed for {username}")
@@ -256,15 +283,19 @@ def call_chat_interface(question: str, username: str) -> Optional[str]:
         logger.error(f"[AgenticClassifier] API timeout ({_API_TIMEOUT}s) for {username}")
         end_session(username)
         return None
+
     except requests.ConnectionError:
         logger.error(f"[AgenticClassifier] API connection error — {_CHAT_INTERFACE_URL}")
         end_session(username)
         return None
+
     except requests.HTTPError as e:
         logger.error(f"[AgenticClassifier] API HTTP error for {username}: {e}")
         end_session(username)
         return None
+
     except Exception as e:
         logger.error(f"[AgenticClassifier] Unexpected error for {username}: {e}")
         end_session(username)
         return None
+        

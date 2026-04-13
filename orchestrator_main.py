@@ -2037,7 +2037,8 @@ Rewritten Answer:"""
             return answer
     
     async def process_request(self, username: str, user_role: str, question: str,
-                            thread_id: str = None, is_existing_thread: bool = False) -> Dict[str, str]:
+                            thread_id: str = None, is_existing_thread: bool = False,
+                            login_dto: dict = None) -> Dict[str, str]:
         """Enhanced request processing with comprehensive fallback chain"""
 
         start_time = time.time()
@@ -2202,7 +2203,7 @@ For example: "Name: John, Role: developer" """
         if _in_session:
             # Route ALL messages directly to API — bypass classifier
             _agentic_response = await asyncio.to_thread(
-                agentic_classifier.call_chat_interface, question, username
+                agentic_classifier.call_chat_interface, question, username, login_dto
             )
             if _agentic_response:
                 await asyncio.to_thread(
@@ -2225,7 +2226,7 @@ For example: "Name: John, Role: developer" """
             _agentic_intent = await asyncio.to_thread(agentic_classifier.classify, question)
             if _agentic_intent in ("personal", "action"):
                 _agentic_response = await asyncio.to_thread(
-                    agentic_classifier.call_chat_interface, question, username
+                    agentic_classifier.call_chat_interface, question, username, login_dto
                 )
                 if _agentic_response:
                     await asyncio.to_thread(
@@ -2896,7 +2897,7 @@ async def ai_role_based_chat(message: Message, Login: str = Header(...)):
         logger.info(f"📍 Built filtered context from {len(source_files)} source(s)")
         
         # Process request
-        result = await ai_orchestrator.process_request(username, user_role, user_input, thread_id, is_existing_thread=False)
+        result = await ai_orchestrator.process_request(username, user_role, user_input, thread_id, is_existing_thread=False, login_dto=login_dto)
         
         # Add actual source files used
         formatted_sources = source_tracker.format_sources_for_response(source_files)
@@ -3028,7 +3029,7 @@ async def ai_thread_chat(request: ThreadRequest, Login: str = Header(...)):
         logger.info(f"📍 Built filtered context from {len(source_files)} source(s)")
         
         result = await ai_orchestrator.process_request(
-            username, user_role, user_input, thread_id, is_existing_thread=True
+            username, user_role, user_input, thread_id, is_existing_thread=True, login_dto=login_dto
         )
         
         # Add actual source files used
@@ -3464,7 +3465,7 @@ async def voice_chat(request: Request, Login: str = Header(...)):
 
     try:
         result = await ai_orchestrator.process_request(
-            username, user_role, english_input, thread_id, is_existing_thread=is_existing
+            username, user_role, english_input, thread_id, is_existing_thread=is_existing, login_dto=login_dto
         )
     except Exception as e:
         logger.error(f"[Voice] Orchestrator error: {e}")
