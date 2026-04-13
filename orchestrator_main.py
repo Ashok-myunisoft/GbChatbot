@@ -2229,6 +2229,11 @@ For example: "Name: John, Role: developer" """
                     agentic_classifier.call_chat_interface, question, username, login_dto
                 )
                 if _agentic_response:
+                    # Personal queries are one-shot (balance check, profile, etc.)
+                    # — end the session immediately so follow-up general questions
+                    # are not trapped in the agentic session.
+                    if _agentic_intent == "personal":
+                        await asyncio.to_thread(agentic_classifier.end_session, username)
                     await asyncio.to_thread(
                         update_enhanced_memory,
                         username, question, _agentic_response, _agentic_intent, user_role, thread_id
