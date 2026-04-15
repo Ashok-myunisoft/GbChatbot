@@ -2198,10 +2198,24 @@ For example: "Name: John, Role: developer" """
         # ── End File Intelligence ─────────────────────────────────────────────
 
         # ── Agentic Classifier: personal + action intents → Chat Interface API ─
-        # Check FIRST: is user already mid-session (slot-filling in progress)?
         _in_session = await asyncio.to_thread(agentic_classifier.is_in_session, username)
+
+        # Session escape: if user is mid-session but sends a general question,
+        # end the session and fall through to existing bots.
         if _in_session:
-            # Route ALL messages directly to API — bypass classifier
+            _is_slot = await asyncio.to_thread(
+                agentic_classifier.is_slot_filling_response, question
+            )
+            if not _is_slot:
+                logger.info(
+                    f"[AgenticClassifier] Non-slot question during session for {username} "
+                    f"— ending session, routing to existing bots"
+                )
+                await asyncio.to_thread(agentic_classifier.end_session, username)
+                _in_session = False
+
+        if _in_session:
+            # Genuine slot-filling response — send directly to API
             _agentic_response = await asyncio.to_thread(
                 agentic_classifier.call_chat_interface, question, username, login_dto
             )
@@ -2225,13 +2239,18 @@ For example: "Name: John, Role: developer" """
             # No active session — classify the intent fresh
             _agentic_intent = await asyncio.to_thread(agentic_classifier.classify, question)
             if _agentic_intent in ("personal", "action"):
+                # For action intent: normalize the message to a direct API command
+                # so the API skips balance/offer display and starts slot-filling immediately.
+                _api_question = (
+                    agentic_classifier.normalize_action_message(question)
+                    if _agentic_intent == "action"
+                    else question
+                )
                 _agentic_response = await asyncio.to_thread(
-                    agentic_classifier.call_chat_interface, question, username, login_dto
+                    agentic_classifier.call_chat_interface, _api_question, username, login_dto
                 )
                 if _agentic_response:
-                    # Personal queries are one-shot (balance check, profile, etc.)
-                    # — end the session immediately so follow-up general questions
-                    # are not trapped in the agentic session.
+                    # Personal queries are one-shot — end session immediately.
                     if _agentic_intent == "personal":
                         await asyncio.to_thread(agentic_classifier.end_session, username)
                     await asyncio.to_thread(
