@@ -156,6 +156,7 @@ _ACTION_PATTERNS = [
     r"\bbook\s+(a\s+)?leave\b",
     r"\btake\s+(a\s+)?leave\b",
     r"\bapply\s+(for\s+)?permission\b",
+    r"\bapply\s+(a\s+)?permission\b",
     r"\brequest\s+(a\s+)?permission\b",
     r"\bsubmit\s+(a\s+)?permission\b",
     r"\bcancel\s+(my\s+)?leave\b",
@@ -298,4 +299,5 @@ def call_chat_interface(
         logger.error(f"[AgenticClassifier] Unexpected error for {username}: {e}")
         end_session(username)
         return None
+        
         
