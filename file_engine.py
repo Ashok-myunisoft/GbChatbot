@@ -27,11 +27,12 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 logger = logging.getLogger(__name__)
 
-FILE_TTL     = 1800          # 30 minutes idle expiry
-MAX_FILE_MB  = 10            # hard limit: 10 MB
-MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
+FILE_TTL             = 1800   # 30 minutes idle expiry
+MAX_FILE_MB          = 10     # hard limit: 10 MB
+MAX_FILE_BYTES       = MAX_FILE_MB * 1024 * 1024
+RELEVANCE_THRESHOLD  = 0.3    # minimum FAISS score to treat a question as file-related
 
-# Per-user store: { username → { index, filename, df, ts, chunks } }
+# Per-user store: { username → { index, filename, df, ts, chunks, thread_id } }
 _store: dict = {}
 _lock  = threading.Lock()
 
@@ -55,8 +56,8 @@ threading.Thread(target=_evict_expired, daemon=True, name="file-engine-evict").s
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def has_file(username: str) -> bool:
-    """Return True if user has a valid (non-expired) uploaded file."""
+def has_file(username: str, thread_id: str = None) -> bool:
+    """Return True if user has a valid (non-expired) uploaded file for this thread."""
     with _lock:
         entry = _store.get(username)
         if not entry:
@@ -65,10 +66,16 @@ def has_file(username: str) -> bool:
             del _store[username]
             logger.info(f"[FileEngine] Session expired for {username}")
             return False
+        # Thread isolation: if the file was bound to a specific thread,
+        # only that thread can access it.
+        stored_tid = entry.get("thread_id")
+        if stored_tid and thread_id and stored_tid != thread_id:
+            logger.info(f"[FileEngine] Thread mismatch for {username} — file belongs to thread '{stored_tid}', request from '{thread_id}'")
+            return False
         return True
 
 
-def process(username: str, filename: str, content: bytes, embeddings) -> str:
+def process(username: str, filename: str, content: bytes, embeddings, thread_id: str = None) -> str:
     """
     Parse uploaded file, build per-user FAISS index.
     Returns a human-readable status message.
@@ -119,6 +126,7 @@ def process(username: str, filename: str, content: bytes, embeddings) -> str:
                 "ts":        time.time(),
                 "chunks":    len(chunks),
                 "full_text": full_text,
+                "thread_id": thread_id,   # binds file to uploading thread
             }
 
         logger.info(f"[FileEngine] {username} → '{filename}' ({len(chunks)} chunks indexed)")
@@ -133,10 +141,12 @@ def process(username: str, filename: str, content: bytes, embeddings) -> str:
         return f"Error processing file: {str(e)}"
 
 
-def search(username: str, question: str, k: int = 5) -> Optional[str]:
+def search(username: str, question: str, thread_id: str = None, k: int = 5) -> Optional[str]:
     """
     Search user's file index for an answer.
     Returns formatted answer string, or None if nothing relevant found.
+    Thread isolation: skips if the file belongs to a different thread.
+    Relevance guard: skips if best FAISS score is below RELEVANCE_THRESHOLD.
     """
     with _lock:
         entry = _store.get(username)
@@ -144,6 +154,10 @@ def search(username: str, question: str, k: int = 5) -> Optional[str]:
             return None
         if time.time() - entry["ts"] > FILE_TTL:
             del _store[username]
+            return None
+        # Thread isolation check
+        stored_tid = entry.get("thread_id")
+        if stored_tid and thread_id and stored_tid != thread_id:
             return None
         entry["ts"] = time.time()          # refresh TTL on each access
         index    = entry["index"]
@@ -158,8 +172,22 @@ def search(username: str, question: str, k: int = 5) -> Optional[str]:
                 logger.info(f"[FileEngine] Pandas fast-path: '{question[:60]}'")
                 return f"From **{filename}**:\n\n{pandas_result}"
 
-        # FAISS semantic search
-        docs = index.similarity_search(question, k=k)
+        # FAISS semantic search with relevance threshold
+        # — rejects questions that are unrelated to the file content
+        try:
+            scored_docs = index.similarity_search_with_relevance_scores(question, k=k)
+            best_score  = max((score for _, score in scored_docs), default=0.0)
+            if best_score < RELEVANCE_THRESHOLD:
+                logger.info(
+                    f"[FileEngine] Low relevance ({best_score:.2f} < {RELEVANCE_THRESHOLD}) "
+                    f"for '{question[:60]}' — skipping file, routing to existing bots"
+                )
+                return None
+            docs = [doc for doc, _ in scored_docs]
+        except Exception:
+            # Fallback: use plain similarity_search if scored variant is unavailable
+            docs = index.similarity_search(question, k=k)
+
         if not docs:
             return None
 
@@ -167,7 +195,7 @@ def search(username: str, question: str, k: int = 5) -> Optional[str]:
         if len(context.strip()) < 20:
             return None
 
-        logger.info(f"[FileEngine] FAISS: '{question[:60]}' ({len(docs)} chunks)")
+        logger.info(f"[FileEngine] FAISS: '{question[:60]}' ({len(docs)} chunks, score={best_score:.2f})")
         return f"From **{filename}**:\n\n{context}"
 
     except Exception as e:

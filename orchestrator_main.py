@@ -9,7 +9,7 @@ import asyncio
 import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
-from fastapi import FastAPI, Header, Request, UploadFile, File
+from fastapi import FastAPI, Header, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -2152,8 +2152,8 @@ For example: "Name: John, Role: developer" """
             }
         
         # ── File Intelligence: answer from uploaded file first ────────────────
-        if FILE_ENGINE_AVAILABLE and file_engine.has_file(username):
-            file_context = await asyncio.to_thread(file_engine.search, username, question)
+        if FILE_ENGINE_AVAILABLE and file_engine.has_file(username, thread_id):
+            file_context = await asyncio.to_thread(file_engine.search, username, question, thread_id)
             if file_context and len(file_context.strip()) >= 20:
                 logger.info(f"[FileEngine] Answering from user file for {username}")
                 _edownload_url = None
@@ -3506,7 +3506,7 @@ async def voice_chat(request: Request, Login: str = Header(...)):
 
 
 @app.post("/gbaiapi/upload", tags=["File Intelligence"])
-async def upload_file(file: UploadFile = File(...), Login: str = Header(...)):
+async def upload_file(file: UploadFile = File(...), Login: str = Header(...), thread_id: str = Form(None)):
     """
     Upload a file (PDF, CSV, Excel, JSON, TXT — max 10 MB).
     The system builds a per-user FAISS index so you can ask questions about it.
@@ -3523,7 +3523,7 @@ async def upload_file(file: UploadFile = File(...), Login: str = Header(...)):
     filename = file.filename or "upload"
 
     status_msg = await asyncio.to_thread(
-        file_engine.process, username, filename, content, ai_resources.embeddings
+        file_engine.process, username, filename, content, ai_resources.embeddings, thread_id
     )
     logger.info(f"[Upload] {username} → '{filename}': {status_msg[:80]}")
 
