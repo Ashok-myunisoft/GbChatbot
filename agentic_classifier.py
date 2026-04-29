@@ -31,7 +31,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 # ── External agentic chatbot API ──────────────────────────────────────────────
-_CHAT_INTERFACE_URL = "http://217.217.249.121:8000/gbaiapi/chat_Interface"
+_DEFAULT_CHAT_INTERFACE_URL = "http://217.217.249.121:8000/gbaiapi/chat_Interface"
 _API_TIMEOUT        = 30.0    # seconds
 _SESSION_TTL        = 300.0   # 5 minutes — auto-expire idle sessions
 
@@ -203,6 +203,24 @@ def _is_completion(response_text: str) -> bool:
     return False
 
 
+def _resolve_chat_interface_url(login_dto: dict) -> str:
+    """
+    Resolve the agentic chatbot endpoint.
+
+    Prefer a runtime-provided BaseURL when available, but keep the existing
+    hardcoded endpoint as a safe fallback so the current integration continues
+    to work even if the caller does not supply BaseURL.
+    """
+    base_url = ""
+    if isinstance(login_dto, dict):
+        base_url = str(login_dto.get("BaseURL") or login_dto.get("base_url") or "").strip()
+
+    if base_url:
+        return base_url.rstrip("/") + "/gbaiapi/chat_Interface"
+
+    return _DEFAULT_CHAT_INTERFACE_URL
+
+
 # =============================================================================
 # 2. INTENT CLASSIFIER
 # =============================================================================
@@ -295,7 +313,7 @@ def call_chat_interface(
     """
     Call the external agentic chatbot API with dynamic login DTO.
 
-    - Requires login_dto (must include BaseURL)
+    - Uses BaseURL when supplied, otherwise falls back to the default endpoint
     - Starts session on first call
     - Ends session on completion or failure
     """
@@ -303,12 +321,6 @@ def call_chat_interface(
     # 🚫 Block greetings — preserve any active session so slot-filling is not aborted
     if is_greeting(question):
         logger.info(f"[AgenticClassifier] Greeting blocked from API for {username} — session preserved")
-        return None
-
-    # ❌ Validate login_dto
-    if not login_dto or "BaseURL" not in login_dto:
-        logger.error(f"[AgenticClassifier] ❌ Missing login_dto/BaseURL for {username}")
-        end_session(username)
         return None
 
     payload = {
@@ -320,12 +332,14 @@ def call_chat_interface(
         "Login": json.dumps(login_dto)   # ✅ FULL DTO PASSED HERE
     }
 
+    chat_interface_url = _resolve_chat_interface_url(login_dto)
+
     try:
         logger.info(f"[AgenticClassifier] → API call for {username}: '{question[:60]}'")
         logger.debug(f"[AgenticClassifier] Login DTO sent: {login_dto}")
 
         resp = requests.post(
-            _CHAT_INTERFACE_URL,
+            chat_interface_url,
             json=payload,
             headers=headers,
             timeout=_API_TIMEOUT,
@@ -369,7 +383,7 @@ def call_chat_interface(
         return None
 
     except requests.ConnectionError:
-        logger.error(f"[AgenticClassifier] API connection error — {_CHAT_INTERFACE_URL}")
+        logger.error(f"[AgenticClassifier] API connection error — {chat_interface_url}")
         end_session(username)
         return None
 
