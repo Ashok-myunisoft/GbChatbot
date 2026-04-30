@@ -3530,49 +3530,78 @@ async def upload_file(file: UploadFile = File(...), Login: str = Header(...), th
     Upload a file (PDF, CSV, Excel, JSON, TXT — max 10 MB).
     The system builds a per-user FAISS index so you can ask questions about it.
     """
-    if not FILE_ENGINE_AVAILABLE:
-        return JSONResponse(status_code=503, content={"response": "File intelligence not available. Install: pymupdf, faiss-cpu"})
     try:
+        if not FILE_ENGINE_AVAILABLE:
+            return JSONResponse(
+                status_code=503,
+                content={"response": "File intelligence not available. Install: pymupdf, faiss-cpu"},
+            )
+
         login_dto = json.loads(Login)
         username  = login_dto.get("UserName", "anonymous")
-    except Exception:
+    except Exception as e:
+        logger.warning(f"[Upload] Invalid login header: {e}")
         return JSONResponse(status_code=400, content={"response": "Invalid login header."})
 
-    content  = await file.read()
-    filename = file.filename or "upload"
+    try:
+        embeddings = getattr(ai_resources, "embeddings", None)
+        if embeddings is None:
+            logger.error("[Upload] Embeddings are not initialized")
+            return JSONResponse(
+                status_code=503,
+                content={"response": "File intelligence is temporarily unavailable. Please try again later."},
+            )
 
-    status_msg = await asyncio.to_thread(
-        file_engine.process, username, filename, content, ai_resources.embeddings, thread_id
-    )
-    logger.info(f"[Upload] {username} → '{filename}': {status_msg[:80]}")
+        content  = await file.read()
+        filename = file.filename or "upload"
 
-    # Auto-summarize after successful indexing
-    summary = status_msg
-    if "uploaded successfully" in status_msg:
         try:
-            full_text = file_engine.get_full_text(username)
-            if full_text:
-                _summary_prompt = (
-                    f"You have been given the content of a file named **{filename}**.\n\n"
-                    f"File Content:\n{full_text[:6000]}\n\n"
-                    f"Please provide a clear and concise summary of this file. "
-                    f"Mention the key topics, data, or sections it contains."
-                )
-                _summary_response = await asyncio.wait_for(
-                    ai_resources.response_llm.ainvoke(_summary_prompt),
-                    timeout=70.0
-                )
-                _summary_text = (_summary_response.content if hasattr(_summary_response, 'content') else str(_summary_response)).strip()
-                summary = (
-                    f"File **{filename}** uploaded and analyzed successfully.\n\n"
-                    f"**Summary:**\n{_summary_text}\n\n"
-                    f"You can now ask me any questions about this file."
-                )
-                logger.info(f"[Upload] Summary generated for {username} → '{filename}'")
-        except Exception as _se:
-            logger.warning(f"[Upload] Summary generation failed, returning default message: {_se}")
+            status_msg = await asyncio.to_thread(
+                file_engine.process, username, filename, content, embeddings, thread_id
+            )
+        except Exception as e:
+            logger.error(f"[Upload] File engine crashed for {username} / '{filename}': {e}", exc_info=True)
+            return JSONResponse(
+                status_code=500,
+                content={"response": "Error processing file. Please try another file or format."},
+            )
 
-    return {"response": summary, "filename": filename}
+        logger.info(f"[Upload] {username} → '{filename}': {status_msg[:80]}")
+
+        # Auto-summarize after successful indexing
+        summary = status_msg
+        if "uploaded successfully" in status_msg:
+            try:
+                full_text = file_engine.get_full_text(username)
+                if full_text:
+                    _summary_prompt = (
+                        f"You have been given the content of a file named **{filename}**.\n\n"
+                        f"File Content:\n{full_text[:6000]}\n\n"
+                        f"Please provide a clear and concise summary of this file. "
+                        f"Mention the key topics, data, or sections it contains."
+                    )
+                    _summary_response = await asyncio.wait_for(
+                        ai_resources.response_llm.ainvoke(_summary_prompt),
+                        timeout=70.0
+                    )
+                    _summary_text = (_summary_response.content if hasattr(_summary_response, 'content') else str(_summary_response)).strip()
+                    summary = (
+                        f"File **{filename}** uploaded and analyzed successfully.\n\n"
+                        f"**Summary:**\n{_summary_text}\n\n"
+                        f"You can now ask me any questions about this file."
+                    )
+                    logger.info(f"[Upload] Summary generated for {username} → '{filename}'")
+            except Exception as _se:
+                logger.warning(f"[Upload] Summary generation failed, returning default message: {_se}")
+
+        return {"response": summary, "filename": filename}
+
+    except Exception as e:
+        logger.error(f"[Upload] Unexpected upload error for {username if 'username' in locals() else 'unknown'}: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"response": "Unexpected error while uploading file. Please try again."},
+        )
 
 
 @app.get("/gbaiapi/download/{file_id}", tags=["Export"])
