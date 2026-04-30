@@ -68,6 +68,8 @@ _SLOT_FILLING_KEYWORDS = {
     "time slip", "pack", "overtime", "from date", "to date",
 }
 
+_MONTH_PATTERN = r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\b"
+
 _QUESTION_STARTERS = (
     "what is", "what are", "what was", "what were",
     "how do", "how does", "how can", "how to", "how many", "how much",
@@ -87,6 +89,7 @@ _ACTION_TO_API_COMMAND = [
     (r"\bwithdraw\s+(my\s+)?permission\b",                             "withdraw permission"),
     (r"\bapprove\s+leave\b",                                           "approve leave"),
     (r"\breject\s+leave\b",                                            "reject leave"),
+    (r"\bsubmit\s+(a\s+)?time\s*slip\b",                               "submit time slip"),
     (r"\bsubmit\s+.{0,10}time\s*slip\b",                              "submit time slip"),
     (r"\bmark\s+attendance\b",                                         "mark attendance"),
 ]
@@ -115,7 +118,8 @@ def is_slot_filling_response(question: str) -> bool:
         return True
 
     # Month name → date input
-    if re.search(r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\b', q):
+    # Use a non-capturing group so "may" does not get matched inside unrelated words.
+    if re.search(_MONTH_PATTERN, q):
         return True
 
     # Short control words
@@ -287,6 +291,11 @@ def classify(question: str) -> str:
 
     q = question.lower().strip()
 
+    # Time slip requests should route to the agentic workflow even if phrased directly.
+    if re.search(r"\bsubmit\s+(a\s+)?time\s*slip\b", q) or re.search(r"\btime\s*slip\b", q):
+        logger.info(f"[AgenticClassifier] ACTION intent: '{question[:60]}'")
+        return "action"
+
     for pattern in _PERSONAL_PATTERNS:
         if re.search(pattern, q):
             logger.info(f"[AgenticClassifier] PERSONAL intent: '{question[:60]}'")
@@ -370,8 +379,13 @@ def call_chat_interface(
         # ✅ Start or maintain session (atomic check+set)
         _start_session_if_needed(username)
 
-        # ✅ End session on completion
-        if status == "error" or _is_completion(answer):
+        # End session on completion
+        if status == "error":
+            logger.warning(f"[AgenticClassifier] API reported error status for {username} — falling back")
+            end_session(username)
+            return None
+
+        if _is_completion(answer):
             end_session(username)
             logger.info(f"[AgenticClassifier] Task complete — session closed for {username}")
 
