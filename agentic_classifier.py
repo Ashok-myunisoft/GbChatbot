@@ -411,4 +411,3 @@ def call_chat_interface(
         end_session(username)
         return None
         
-        

@@ -174,6 +174,7 @@ def search(username: str, question: str, thread_id: str = None, k: int = 5) -> O
 
         # FAISS semantic search with relevance threshold
         # — rejects questions that are unrelated to the file content
+        best_score = 0.0
         try:
             scored_docs = index.similarity_search_with_relevance_scores(question, k=k)
             best_score  = max((score for _, score in scored_docs), default=0.0)
@@ -247,8 +248,31 @@ def _parse_pdf(content: bytes, filename: str) -> list:
         logger.info(f"[FileEngine] PDF: {len(docs)} pages from '{filename}'")
         return docs
     except ImportError:
-        logger.warning("[FileEngine] PyMuPDF not installed. Run: pip install pymupdf")
-        return []
+        # Fallback readers keep PDF support working when PyMuPDF is not installed.
+        try:
+            from pypdf import PdfReader
+        except ImportError:
+            try:
+                from PyPDF2 import PdfReader
+            except ImportError:
+                logger.warning("[FileEngine] No PDF reader installed. Run: pip install pymupdf pypdf")
+                return []
+
+        try:
+            reader = PdfReader(io.BytesIO(content))
+            docs = []
+            for i, page in enumerate(reader.pages):
+                text = page.extract_text() or ""
+                if text.strip():
+                    docs.append(Document(
+                        page_content=text,
+                        metadata={"source": filename, "page": i + 1}
+                    ))
+            logger.info(f"[FileEngine] PDF (fallback): {len(docs)} pages from '{filename}'")
+            return docs
+        except Exception as e:
+            logger.error(f"[FileEngine] PDF fallback parse error: {e}")
+            return []
     except Exception as e:
         logger.error(f"[FileEngine] PDF parse error: {e}")
         return []
@@ -258,7 +282,7 @@ def _parse_tabular(content: bytes, filename: str,
                    fmt: str) -> Tuple[Optional[pd.DataFrame], list]:
     try:
         if fmt == "csv":
-            df = pd.read_csv(io.BytesIO(content), encoding="utf-8", errors="replace")
+            df = pd.read_csv(io.BytesIO(content), encoding="utf-8", encoding_errors="replace")
         else:
             df = pd.read_excel(io.BytesIO(content))
 
