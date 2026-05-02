@@ -210,18 +210,10 @@ def _is_completion(response_text: str) -> bool:
 def _resolve_chat_interface_url(login_dto: dict) -> str:
     """
     Resolve the agentic chatbot endpoint.
-
-    Prefer a runtime-provided BaseURL when available, but keep the existing
-    hardcoded endpoint as a safe fallback so the current integration continues
-    to work even if the caller does not supply BaseURL.
+    
+    Always use the hardcoded endpoint to ensure consistent
+    routing to the chat interface, ignoring frontend BaseURL.
     """
-    base_url = ""
-    if isinstance(login_dto, dict):
-        base_url = str(login_dto.get("BaseURL") or login_dto.get("base_url") or "").strip()
-
-    if base_url:
-        return base_url.rstrip("/") + "/gbaiapi/chat_Interface"
-
     return _DEFAULT_CHAT_INTERFACE_URL
 
 
