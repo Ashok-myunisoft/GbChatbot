@@ -1654,6 +1654,27 @@ class AIOrchestrationAgent:
         q = question.lower().strip()
         words = set(re.findall(r'\b\w+\b', q))
 
+        # Agentic personal/action phrases should not be stolen by the generic
+        # schema/report routers unless the user is explicitly asking for a report
+        # or table structure.
+        _AGENTIC_PERSONAL_MARKERS = {
+            'my leave', 'my leaves', 'my leave balance',
+            'my permission', 'my permission balance',
+            'my attendance', 'my salary', 'my payslip',
+            'my profile', 'my data', 'my details', 'my record',
+            'get attendance', 'show attendance', 'view attendance', 'check attendance',
+            'attendance details', 'attendance record', 'attendance status',
+            'leave balance', 'permission balance',
+            'remaining leave', 'available leave', 'left leave',
+        }
+        _AGENTIC_ACTION_MARKERS = {
+            'apply leave', 'request leave', 'submit leave', 'book leave', 'take leave',
+            'apply permission', 'request permission', 'submit permission',
+            'cancel leave', 'cancel permission', 'withdraw leave', 'withdraw permission',
+            'approve leave', 'reject leave', 'mark attendance', 'time slip',
+        }
+        is_agentic_like = any(marker in q for marker in _AGENTIC_PERSONAL_MARKERS | _AGENTIC_ACTION_MARKERS)
+
         # --- Navigation intent (any phrasing meaning "find a screen/menu") ---
         _NAV_PATTERNS = [
             'how to reach', 'how to get to', 'how to open', 'how to access',
@@ -1671,6 +1692,17 @@ class AIOrchestrationAgent:
         ]
         if any(p in q for p in _CALC_PATTERNS):
             return "formula"
+
+        if is_agentic_like:
+            # Let agentic_classifier own these phrases unless the user clearly
+            # asks for a report, schema, menu, or project artifact.
+            _EXPLICIT_NON_AGENTIC = (
+                'report', 'analysis', 'chart', 'graph', 'dashboard', 'visualize',
+                'kpi', 'trend', 'breakdown', 'schema', 'table', 'column', 'field',
+                'screen', 'menu', 'project', 'module location',
+            )
+            if not any(token in q for token in _EXPLICIT_NON_AGENTIC):
+                return None
 
         # --- ERP entity words — strong signal that user wants DB data ---
         _SCHEMA_ENTITIES = {
@@ -1713,6 +1745,25 @@ class AIOrchestrationAgent:
     def _get_cached_intent(self, question: str) -> Optional[str]:
         """Enhanced keyword-based routing with broader patterns"""
         question_lower = question.lower().strip()
+        words = set(re.findall(r'\b\w+\b', question_lower))
+
+        _AGENTIC_PERSONAL_MARKERS = {
+            'my leave', 'my leaves', 'my leave balance',
+            'my permission', 'my permission balance',
+            'my attendance', 'my salary', 'my payslip',
+            'my profile', 'my data', 'my details', 'my record',
+            'get attendance', 'show attendance', 'view attendance', 'check attendance',
+            'attendance details', 'attendance record', 'attendance status',
+            'leave balance', 'permission balance',
+            'remaining leave', 'available leave', 'left leave',
+        }
+        _AGENTIC_ACTION_MARKERS = {
+            'apply leave', 'request leave', 'submit leave', 'book leave', 'take leave',
+            'apply permission', 'request permission', 'submit permission',
+            'cancel leave', 'cancel permission', 'withdraw leave', 'withdraw permission',
+            'approve leave', 'reject leave', 'mark attendance', 'time slip',
+        }
+        is_agentic_like = any(marker in question_lower for marker in _AGENTIC_PERSONAL_MARKERS | _AGENTIC_ACTION_MARKERS)
         
         # Formula bot keywords
         formula_keywords = [
@@ -1736,6 +1787,18 @@ class AIOrchestrationAgent:
         if (has_formula_keyword and has_numbers) or has_math_ops or is_formula_listing:
             logger.info("🚀 Fast route: formula")
             return "formula"
+
+        # If this looks like an agentic personal/action query, don't let the
+        # generic report/schema/menu/project keyword router steal it unless the
+        # request is explicitly about one of those artifacts.
+        if is_agentic_like:
+            explicit_non_agentic = (
+                'report', 'analysis', 'chart', 'graph', 'dashboard', 'visualize',
+                'kpi', 'trend', 'breakdown', 'schema', 'table', 'column', 'field',
+                'screen', 'menu', 'project', 'module location',
+            )
+            if not any(word in question_lower for word in explicit_non_agentic):
+                return None
         
         # Report bot keywords — only explicit report/chart/analysis requests
         # Removed: 'listing', 'history of', 'show me data', 'display data',
