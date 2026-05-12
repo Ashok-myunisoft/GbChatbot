@@ -66,6 +66,39 @@ def _clean(text: str) -> str:
     return text
 
 
+def _clean_query_text(question: str) -> str:
+    """
+    Turn a raw user question into a short, presentation-friendly heading.
+    This keeps the actual answer intact while removing conversational noise.
+    """
+    q = (question or "").strip()
+    q = re.sub(r"\[referring to previous result:.*?\]", "", q, flags=re.IGNORECASE)
+    q = re.sub(r"\s+", " ", q).strip(" .?!,:;")
+    q = re.sub(
+        r"^(what|which|where|when|who|how|why|show|give|get|fetch|find|tell)\b(?:\s+(?:me|us|the|a|an))?\s*",
+        "",
+        q,
+        flags=re.IGNORECASE,
+    )
+    q = re.sub(r"\b(give a name of that|tell me about it|tell me about that)\b.*$", "", q, flags=re.IGNORECASE)
+    q = re.sub(r"\s+", " ", q).strip(" .?!,:;")
+
+    # Prefer a trailing "in/for/of/about X" phrase when it looks meaningful.
+    tail = re.search(r"\b(?:in|for|of|about)\s+(.+)$", q, re.IGNORECASE)
+    if tail:
+        candidate = tail.group(1).strip(" .?!,:;")
+        candidate = re.sub(r"\b(give a name of that|tell me about it|tell me about that)\b.*$", "", candidate, flags=re.IGNORECASE).strip()
+        if 2 <= len(candidate.split()) <= 8:
+            q = candidate
+
+    if not q:
+        return "Results"
+
+    if len(q) > 64:
+        q = q[:61].rstrip() + "..."
+    return q[0].upper() + q[1:]
+
+
 def _split_results_header(text: str) -> Tuple[str, str]:
     """
     Separate the 'Results for ... (N rows):' prefix from the body.
@@ -73,9 +106,9 @@ def _split_results_header(text: str) -> Tuple[str, str]:
     """
     m = re.match(r"^(Results for '([^']*)' \((\d+) rows\):)\s*\n+(.*)", text, re.DOTALL)
     if m:
-        query_text = m.group(2)
+        query_text = _clean_query_text(m.group(2))
         row_count  = m.group(3)
-        header = f"📊 **Results for '{query_text}'** — {row_count} record(s) found"
+        header = f"📊 **{query_text}** — {row_count} record(s) found"
         return header, m.group(4).strip()
     return "", text
 

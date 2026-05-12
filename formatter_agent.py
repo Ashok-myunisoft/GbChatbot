@@ -51,18 +51,39 @@ _UI_MAP = {
 
 # Maps intent label → (pattern list, format type)
 _INTENT_PATTERNS = [
+    # List requests — user wants multiple items
+    # These are checked first so queries like "what menu names are in sales module"
+    # are treated as lists instead of a single-value lookup.
+    ("list_names",     [
+        r"\bwhat are\b.*\bnames\b",
+        r"\bwhat names\b",
+        r"\bnames of\b",
+        r"\bmenu names\b",
+        r"\bmodule names\b",
+        r"\bmenu(s)?\s+you\s+have\b",
+        r"\bgive a name of that\b",
+        r"\blist\b.*\bname",
+        r"\ball.*names",
+        r"\bshow.*names",
+        r"\bshow.*modules",
+        r"\bshow.*courses",
+        r"\bshow.*products",
+        r"\bwhat.*menus\b",
+        r"\bwhat.*menu\b",
+        r"\bmenus?\s+in\b",
+        r"\bnames?\s+in\b",
+        r"\bmodules?\s+have\b",
+    ],  "bullet_list"),
+    ("list_all",       [r"\blist all\b", r"\bshow all\b", r"\bget all\b", r"\bfetch all\b"],                                    "bullet_list"),
+
     # Single-value lookups — user wants ONE specific field
-    ("single_name",    [r"\bname\b", r"what is the name", r"module name", r"course name", r"product name"],                      "single_value"),
-    ("single_id",      [r"\bid\b", r"what is the id", r"module id", r"give.*id", r"fetch.*id"],                                  "single_value"),
-    ("single_status",  [r"\bstatus\b", r"is it active", r"current status"],                                                      "single_value"),
+    ("single_name",    [r"\bwhat is the name\b", r"\bgive (me )?(the )?(module|course|product|menu|customer|employee)?\s*name\b", r"\bmodule name\b", r"\bcourse name\b", r"\bproduct name\b", r"\bcustomer name\b", r"\bemployee name\b"],  "single_value"),
+    ("single_id",      [r"\bid\b", r"\bwhat is the id\b", r"\bmodule id\b", r"\bgive.*id\b", r"\bfetch.*id\b"],                                  "single_value"),
+    ("single_status",  [r"\bstatus\b", r"\bis it active\b", r"\bcurrent status\b"],                                                      "single_value"),
     ("single_count",   [r"\bhow many\b", r"\bcount\b", r"\btotal\b", r"\bnumber of\b"],                                          "single_value"),
     ("single_price",   [r"\bprice\b", r"\bcost\b", r"\brate\b", r"\bhow much\b"],                                                "single_value"),
     ("single_date",    [r"\bdate\b", r"\bwhen\b", r"\bcreated at\b", r"\bdeadline\b"],                                           "single_value"),
     ("single_email",   [r"\bemail\b", r"\bcontact\b"],                                                                           "single_value"),
-
-    # List requests — user wants multiple items
-    ("list_names",     [r"\blist\b.*\bname", r"all.*names", r"names of all", r"show.*modules", r"show.*courses", r"show.*products"],  "bullet_list"),
-    ("list_all",       [r"\blist all\b", r"\bshow all\b", r"\bget all\b", r"\bfetch all\b"],                                    "bullet_list"),
 
     # Detail requests — user wants full info
     ("full_details",   [r"\bdetails?\b", r"\bfull info\b", r"\btell me (about|more)", r"\bshow (me )?everything", r"\ball (fields|info|data)\b"], "table"),
@@ -368,4 +389,3 @@ def _fallback(raw: str) -> dict:
         "confidence":   0.5,
         "intent":       "unknown",
     }
-
