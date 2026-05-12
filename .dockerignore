@@ -17,8 +17,9 @@ memory_vectorstore_report/
 conversational_memory_vectorstore/
 menu_memory_vectorstore/
 
-# Data files (mount via volume instead)
-data/
+# Data files used to build the general RAG knowledge base
+# Keep the runtime volume mount in docker-compose.yml so local changes still work.
+# The image now includes these docs as a safe fallback when the mount is absent.
 
 # Dev / editor artefacts
 .git/
