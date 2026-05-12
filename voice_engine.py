@@ -23,7 +23,7 @@ try:
     LANGDETECT_AVAILABLE = True
 except ImportError:
     LANGDETECT_AVAILABLE = False
-    logger.warning("[VoiceEngine] langdetect not installed. Language detection disabled. Run: pip install langdetect")
+    logger.warning( "[VoiceEngine] langdetect not installed. Language detection disabled. Run: pip install langdetect")
 
 try:
     from deep_translator import GoogleTranslator
@@ -73,7 +73,7 @@ def translate_to_english(text: str, source_lang: str) -> str:
     safe_text = text[:_TRANSLATE_CHAR_LIMIT]
     try:
         translated = GoogleTranslator(source=source_lang, target="en").translate(safe_text)
-        logger.info(f"[VoiceEngine] Translated [{source_lang}→en]: {text[:60]} → {(translated or '')[:60]}")
+        logger.info( f"[VoiceEngine] Translated [{source_lang}→en]: {text[:60]} → {(translated or '')[:60]}")
         return translated or text
     except Exception as e:
         logger.warning(f"[VoiceEngine] Translation to English failed: {e} — using original")

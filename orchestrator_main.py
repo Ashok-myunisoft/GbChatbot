@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 import logging
 import traceback
@@ -15,9 +15,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 
-# Configure logging first — before any module-level log calls
+# Configure logging first â€” before any module-level log calls
 logging.basicConfig(level=logging.INFO)
-# RunPodLLM via shared_resources — ChatOllama no longer used
+# RunPodLLM via shared_resources â€” ChatOllama no longer used
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 import psycopg2
@@ -27,6 +27,7 @@ from shared_resources import ai_resources
 from response_formatter import format_response as _fmt_response
 import knowledge_loader
 import voice_engine
+import voice_agent
 import formatter_agent
 import agentic_classifier
 
@@ -214,11 +215,11 @@ ROLEID_TO_NAME = {
 # Memory storage
 MEMORY_VECTORSTORE_PATH = "conversational_memory_vectorstore"
 chats_db = {}
-user_sessions = {}          # { key → session_data }; evicted hourly
+user_sessions = {}          # { key â†’ session_data }; evicted hourly
 _USER_SESSION_TTL = 86400   # 24 hours
 
 # ===========================
-# RATE LIMITER (no extra library — pure Python)
+# RATE LIMITER (no extra library â€” pure Python)
 # 30 requests per user per 60 seconds.
 # Prevents a single user from burning RunPod credits.
 # ===========================
@@ -256,9 +257,9 @@ class PerformanceMonitoringMiddleware(BaseHTTPMiddleware):
         response.headers["X-Process-Time"] = f"{process_time:.2f}s"
         
         if process_time > 1.0:
-            logger.info(f"⏱️ Request {request.url.path} took {process_time:.2f}s")
+            logger.info(f"â±ï¸ Request {request.url.path} took {process_time:.2f}s")
         else:
-            logger.info(f"⚡ Request {request.url.path} took {process_time:.2f}s")
+            logger.info(f"âš¡ Request {request.url.path} took {process_time:.2f}s")
         
         return response
 
@@ -276,76 +277,76 @@ ROLE_GREETINGS = {
     UserRole.DEVELOPER: """Hi! I'm your GoodBooks ERP technical assistant.
 
 I can help with:
-• System architecture & APIs
-• Database schemas & queries
-• Code examples & implementation
-• Technical troubleshooting
+â€¢ System architecture & APIs
+â€¢ Database schemas & queries
+â€¢ Code examples & implementation
+â€¢ Technical troubleshooting
 
 What technical challenge can I solve?""",
 
     UserRole.IMPLEMENTATION: """Hello! I'm your GoodBooks implementation consultant.
 
 I assist with:
-• Setup & configuration steps
-• Client deployment procedures
-• Best practices & troubleshooting
+â€¢ Setup & configuration steps
+â€¢ Client deployment procedures
+â€¢ Best practices & troubleshooting
 
 How can I help with implementation?""",
 
     UserRole.MARKETING: """Hi! I'm your GoodBooks product expert.
 
 I help with:
-• Business value & ROI metrics
-• Competitive advantages
-• Sales materials & success stories
+â€¢ Business value & ROI metrics
+â€¢ Competitive advantages
+â€¢ Sales materials & success stories
 
 What would you like to explore?""",
 
-    UserRole.CLIENT: """Hello! Welcome to GoodBooks ERP! 😊
+    UserRole.CLIENT: """Hello! Welcome to GoodBooks ERP! ðŸ˜Š
 
 I'm here to help you with:
-• Understanding features
-• Step-by-step guidance
-• Finding what you need
+â€¢ Understanding features
+â€¢ Step-by-step guidance
+â€¢ Finding what you need
 
 What would you like to learn?""",
 
     UserRole.ADMIN: """Hello! I'm your GoodBooks system administrator assistant.
 
 I help with:
-• System administration
-• Configuration management
-• User permissions & monitoring
+â€¢ System administration
+â€¢ Configuration management
+â€¢ User permissions & monitoring
 
 What can I assist you with?""",
 
     UserRole.SYSTEM_ADMIN: """Hello! I'm your GoodBooks senior system administrator assistant.
 
 I'm here to help with:
-• Infrastructure & server health
-• Data security & access control
-• System optimization & maintenance
-• Technical administration
+â€¢ Infrastructure & server health
+â€¢ Data security & access control
+â€¢ System optimization & maintenance
+â€¢ Technical administration
 
 How can I help you keep the system running perfectly today?""",
 
     UserRole.MANAGER: """Hello! I'm your GoodBooks strategic management assistant.
 
 I can assist with:
-• Operational oversight & efficiency
-• Performance metrics & strategic insights
-• Team coordination & workflows
-• Business process optimization
+â€¢ Operational oversight & efficiency
+â€¢ Performance metrics & strategic insights
+â€¢ Team coordination & workflows
+â€¢ Business process optimization
 
 What management goals can I help you achieve today?""",
 
     UserRole.SALES: """Hello! I'm your GoodBooks sales and revenue assistant.
 
 I help with:
-• Lead management & pipelines
-• Sales forecasting & performance
-• CRM optimization & customer insights
-• Revenue growth strategies
+â€¢ Lead management & pipelines
+â€¢ Sales forecasting & performance
+â€¢ CRM optimization & customer insights
+â€¢ Revenue growth strategies
 
 How can I help you drive more sales today?"""
 }
@@ -506,8 +507,8 @@ OUT_OF_SCOPE_SYSTEM_PROMPT = """You are a GoodBooks ERP assistant speaking to a 
 User question: {question}
 
 Instructions:
-- If the question is related to ERP, business processes, HR, payroll, accounting, inventory, finance, company management, software features, or GoodBooks modules → answer it helpfully using your ERP knowledge. Do NOT redirect.
-- If the question is completely unrelated to ERP or business software (e.g. sports, entertainment, politics, personal advice) → politely explain you are a GoodBooks ERP assistant and redirect them to relevant GoodBooks features.
+- If the question is related to ERP, business processes, HR, payroll, accounting, inventory, finance, company management, software features, or GoodBooks modules â†’ answer it helpfully using your ERP knowledge. Do NOT redirect.
+- If the question is completely unrelated to ERP or business software (e.g. sports, entertainment, politics, personal advice) â†’ politely explain you are a GoodBooks ERP assistant and redirect them to relevant GoodBooks features.
 
 Keep the response brief and appropriate for a {role}.
 
@@ -599,7 +600,7 @@ class ConversationHistoryManager:
                 thread.user_name = row["user_name"]
                 self.threads[row["thread_id"]] = thread
 
-            logger.info(f"✅ Loaded {len(self.threads)} recent threads from PostgreSQL")
+            logger.info(f"âœ… Loaded {len(self.threads)} recent threads from PostgreSQL")
         except Exception as e:
             logger.error(f"Failed to load threads from PostgreSQL: {e}", exc_info=True)
             self.threads = {}
@@ -674,7 +675,7 @@ class ConversationHistoryManager:
                 )
             conn.commit()
             release_pg_conn(conn)
-            logger.info(f"✅ Batch-saved {len(threads)} threads to PostgreSQL")
+            logger.info(f"âœ… Batch-saved {len(threads)} threads to PostgreSQL")
         except Exception as e:
             logger.error(f"Error in save_threads batch upsert: {e}")
             # Fallback: individual upserts
@@ -684,9 +685,9 @@ class ConversationHistoryManager:
     def create_new_thread(self, username: str, initial_message: str = None) -> str:
         thread_id = str(uuid.uuid4())
         thread = ConversationThread(thread_id, username)
-        # Title will be set by LLM after first response — keep as "New Conversation" for now
+        # Title will be set by LLM after first response â€” keep as "New Conversation" for now
         self.threads[thread_id] = thread
-        # Skip DB write for warmup — don't pollute conversation_threads table
+        # Skip DB write for warmup â€” don't pollute conversation_threads table
         if username != "__warmup__":
             self._upsert_thread(thread)
         logger.info(f"Created new thread {thread_id} for {username}")
@@ -815,14 +816,14 @@ class EnhancedConversationalMemory:
                         }
                     ))
                 self.memory_vectorstore = FAISS.from_documents(docs, self.embeddings)
-                logger.info(f"✅ Rebuilt FAISS memory from {len(docs)} PostgreSQL rows.")
+                logger.info(f"âœ… Rebuilt FAISS memory from {len(docs)} PostgreSQL rows.")
             else:
                 dummy_doc = Document(page_content="Memory system initialized", metadata={"memory_id": "init"})
                 self.memory_vectorstore = FAISS.from_documents([dummy_doc], self.embeddings)
-                logger.info("✅ Created fresh FAISS memory vectorstore.")
+                logger.info("âœ… Created fresh FAISS memory vectorstore.")
         except Exception as e:
             logger.error(
-                f"CRITICAL: Failed to load conversation memory from PostgreSQL — "
+                f"CRITICAL: Failed to load conversation memory from PostgreSQL â€” "
                 f"all prior user context is unavailable this session: {e}",
                 exc_info=True
             )
@@ -882,9 +883,9 @@ class EnhancedConversationalMemory:
 
     def retrieve_contextual_memories(self, username: str, query: str, k: int = 3, thread_id: str = None, thread_isolation: bool = False) -> List[Dict]:
         try:
-            # Single FAISS search — fetches k*3 to allow deduplication and filtering
+            # Single FAISS search â€” fetches k*3 to allow deduplication and filtering
             # Removed secondary/tertiary searches: same model, same index, same embeddings
-            # → results were near-identical duplicates, just wasting 3x CPU per request
+            # â†’ results were near-identical duplicates, just wasting 3x CPU per request
             all_docs = self.memory_vectorstore.similarity_search(query, k=k * 3)
 
             user_memories = {}
@@ -1028,7 +1029,7 @@ class SharedContextRegistry:
                 )
                 del self.context_store[username][bot_type][oldest_key]
 
-        logger.info(f"📚 Stored context '{context_key}' for {username}:{bot_type}")
+        logger.info(f"ðŸ“š Stored context '{context_key}' for {username}:{bot_type}")
 
     def get_relevant_contexts(self, username: str, current_bot_type: str, query: str, max_contexts: int = 3) -> List[Dict]:
         """Get relevant contexts from other bots that might help with the current query"""
@@ -1087,7 +1088,7 @@ class SharedContextRegistry:
         relevant_contexts.sort(key=lambda x: x['relevance_score'], reverse=True)
         top_contexts = relevant_contexts[:max_contexts]
 
-        logger.info(f"🔗 Found {len(top_contexts)} relevant cross-bot contexts for {username}:{current_bot_type}")
+        logger.info(f"ðŸ”— Found {len(top_contexts)} relevant cross-bot contexts for {username}:{current_bot_type}")
         return top_contexts
 
     def _calculate_context_relevance(self, context_data: Dict, query: str) -> float:
@@ -1153,7 +1154,7 @@ class SharedContextRegistry:
                 del self.context_store[username]
 
         if cleaned_count > 0:
-            logger.info(f"🧹 Cleaned up {cleaned_count} old contexts from registry")
+            logger.info(f"ðŸ§¹ Cleaned up {cleaned_count} old contexts from registry")
 
 # Initialize shared context registry
 shared_context_registry = SharedContextRegistry()
@@ -1175,7 +1176,7 @@ def _extract_clean_response(response: str) -> str:
         return response
     stripped = response.strip()
     if stripped.startswith("{'output':") or stripped.startswith('{"output":'):
-        # Try regex first — works even on truncated strings
+        # Try regex first â€” works even on truncated strings
         match = re.search(r"""['"]output['"]\s*:\s*['"](.+)""", stripped, re.DOTALL)
         if match:
             raw = match.group(1)
@@ -1198,11 +1199,11 @@ class GeneralBotWrapper:
     @staticmethod
     async def answer(question: str, context: str, user_role: str, username: str = "anonymous") -> str:
         if not GENERAL_BOT_AVAILABLE:
-            logger.warning("❌ General bot not available")
+            logger.warning("âŒ General bot not available")
             return None
         try:
-            logger.info(f"📞 Calling general_bot with question: {question[:100]}")
-            logger.info(f"📚 Passing context: {len(context)} chars")
+            logger.info(f"ðŸ“ž Calling general_bot with question: {question[:100]}")
+            logger.info(f"ðŸ“š Passing context: {len(context)} chars")
             
             message = EnhancedMessage(question, context)
             login_header = json.dumps({"UserName": username, "Role": user_role})
@@ -1238,28 +1239,28 @@ class GeneralBotWrapper:
                 )
                 
                 if is_refusal:
-                    logger.warning(f"⚠️ General bot returned refusal: {response[:150]}")
+                    logger.warning(f"âš ï¸ General bot returned refusal: {response[:150]}")
                     return None
                 else:
-                    logger.info(f"✅ General bot returned valid answer: {response[:100]}")
+                    logger.info(f"âœ… General bot returned valid answer: {response[:100]}")
                     return response
             else:
-                logger.warning("⚠️ General bot returned empty response")
+                logger.warning("âš ï¸ General bot returned empty response")
                 return None
                 
         except Exception as e:
-            logger.error(f"❌ General bot error: {e}", exc_info=True)
+            logger.error(f"âŒ General bot error: {e}", exc_info=True)
             return None
 
 class FormulaBot:
     @staticmethod
     async def answer(question: str, context: str, user_role: str, username: str = "anonymous") -> str:
         if not FORMULA_BOT_AVAILABLE:
-            logger.warning("❌ Formula bot not available")
+            logger.warning("âŒ Formula bot not available")
             return None
         try:
-            logger.info(f"📞 Calling formula_bot with question: {question[:100]}")
-            logger.info(f"📚 Passing context: {len(context)} chars")
+            logger.info(f"ðŸ“ž Calling formula_bot with question: {question[:100]}")
+            logger.info(f"ðŸ“š Passing context: {len(context)} chars")
             
             message = EnhancedMessage(question, context)
             login_header = json.dumps({"UserName": username, "Role": user_role})
@@ -1285,28 +1286,28 @@ class FormulaBot:
                 is_refusal = any(pattern in response_lower for pattern in refusal_patterns)
                 
                 if is_refusal:
-                    logger.warning(f"⚠️ Formula bot returned refusal: {response[:150]}")
+                    logger.warning(f"âš ï¸ Formula bot returned refusal: {response[:150]}")
                     return None
                 else:
-                    logger.info(f"✅ Formula bot returned valid answer: {response[:100]}")
+                    logger.info(f"âœ… Formula bot returned valid answer: {response[:100]}")
                     return response
             else:
-                logger.warning("⚠️ Formula bot returned empty response")
+                logger.warning("âš ï¸ Formula bot returned empty response")
                 return None
                 
         except Exception as e:
-            logger.error(f"❌ Formula bot error: {e}", exc_info=True)
+            logger.error(f"âŒ Formula bot error: {e}", exc_info=True)
             return None
 
 class ReportBot:
     @staticmethod
     async def answer(question: str, context: str, user_role: str, username: str = "anonymous") -> str:
         if not REPORT_BOT_AVAILABLE:
-            logger.warning("❌ Report bot not available")
+            logger.warning("âŒ Report bot not available")
             return None
         try:
-            logger.info(f"📞 Calling report_bot with question: {question[:100]}")
-            logger.info(f"📚 Passing context: {len(context)} chars")
+            logger.info(f"ðŸ“ž Calling report_bot with question: {question[:100]}")
+            logger.info(f"ðŸ“š Passing context: {len(context)} chars")
             
             message = EnhancedMessage(question, context)
             login_header = json.dumps({"UserName": username, "Role": user_role})
@@ -1332,28 +1333,28 @@ class ReportBot:
                 is_refusal = any(pattern in response_lower for pattern in refusal_patterns)
                 
                 if is_refusal:
-                    logger.warning(f"⚠️ Report bot returned refusal: {response[:150]}")
+                    logger.warning(f"âš ï¸ Report bot returned refusal: {response[:150]}")
                     return None
                 else:
-                    logger.info(f"✅ Report bot returned valid answer: {response[:100]}")
+                    logger.info(f"âœ… Report bot returned valid answer: {response[:100]}")
                     return response
             else:
-                logger.warning("⚠️ Report bot returned empty response")
+                logger.warning("âš ï¸ Report bot returned empty response")
                 return None
                 
         except Exception as e:
-            logger.error(f"❌ Report bot error: {e}", exc_info=True)
+            logger.error(f"âŒ Report bot error: {e}", exc_info=True)
             return None
 
 class MenuBot:
     @staticmethod
     async def answer(question: str, context: str, user_role: str, username: str = "anonymous") -> str:
         if not MENU_BOT_AVAILABLE:
-            logger.warning("❌ Menu bot not available")
+            logger.warning("âŒ Menu bot not available")
             return None
         try:
-            logger.info(f"📞 Calling menu_bot with question: {question[:100]}")
-            logger.info(f"📚 Passing context: {len(context)} chars")
+            logger.info(f"ðŸ“ž Calling menu_bot with question: {question[:100]}")
+            logger.info(f"ðŸ“š Passing context: {len(context)} chars")
             
             message = EnhancedMessage(question, context)
             login_header = json.dumps({"UserName": username, "Role": user_role})
@@ -1379,28 +1380,28 @@ class MenuBot:
                 is_refusal = any(pattern in response_lower for pattern in refusal_patterns)
                 
                 if is_refusal:
-                    logger.warning(f"⚠️ Menu bot returned refusal: {response[:150]}")
+                    logger.warning(f"âš ï¸ Menu bot returned refusal: {response[:150]}")
                     return None
                 else:
-                    logger.info(f"✅ Menu bot returned valid answer: {response[:100]}")
+                    logger.info(f"âœ… Menu bot returned valid answer: {response[:100]}")
                     return response
             else:
-                logger.warning("⚠️ Menu bot returned empty response")
+                logger.warning("âš ï¸ Menu bot returned empty response")
                 return None
                 
         except Exception as e:
-            logger.error(f"❌ Menu bot error: {e}", exc_info=True)
+            logger.error(f"âŒ Menu bot error: {e}", exc_info=True)
             return None
 
 class ProjectBot:
     @staticmethod
     async def answer(question: str, context: str, user_role: str, username: str = "anonymous") -> str:
         if not PROJECT_BOT_AVAILABLE:
-            logger.warning("❌ Project bot not available")
+            logger.warning("âŒ Project bot not available")
             return None
         try:
-            logger.info(f"📞 Calling project_bot with question: {question[:100]}")
-            logger.info(f"📚 Passing context: {len(context)} chars")
+            logger.info(f"ðŸ“ž Calling project_bot with question: {question[:100]}")
+            logger.info(f"ðŸ“š Passing context: {len(context)} chars")
             
             message = EnhancedMessage(question, context)
             login_header = json.dumps({"UserName": username, "Role": user_role})
@@ -1426,28 +1427,28 @@ class ProjectBot:
                 is_refusal = any(pattern in response_lower for pattern in refusal_patterns)
                 
                 if is_refusal:
-                    logger.warning(f"⚠️ Project bot returned refusal: {response[:150]}")
+                    logger.warning(f"âš ï¸ Project bot returned refusal: {response[:150]}")
                     return None
                 else:
-                    logger.info(f"✅ Project bot returned valid answer: {response[:100]}")
+                    logger.info(f"âœ… Project bot returned valid answer: {response[:100]}")
                     return response
             else:
-                logger.warning("⚠️ Project bot returned empty response")
+                logger.warning("âš ï¸ Project bot returned empty response")
                 return None
                 
         except Exception as e:
-            logger.error(f"❌ Project bot error: {e}", exc_info=True)
+            logger.error(f"âŒ Project bot error: {e}", exc_info=True)
             return None
 
 class SchemaBot:
     @staticmethod
     async def answer(question: str, context: str, user_role: str, username: str = "anonymous") -> str:
         if not SCHEMA_BOT_AVAILABLE:
-            logger.warning("❌ Schema bot not available")
+            logger.warning("âŒ Schema bot not available")
             return None
         try:
-            logger.info(f"📞 Calling schema_bot with question: {question[:100]}")
-            logger.info(f"📚 Passing context: {len(context)} chars")
+            logger.info(f"ðŸ“ž Calling schema_bot with question: {question[:100]}")
+            logger.info(f"ðŸ“š Passing context: {len(context)} chars")
 
             message = EnhancedMessage(question, context)
             login_header = json.dumps({"UserName": username, "Role": user_role})
@@ -1471,17 +1472,17 @@ class SchemaBot:
                 ]
                 is_refusal = any(pattern in response_lower for pattern in refusal_patterns)
                 if is_refusal:
-                    logger.warning(f"⚠️ Schema bot returned refusal: {response[:150]}")
+                    logger.warning(f"âš ï¸ Schema bot returned refusal: {response[:150]}")
                     return None
                 else:
-                    logger.info(f"✅ Schema bot returned valid answer: {response[:100]}")
+                    logger.info(f"âœ… Schema bot returned valid answer: {response[:100]}")
                     return response
             else:
-                logger.warning("⚠️ Schema bot returned empty response")
+                logger.warning("âš ï¸ Schema bot returned empty response")
                 return None
 
         except Exception as e:
-            logger.error(f"❌ Schema bot error: {e}", exc_info=True)
+            logger.error(f"âŒ Schema bot error: {e}", exc_info=True)
             return None
 
 # ===========================
@@ -1530,7 +1531,7 @@ def build_conversational_context(username: str, current_query: str, thread_id: s
     
     full_context = "\n".join(context_parts)
     
-    logger.info(f"📚 Built conversational context:")
+    logger.info(f"ðŸ“š Built conversational context:")
     logger.info(f"   - Thread messages: {len(thread.messages) if thread_id and thread else 0}")
     logger.info(f"   - Retrieved memories: {len(memories)}")
     logger.info(f"   - Total context size: {len(full_context)} chars")
@@ -1570,7 +1571,7 @@ async def build_filtered_context(username: str, user_question: str,
     
     # Step 3: If no highly relevant memories, don't force old history
     if not filtered_memories:
-        logger.info(f"⚠️  No relevant memories found. Question type: {extract_question_type(user_question)}")
+        logger.info(f"âš ï¸  No relevant memories found. Question type: {extract_question_type(user_question)}")
         source_files = ["Current_Query_Only"]
         context = f"""
 User: {username}
@@ -1618,8 +1619,8 @@ Relevance Score: {memory.get('relevance_score', 'N/A')}
 ---
 """
     
-    logger.info(f"📍 Built filtered context from {len(source_files)} source(s)")
-    logger.info(f"📍 Used {len(filtered_memories)} relevant memories")
+    logger.info(f"ðŸ“ Built filtered context from {len(source_files)} source(s)")
+    logger.info(f"ðŸ“ Used {len(filtered_memories)} relevant memories")
     
     return context, source_files
 
@@ -1646,10 +1647,10 @@ class AIOrchestrationAgent:
     
     def _understand_query(self, question: str) -> Optional[str]:
         """
-        Pure Python query understanding layer — runs BEFORE keyword matching.
+        Pure Python query understanding layer â€” runs BEFORE keyword matching.
         Understands user INTENT from natural language, not just exact keywords.
         Covers ~30% of questions that miss the keyword cache and fall to RunPod.
-        Zero LLM calls — pure pattern matching, < 1ms.
+        Zero LLM calls â€” pure pattern matching, < 1ms.
         """
         q = question.lower().strip()
         words = set(re.findall(r'\b\w+\b', q))
@@ -1704,7 +1705,7 @@ class AIOrchestrationAgent:
             if not any(token in q for token in _EXPLICIT_NON_AGENTIC):
                 return None
 
-        # --- ERP entity words — strong signal that user wants DB data ---
+        # --- ERP entity words â€” strong signal that user wants DB data ---
         _SCHEMA_ENTITIES = {
             'employee', 'employees', 'staff', 'worker', 'workers', 'personnel',
             'salary', 'salaries', 'payslip', 'payroll', 'payment', 'payments',
@@ -1770,7 +1771,7 @@ class AIOrchestrationAgent:
             'calculate', 'compute', 'formula', 'math', 'sum', 'average', 'total',
             'count', 'percentage', 'divide', 'multiply', 'subtract', 'add',
             'equation', 'expression', 'result of',
-            # NOTE: 'what is' and 'how much' removed — too broad; stolen general questions
+            # NOTE: 'what is' and 'how much' removed â€” too broad; stolen general questions
             '+', '-', '*', '/', '=', '%', 'mean', 'median', 'gst', 'tax', 'discount',
             'net amount', 'gross', 'valuation', 'variance',
             'interest', 'deduction', 'allowance', 'commission', 'wage',
@@ -1785,7 +1786,7 @@ class AIOrchestrationAgent:
             w in question_lower for w in ['show', 'list', 'get', 'give', 'all', 'fetch', 'display']
         )
         if (has_formula_keyword and has_numbers) or has_math_ops or is_formula_listing:
-            logger.info("🚀 Fast route: formula")
+            logger.info("ðŸš€ Fast route: formula")
             return "formula"
 
         # If this looks like an agentic personal/action query, don't let the
@@ -1800,14 +1801,14 @@ class AIOrchestrationAgent:
             if not any(word in question_lower for word in explicit_non_agentic):
                 return None
         
-        # Report bot keywords — only explicit report/chart/analysis requests
+        # Report bot keywords â€” only explicit report/chart/analysis requests
         # Removed: 'listing', 'history of', 'show me data', 'display data',
-        #          'performance', 'stats' (too generic — stolen schema/general queries)
+        #          'performance', 'stats' (too generic â€” stolen schema/general queries)
         report_keywords = [
             'report', 'analyze', 'analysis', 'chart', 'graph',
             'dashboard', 'visualize', 'kpi', 'trend', 'breakdown',
             'generate report', 'view report', 'show chart', 'create graph',
-            # NOTE: 'export' removed — conflicts with export engine keyword detection
+            # NOTE: 'export' removed â€” conflicts with export engine keyword detection
             'ledger', 'balance sheet', 'p&l', 'profit', 'loss',
             'payroll report', 'attendance report', 'sales report',
             'inventory report', 'purchase report', 'financial report',
@@ -1815,7 +1816,7 @@ class AIOrchestrationAgent:
             'statistics report', 'monthly report', 'annual report',
         ]
         if any(word in question_lower for word in report_keywords):
-            logger.info("🚀 Fast route: report")
+            logger.info("ðŸš€ Fast route: report")
             return "report"
         
         # Menu bot keywords
@@ -1832,15 +1833,15 @@ class AIOrchestrationAgent:
             'menucode', 'menu code',
         ]
         if any(word in question_lower for word in menu_keywords):
-            logger.info("🚀 Fast route: menu")
+            logger.info("ðŸš€ Fast route: menu")
             return "menu"
-        # Compound "menu*" column words (menuname, menupath, menuid, menutype, etc.) → menu bot
+        # Compound "menu*" column words (menuname, menupath, menuid, menutype, etc.) â†’ menu bot
         if any(w.startswith('menu') and len(w) > 4 for w in question_lower.split()):
-            logger.info("🚀 Fast route: menu (menu* column word)")
+            logger.info("ðŸš€ Fast route: menu (menu* column word)")
             return "menu"
-        # Compound "formula*" column words (formulaexpression, formulaname, formulaid, etc.) → formula bot
+        # Compound "formula*" column words (formulaexpression, formulaname, formulaid, etc.) â†’ formula bot
         if any(w.startswith('formula') and len(w) > 7 for w in question_lower.split()):
-            logger.info("🚀 Fast route: formula (formula* column word)")
+            logger.info("ðŸš€ Fast route: formula (formula* column word)")
             return "formula"
         
         # Structure/schema questions always go to schema bot, even for project-related tables
@@ -1851,7 +1852,7 @@ class AIOrchestrationAgent:
             'schema of', 'what does this table'
         ]
         if any(pattern in question_lower for pattern in structure_patterns):
-            logger.info("🚀 Fast route: schema (structure question)")
+            logger.info("ðŸš€ Fast route: schema (structure question)")
             return "schema"
 
         # Project bot keywords
@@ -1862,36 +1863,36 @@ class AIOrchestrationAgent:
             'project details', 'mfile', 'uploaded files', 'project data'
         ]
         if any(word in question_lower for word in project_keywords):
-            logger.info("🚀 Fast route: project")
+            logger.info("ðŸš€ Fast route: project")
             return "project"
 
-        # PostgreSQL table name detection — works for ALL table prefixes (M, PL, FW, HR, GL…)
-        # Uses the cached table list from db_query — no extra DB call.
+        # PostgreSQL table name detection â€” works for ALL table prefixes (M, PL, FW, HR, GLâ€¦)
+        # Uses the cached table list from db_query â€” no extra DB call.
         try:
             import db_query as _dq
             _detected = _dq._detect_table_from_question(question)
             if _detected:
                 tname = _detected.upper()
                 if tname in ('MREPORT',):
-                    logger.info(f"🚀 Fast route: report (table {tname})")
+                    logger.info(f"ðŸš€ Fast route: report (table {tname})")
                     return "report"
                 elif tname in ('MMENU',):
-                    logger.info(f"🚀 Fast route: menu (table {tname})")
+                    logger.info(f"ðŸš€ Fast route: menu (table {tname})")
                     return "menu"
                 elif tname in ('MFORMULAFIELD', 'MFORMULA'):
-                    logger.info(f"🚀 Fast route: formula (table {tname})")
+                    logger.info(f"ðŸš€ Fast route: formula (table {tname})")
                     return "formula"
                 elif tname in ('MFILE', 'MPROJECT'):
-                    logger.info(f"🚀 Fast route: project (table {tname})")
+                    logger.info(f"ðŸš€ Fast route: project (table {tname})")
                     return "project"
                 else:
-                    # All other tables (any prefix) → schema bot
-                    logger.info(f"🚀 Fast route: schema (table {tname})")
+                    # All other tables (any prefix) â†’ schema bot
+                    logger.info(f"ðŸš€ Fast route: schema (table {tname})")
                     return "schema"
         except Exception:
             pass  # Fall through to keyword and AI routing
 
-        # Schema bot keywords — structural and data-fetch queries
+        # Schema bot keywords â€” structural and data-fetch queries
         schema_keywords = [
             'column', 'columns', 'field', 'fields', 'table', 'tables',
             'schema', 'database schema', 'db schema', 'table structure',
@@ -1903,13 +1904,13 @@ class AIOrchestrationAgent:
             'picklist', 'pick list', 'dropdown', 'lookup', 'masterdata',
             'master data',
             # NOTE: 'give me', 'show me', 'find me', 'fetch me', 'what are', 'what is the'
-            # removed — too broad; stolen general/menu/report queries
+            # removed â€” too broad; stolen general/menu/report queries
         ]
         if any(word in question_lower for word in schema_keywords):
-            logger.info("🚀 Fast route: schema")
+            logger.info("ðŸš€ Fast route: schema")
             return "schema"
 
-        # General bot keywords — only when NOT a data/list query
+        # General bot keywords â€” only when NOT a data/list query
         # 'what is'/'explain' removed from here; handled after schema check to avoid
         # stealing DB queries like "what is the status of purchase order 123"
         general_keywords = [
@@ -1919,13 +1920,13 @@ class AIOrchestrationAgent:
             'about goodbooks', 'what is goodbooks', 'who is',
         ]
         if any(word in question_lower for word in general_keywords):
-            logger.info("🚀 Fast route: general")
+            logger.info("ðŸš€ Fast route: general")
             return "general"
         
         with self._intent_cache_lock:
             cached = self.intent_cache.get(question_lower)
         if cached:
-            logger.info(f"🚀 Cache hit: {cached}")
+            logger.info(f"ðŸš€ Cache hit: {cached}")
             return cached
         
         return None
@@ -1946,7 +1947,7 @@ class AIOrchestrationAgent:
             
             prompt = ORCHESTRATOR_SYSTEM_PROMPT.format(question=question)
             
-            logger.info(f"🤖 Using AI to route: {question[:80]}")
+            logger.info(f"ðŸ¤– Using AI to route: {question[:80]}")
             
             response = await asyncio.wait_for(
                 self.routing_llm.ainvoke(prompt),
@@ -1954,7 +1955,7 @@ class AIOrchestrationAgent:
             )
             
             intent = (response.content if hasattr(response, 'content') else str(response)).strip().lower()
-            logger.info(f"🎯 AI raw response: {intent}")
+            logger.info(f"ðŸŽ¯ AI raw response: {intent}")
             
             valid_intents = ["general", "formula", "report", "menu", "project", "schema"]
             
@@ -1964,7 +1965,7 @@ class AIOrchestrationAgent:
                     break
             
             if intent not in valid_intents:
-                logger.warning(f"⚠️ Invalid AI intent '{intent}', analyzing question structure")
+                logger.warning(f"âš ï¸ Invalid AI intent '{intent}', analyzing question structure")
                 # Use both question AND context for better fallback routing.
                 # Context helps resolve vague follow-ups like "tell me more about it"
                 # by checking what bot was used in the previous turn.
@@ -1985,7 +1986,7 @@ class AIOrchestrationAgent:
                     intent = "general"
                 else:
                     intent = "general"
-                logger.info(f"📊 Fallback analysis selected (with context): {intent}")
+                logger.info(f"ðŸ“Š Fallback analysis selected (with context): {intent}")
             
             key = question.lower().strip()
             with self._intent_cache_lock:
@@ -1993,11 +1994,11 @@ class AIOrchestrationAgent:
                     keep = list(self.intent_cache.items())[250:]
                     self.intent_cache = dict(keep)
                 self.intent_cache[key] = intent
-            logger.info(f"✅ Final routing decision: {intent}")
+            logger.info(f"âœ… Final routing decision: {intent}")
             return intent
             
         except asyncio.TimeoutError:
-            logger.error("⏱️ Intent detection timeout (70s), using intelligent fallback")
+            logger.error("â±ï¸ Intent detection timeout (70s), using intelligent fallback")
             fallback = self._get_cached_intent(question)
             if not fallback:
                 question_lower = question.lower()
@@ -2013,18 +2014,18 @@ class AIOrchestrationAgent:
                     fallback = "general"
                 else:
                     fallback = "general"
-            logger.info(f"🔍 Timeout fallback route: {fallback}")
+            logger.info(f"ðŸ” Timeout fallback route: {fallback}")
             return fallback
         except Exception as e:
-            logger.error(f"❌ Intent detection error: {e}", exc_info=True)
+            logger.error(f"âŒ Intent detection error: {e}", exc_info=True)
             fallback = self._get_cached_intent(question) or "general"
-            logger.info(f"🔍 Error fallback route: {fallback}")
+            logger.info(f"ðŸ” Error fallback route: {fallback}")
             return fallback
     
     async def generate_out_of_scope_response(self, question: str, user_role: str) -> str:
         """Generate brief out-of-scope response"""
         try:
-            logger.info(f"🚫 Generating out-of-scope response for role: {user_role}")
+            logger.info(f"ðŸš« Generating out-of-scope response for role: {user_role}")
             prompt = OUT_OF_SCOPE_SYSTEM_PROMPT.format(
                 role=user_role,
                 question=question
@@ -2036,14 +2037,14 @@ class AIOrchestrationAgent:
             )
 
             generated = (response.content if hasattr(response, 'content') else str(response)).strip()
-            logger.info(f"✅ Out-of-scope response generated: {generated[:100]}")
+            logger.info(f"âœ… Out-of-scope response generated: {generated[:100]}")
             return generated
 
         except asyncio.TimeoutError:
-            logger.warning("⏱️ Out-of-scope response timeout")
+            logger.warning("â±ï¸ Out-of-scope response timeout")
             return f"I'm your GoodBooks ERP assistant. I specialize in helping with GoodBooks features and functionality. Could you please ask me about something related to GoodBooks ERP?"
         except Exception as e:
-            logger.error(f"❌ Out-of-scope response error: {e}")
+            logger.error(f"âŒ Out-of-scope response error: {e}")
             return f"I'm here to help with GoodBooks ERP. What would you like to know about our system?"
     
     async def apply_role_perspective(self, answer: str, user_role: str, question: str) -> str:
@@ -2051,19 +2052,19 @@ class AIOrchestrationAgent:
         try:
             greeting_words = ['hello', 'hi there', 'welcome', 'greetings', "i'm here to help"]
             if any(word in answer.lower() for word in greeting_words) and len(answer) < 200:
-                logger.info("⚡ Skipping role adaptation - greeting detected")
+                logger.info("âš¡ Skipping role adaptation - greeting detected")
                 return answer
             
             error_phrases = ['error', 'try again', 'something went wrong', "couldn't", "unable to"]
             if any(phrase in answer.lower() for phrase in error_phrases):
-                logger.info("⚡ Skipping role adaptation - error message")
+                logger.info("âš¡ Skipping role adaptation - error message")
                 return answer
             
             if len(answer.strip()) < 30:
-                logger.info("⚡ Skipping role adaptation - answer too short")
+                logger.info("âš¡ Skipping role adaptation - answer too short")
                 return answer
             
-            logger.info(f"🎭 Applying {user_role} perspective to answer...")
+            logger.info(f"ðŸŽ­ Applying {user_role} perspective to answer...")
             
             role_personality = ROLE_SYSTEM_PROMPTS.get(user_role, ROLE_SYSTEM_PROMPTS[UserRole.CLIENT])
             
@@ -2086,17 +2087,17 @@ Rewritten Answer:"""
             role_adapted = (response.content if hasattr(response, 'content') else str(response)).strip()
             
             if role_adapted and len(role_adapted) > 20:
-                logger.info(f"✅ Role perspective applied successfully ({len(role_adapted)} chars)")
+                logger.info(f"âœ… Role perspective applied successfully ({len(role_adapted)} chars)")
                 return role_adapted
             else:
-                logger.warning("⚠️ Role adaptation produced insufficient result, using original")
+                logger.warning("âš ï¸ Role adaptation produced insufficient result, using original")
                 return answer
             
         except asyncio.TimeoutError:
-            logger.warning("⏱️ Role adaptation timeout, using original answer")
+            logger.warning("â±ï¸ Role adaptation timeout, using original answer")
             return answer
         except Exception as e:
-            logger.error(f"❌ Role perspective error: {e}")
+            logger.error(f"âŒ Role perspective error: {e}")
             return answer
     
     async def process_request(self, username: str, user_role: str, question: str,
@@ -2106,8 +2107,8 @@ Rewritten Answer:"""
 
         start_time = time.time()
         logger.info("="*80)
-        logger.info(f"🚀 NEW REQUEST from {username} (Role: {user_role})")
-        logger.info(f"💬 Question: {question}")
+        logger.info(f"ðŸš€ NEW REQUEST from {username} (Role: {user_role})")
+        logger.info(f"ðŸ’¬ Question: {question}")
         logger.info("="*80)
 
         # IMPROVED: Only prompt for role when it's a NEW thread with no role set
@@ -2128,7 +2129,7 @@ Rewritten Answer:"""
                         thread.user_role = user_role
                         thread.user_name = user_name
                         await asyncio.to_thread(history_manager.save_threads)
-                    logger.info(f"🎭 User set role to: {user_role}, name: {user_name} for thread {thread_id}")
+                    logger.info(f"ðŸŽ­ User set role to: {user_role}, name: {user_name} for thread {thread_id}")
                     confirmation = f"Hello {user_name if user_name else username}! I've set your role to {user_role}. How can I help you with GoodBooks ERP today?"
                     return {
                         "response":     confirmation,
@@ -2161,24 +2162,24 @@ For example: "Name: John, Role: developer" """
         if thread_id and is_existing_thread:
             thread = history_manager.get_thread(thread_id)
             if thread:
-                # ✅ IMPROVED: Better role persistence and retrieval
+                # âœ… IMPROVED: Better role persistence and retrieval
                 if thread.user_role:
                     user_role = thread.user_role
-                    logger.info(f"✅ Using persisted role from thread {thread_id}: {user_role}")
+                    logger.info(f"âœ… Using persisted role from thread {thread_id}: {user_role}")
                 else:
                     # Thread exists but no role set - this shouldn't happen for existing threads
-                    logger.warning(f"⚠️ Existing thread {thread_id} has no role set - using login role")
+                    logger.warning(f"âš ï¸ Existing thread {thread_id} has no role set - using login role")
                     user_role = user_role  # Use the provided role
                     thread.user_role = user_role  # Set it for future use
                     await asyncio.to_thread(history_manager.save_threads)
             else:
                 # Thread ID provided but thread not found - create new thread
-                logger.warning(f"⚠️ Thread {thread_id} not found, creating new thread")
+                logger.warning(f"âš ï¸ Thread {thread_id} not found, creating new thread")
                 thread_id = history_manager.create_new_thread(username, question)
                 is_existing_thread = False
 
         if is_greeting(question):
-            logger.info(f"⚡ INSTANT greeting response (0.0s)")
+            logger.info(f"âš¡ INSTANT greeting response (0.0s)")
             greeting_response = get_greeting_response(user_role)
 
             # Skip all slow operations for greetings - do them in background
@@ -2214,7 +2215,7 @@ For example: "Name: John, Role: developer" """
                 "download_url": None
             }
         
-        # ── File Intelligence: answer from uploaded file first ────────────────
+        # â”€â”€ File Intelligence: answer from uploaded file first â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if FILE_ENGINE_AVAILABLE and file_engine.has_file(username, thread_id):
             file_context = await asyncio.to_thread(file_engine.search, username, question, thread_id)
             if file_context and len(file_context.strip()) >= 20:
@@ -2248,7 +2249,7 @@ For example: "Name: John, Role: developer" """
                         _edownload_url = None
                         if _efile_id:
                             _edownload_url = f"{BASE_URL}/gbaiapi/download/{_efile_id}"
-                            _file_answer += f"\n\n📥 Download {_efmt.upper()}: {_edownload_url}"
+                            _file_answer += f"\n\nðŸ“¥ Download {_efmt.upper()}: {_edownload_url}"
                 await asyncio.to_thread(update_enhanced_memory, username, question, _file_answer, "file_intelligence", user_role, thread_id)
                 return {
                     "response":     _file_answer,
@@ -2258,9 +2259,9 @@ For example: "Name: John, Role: developer" """
                     "user_role":    user_role,
                     "download_url": _edownload_url
                 }
-        # ── End File Intelligence ─────────────────────────────────────────────
+        # â”€â”€ End File Intelligence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-        # ── Agentic Classifier: personal + action intents → Chat Interface API ─
+        # â”€â”€ Agentic Classifier: personal + action intents â†’ Chat Interface API â”€
         _in_session = await asyncio.to_thread(agentic_classifier.is_in_session, username)
 
         # Session escape: if user is mid-session but sends a general question,
@@ -2272,13 +2273,13 @@ For example: "Name: John, Role: developer" """
             if not _is_slot:
                 logger.info(
                     f"[AgenticClassifier] Non-slot question during session for {username} "
-                    f"— ending session, routing to existing bots"
+                    f"â€” ending session, routing to existing bots"
                 )
                 await asyncio.to_thread(agentic_classifier.end_session, username)
                 _in_session = False
 
         if _in_session:
-            # Genuine slot-filling response — send directly to API
+            # Genuine slot-filling response â€” send directly to API
             _agentic_response = await asyncio.to_thread(
                 agentic_classifier.call_chat_interface, question, username, login_dto
             )
@@ -2287,7 +2288,7 @@ For example: "Name: John, Role: developer" """
                     update_enhanced_memory,
                     username, question, _agentic_response, "session", user_role, thread_id
                 )
-                logger.info(f"[AgenticClassifier] Slot-filling session active — returning API response for {username}")
+                logger.info(f"[AgenticClassifier] Slot-filling session active â€” returning API response for {username}")
                 return {
                     "response":  _agentic_response,
                     "formatted": await asyncio.to_thread(formatter_agent.format, question, _agentic_response),
@@ -2296,10 +2297,10 @@ For example: "Name: John, Role: developer" """
                     "user_role": user_role,
                     "download_url": None
                 }
-            # Session API failed → fall through to existing bots
-            logger.warning(f"[AgenticClassifier] Session API failed for {username} — falling back to existing bots")
+            # Session API failed â†’ fall through to existing bots
+            logger.warning(f"[AgenticClassifier] Session API failed for {username} â€” falling back to existing bots")
         else:
-            # No active session — classify the intent fresh
+            # No active session â€” classify the intent fresh
             _agentic_intent = await asyncio.to_thread(agentic_classifier.classify, question)
             if _agentic_intent in ("personal", "action"):
                 # For action intent: normalize the message to a direct API command
@@ -2313,7 +2314,7 @@ For example: "Name: John, Role: developer" """
                     agentic_classifier.call_chat_interface, _api_question, username, login_dto
                 )
                 if _agentic_response:
-                    # Personal queries are one-shot — end session immediately.
+                    # Personal queries are one-shot â€” end session immediately.
                     if _agentic_intent == "personal":
                         await asyncio.to_thread(agentic_classifier.end_session, username)
                     await asyncio.to_thread(
@@ -2329,17 +2330,17 @@ For example: "Name: John, Role: developer" """
                         "user_role": user_role,
                         "download_url": None
                     }
-                # API failed → log and fall through to existing bots
-                logger.warning(f"[AgenticClassifier] API unavailable for intent={_agentic_intent} — falling back to existing bots")
-        # ── End Agentic Classifier ────────────────────────────────────────────
+                # API failed â†’ log and fall through to existing bots
+                logger.warning(f"[AgenticClassifier] API unavailable for intent={_agentic_intent} â€” falling back to existing bots")
+        # â”€â”€ End Agentic Classifier â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-        logger.info("📚 Building conversational context...")
+        logger.info("ðŸ“š Building conversational context...")
         if is_existing_thread and thread_id:
             context = build_conversational_context(username, question, thread_id, thread_isolation=True)
         else:
             context = build_conversational_context(username, question, thread_id, thread_isolation=False)
 
-        # Detect "try again" / "retry" — re-use the previous question and intent
+        # Detect "try again" / "retry" â€” re-use the previous question and intent
         retry_phrases = {"try again", "retry", "try once more", "please retry", "try that again", "again"}
         if question.lower().strip() in retry_phrases and thread_id:
             thread = history_manager.get_thread(thread_id)
@@ -2347,11 +2348,11 @@ For example: "Name: John, Role: developer" """
                 last_msg = thread.messages[-1]
                 prev_question = last_msg.get("user_message", question)
                 prev_bot = last_msg.get("bot_type", "general")
-                logger.info(f"🔄 Retry detected — replaying question: '{prev_question}' with bot: {prev_bot}")
+                logger.info(f"ðŸ”„ Retry detected â€” replaying question: '{prev_question}' with bot: {prev_bot}")
                 question = prev_question
                 context = build_conversational_context(username, question, thread_id, thread_isolation=True)
 
-        # ── Base Answer Quality (every question) ──────────────────────────────
+        # â”€â”€ Base Answer Quality (every question) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Lightweight instruction appended to context for ALL questions.
         # Reinforces bot prompts to ensure complete, precise first-time answers.
         _base_quality = (
@@ -2363,11 +2364,11 @@ For example: "Name: John, Role: developer" """
             "=== END QUALITY STANDARD ==="
         )
         context = (context + _base_quality) if context else _base_quality
-        # ── End Base Answer Quality ────────────────────────────────────────────
+        # â”€â”€ End Base Answer Quality â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-        # ── Deep Analysis Detection ───────────────────────────────────────────
+        # â”€â”€ Deep Analysis Detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Triggers when user is dissatisfied OR repeats the same question.
-        # Only modifies the context string — no bot logic or routing is changed.
+        # Only modifies the context string â€” no bot logic or routing is changed.
         deep_analysis_needed = False
 
         # Signal 1: User explicitly expresses dissatisfaction or asks for more
@@ -2381,9 +2382,9 @@ For example: "Name: John, Role: developer" """
         ]
         if any(phrase in question.lower() for phrase in dissatisfaction_phrases):
             deep_analysis_needed = True
-            logger.info("🔍 Deep analysis triggered: dissatisfaction signal detected")
+            logger.info("ðŸ” Deep analysis triggered: dissatisfaction signal detected")
 
-        # Signal 2: Current question has ≥70% word overlap with the last question
+        # Signal 2: Current question has â‰¥70% word overlap with the last question
         # (same question asked again, possibly rephrased)
         if not deep_analysis_needed and thread_id:
             _thread_obj = history_manager.get_thread(thread_id)
@@ -2399,7 +2400,7 @@ For example: "Name: John, Role: developer" """
                         _overlap = len(_curr_words & _prev_words) / max(len(_curr_words), len(_prev_words))
                         if _overlap >= 0.7:
                             deep_analysis_needed = True
-                            logger.info(f"🔍 Deep analysis triggered: question similarity {_overlap:.0%}")
+                            logger.info(f"ðŸ” Deep analysis triggered: question similarity {_overlap:.0%}")
 
         if deep_analysis_needed:
             _depth_note = (
@@ -2413,10 +2414,10 @@ For example: "Name: John, Role: developer" """
                 "=== END DEEP ANALYSIS ==="
             )
             context = (context + _depth_note) if context else _depth_note
-            logger.info("📣 Deep analysis instruction appended to context")
-        # ── End Deep Analysis Detection ───────────────────────────────────────
+            logger.info("ðŸ“£ Deep analysis instruction appended to context")
+        # â”€â”€ End Deep Analysis Detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-        # ── Follow-up detection: short question referencing previous turn ──────
+        # â”€â”€ Follow-up detection: short question referencing previous turn â”€â”€â”€â”€â”€â”€
         # Reuse last bot_type so "tell me more" / "show more" stay in the same bot
         # instead of falling through to AI routing (saves 5-15s per follow-up)
         _FOLLOWUP_PHRASES = {
@@ -2442,19 +2443,19 @@ For example: "Name: John, Role: developer" """
                 _last_bot = _thread.messages[-1].get("bot_type", "")
                 _skip_types = {"greeting", "role_setup", "role_prompt", "out_of_scope", "general_fallback", "error", ""}
                 if _last_bot not in _skip_types:
-                    logger.info(f"🔄 Follow-up detected → reusing last bot: {_last_bot}")
+                    logger.info(f"ðŸ”„ Follow-up detected â†’ reusing last bot: {_last_bot}")
                     intent = _last_bot
                     selected_bot = self.bots.get(intent, self.bots["general"])
                     answer = None
                     bot_type = intent
-                    logger.info(f"🤖 Executing {intent} bot (follow-up)...")
+                    logger.info(f"ðŸ¤– Executing {intent} bot (follow-up)...")
                     try:
                         answer = await asyncio.wait_for(
                             selected_bot.answer(question, context, user_role, username),
                             timeout=120.0
                         )
                     except (asyncio.TimeoutError, Exception) as _fe:
-                        logger.warning(f"Follow-up bot failed: {_fe} — falling through to normal routing")
+                        logger.warning(f"Follow-up bot failed: {_fe} â€” falling through to normal routing")
                         answer = None
                     if answer and len(answer.strip()) >= 10:
                         answer = _extract_clean_response(answer)
@@ -2462,7 +2463,7 @@ For example: "Name: John, Role: developer" """
                         _formatted = await asyncio.to_thread(formatter_agent.format, question, answer)
                         await asyncio.to_thread(update_enhanced_memory, username, question, answer, bot_type, user_role, thread_id)
                         elapsed = time.time() - start_time
-                        logger.info(f"✅ Follow-up completed in {elapsed:.2f}s")
+                        logger.info(f"âœ… Follow-up completed in {elapsed:.2f}s")
                         return {
                             "response":     answer,
                             "formatted":    _formatted,
@@ -2471,13 +2472,13 @@ For example: "Name: John, Role: developer" """
                             "user_role":    user_role,
                             "download_url": None
                         }
-        # ── End follow-up detection ───────────────────────────────────────────
+        # â”€â”€ End follow-up detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-        logger.info("🎯 Detecting intent...")
+        logger.info("ðŸŽ¯ Detecting intent...")
         intent = await self.detect_intent_with_ai(question, context)
-        logger.info(f"🎯 INTENT SELECTED: {intent}")
+        logger.info(f"ðŸŽ¯ INTENT SELECTED: {intent}")
 
-        # 🔗 ENHANCED: Add cross-bot context sharing
+        # ðŸ”— ENHANCED: Add cross-bot context sharing
         cross_bot_contexts = shared_context_registry.get_relevant_contexts(username, intent, question)
         if cross_bot_contexts:
             context_parts = [context] if context else []
@@ -2498,66 +2499,66 @@ For example: "Name: John, Role: developer" """
                 context_parts.append("")
 
             context = "\n".join(context_parts)
-            logger.info(f"🔗 Added {len(cross_bot_contexts)} cross-bot contexts")
+            logger.info(f"ðŸ”— Added {len(cross_bot_contexts)} cross-bot contexts")
         
         selected_bot = self.bots.get(intent, self.bots["general"])
         answer = None
         bot_type = intent
         
-        logger.info(f"🤖 Executing {intent} bot...")
+        logger.info(f"ðŸ¤– Executing {intent} bot...")
         try:
             answer = await asyncio.wait_for(
                 selected_bot.answer(question, context, user_role, username),
                 timeout=120.0
             )
-            logger.info(f"📥 {intent} bot response received: {len(answer) if answer else 0} chars")
+            logger.info(f"ðŸ“¥ {intent} bot response received: {len(answer) if answer else 0} chars")
         except asyncio.TimeoutError:
-            logger.error(f"⏱️ Bot {intent} execution timeout (120s)")
+            logger.error(f"â±ï¸ Bot {intent} execution timeout (120s)")
             answer = None
         except Exception as e:
-            logger.error(f"❌ Bot {intent} execution error: {e}", exc_info=True)
+            logger.error(f"âŒ Bot {intent} execution error: {e}", exc_info=True)
             answer = None
         
         if not answer or len(answer.strip()) < 10:
-            logger.warning(f"⚠️ Primary bot '{intent}' returned insufficient answer (len={len(answer) if answer else 0})")
+            logger.warning(f"âš ï¸ Primary bot '{intent}' returned insufficient answer (len={len(answer) if answer else 0})")
             
             if intent != "general":
-                logger.info("🔄 Attempting fallback to general bot...")
+                logger.info("ðŸ”„ Attempting fallback to general bot...")
                 try:
                     answer = await asyncio.wait_for(
                         self.bots["general"].answer(question, context, user_role, username),
                         timeout=120.0
                     )
                     if answer and len(answer.strip()) >= 10:
-                        logger.info(f"✅ General bot fallback successful: {len(answer)} chars")
+                        logger.info(f"âœ… General bot fallback successful: {len(answer)} chars")
                         bot_type = "general_fallback"
                     else:
-                        logger.warning("⚠️ General bot fallback also returned insufficient answer")
+                        logger.warning("âš ï¸ General bot fallback also returned insufficient answer")
                         answer = None
                 except asyncio.TimeoutError:
-                    logger.error("⏱️ General bot fallback timeout")
+                    logger.error("â±ï¸ General bot fallback timeout")
                     answer = None
                 except Exception as e:
-                    logger.error(f"❌ General bot fallback error: {e}", exc_info=True)
+                    logger.error(f"âŒ General bot fallback error: {e}", exc_info=True)
                     answer = None
         
         if not answer or len(answer.strip()) < 10:
-            logger.info(f"🚫 No valid answer from any bot, generating out-of-scope response")
+            logger.info(f"ðŸš« No valid answer from any bot, generating out-of-scope response")
             answer = await self.generate_out_of_scope_response(question, user_role)
             bot_type = "out_of_scope"
         else:
-            logger.info(f"⚡ Skipping redundant role adaptation - bot handled it in-situ")
+            logger.info(f"âš¡ Skipping redundant role adaptation - bot handled it in-situ")
             # answer = await self.apply_role_perspective(answer, user_role, question)
 
         # Clean up LLM response if wrapped in {'output': '...'} format
         answer = _extract_clean_response(answer)
 
-        # Format response — converts DB record blocks / numbered lists to clean markdown
+        # Format response â€” converts DB record blocks / numbered lists to clean markdown
         # Zero latency: pure Python, no LLM call
         answer = _fmt_response(question, answer)
         _formatted = await asyncio.to_thread(formatter_agent.format, question, answer)
 
-        # ── Export check: user asked for a downloadable file ──────────────────
+        # â”€â”€ Export check: user asked for a downloadable file â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         _download_url = None
         if EXPORT_ENGINE_AVAILABLE:
             _export_fmt = export_engine.detect_export_format(question)
@@ -2570,11 +2571,11 @@ For example: "Name: John, Role: developer" """
                 )
                 if _export_id:
                     _download_url = f"{BASE_URL}/gbaiapi/download/{_export_id}"
-                    answer += f"\n\n📥 Download {_export_fmt.upper()}: {_download_url}"
-                    logger.info(f"[ExportEngine] Built {_export_fmt} export → {_export_id}")
-        # ── End export check ──────────────────────────────────────────────────
+                    answer += f"\n\nðŸ“¥ Download {_export_fmt.upper()}: {_download_url}"
+                    logger.info(f"[ExportEngine] Built {_export_fmt} export â†’ {_export_id}")
+        # â”€â”€ End export check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-        logger.info("💾 Storing conversation...")
+        logger.info("ðŸ’¾ Storing conversation...")
         await asyncio.to_thread(
             update_enhanced_memory,
             username, question, answer, bot_type, user_role, thread_id
@@ -2588,10 +2589,10 @@ For example: "Name: John, Role: developer" """
 
         elapsed = time.time() - start_time
         logger.info("="*80)
-        logger.info(f"✅ REQUEST COMPLETED in {elapsed:.2f}s")
-        logger.info(f"🤖 Bot Type: {bot_type}")
-        logger.info(f"📏 Response Length: {len(answer)} chars")
-        logger.info(f"👤 User Role: {user_role}")
+        logger.info(f"âœ… REQUEST COMPLETED in {elapsed:.2f}s")
+        logger.info(f"ðŸ¤– Bot Type: {bot_type}")
+        logger.info(f"ðŸ“ Response Length: {len(answer)} chars")
+        logger.info(f"ðŸ‘¤ User Role: {user_role}")
         logger.info("="*80)
 
         return {
@@ -2636,7 +2637,7 @@ def parse_name_and_role(message: str) -> tuple[str, str]:
     # Valid roles for validation
     valid_roles = ["developer", "implementation", "marketing", "client", "admin", "system admin", "manager", "sales"]
 
-    # Strategy 0: Single word exact role match — user typed just "developer", "admin" etc.
+    # Strategy 0: Single word exact role match â€” user typed just "developer", "admin" etc.
     if message_lower in valid_roles:
         return None, message_lower
 
@@ -2674,7 +2675,7 @@ def parse_name_and_role(message: str) -> tuple[str, str]:
     # Strategy 3: Removed - too broad, was causing false positives in normal questions
     
     # Strategy 4: Simple space-separated format (Name Role) - Extract name even if role found
-    if not name:  # ✅ FIX: Only check for name, role may already be found
+    if not name:  # âœ… FIX: Only check for name, role may already be found
         words = message.split()
         if len(words) >= 2:
             # Check if any word is a valid role to identify name position
@@ -2704,13 +2705,13 @@ def parse_name_and_role(message: str) -> tuple[str, str]:
         if role not in valid_roles:
             role = None  # Invalid role
     
-    logger.info(f"🔍 Parsed message: '{message}'")
-    logger.info(f"   → Name: {name}, Role: {role}")
+    logger.info(f"ðŸ” Parsed message: '{message}'")
+    logger.info(f"   â†’ Name: {name}, Role: {role}")
     
     return name, role
 
 def update_user_session(username: str, name: str = None, current_role: str = None):
-    """Update user session in PostgreSQL — non-blocking."""
+    """Update user session in PostgreSQL â€” non-blocking."""
     try:
         current_time = datetime.now().isoformat()
         conn = get_pg_conn()
@@ -2771,7 +2772,7 @@ def update_enhanced_memory(username: str, question: str, answer: str, bot_type: 
             history_manager.add_message_to_thread(thread_id, question, answer, bot_type)
 
         enhanced_memory.store_conversation_turn(username, question, answer, bot_type, user_role, thread_id)
-        logger.info("💾 Memory stored successfully")
+        logger.info("ðŸ’¾ Memory stored successfully")
     except Exception as e:
         logger.error(f"Error storing memory: {e}")
 
@@ -2821,15 +2822,16 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Content-Type", "Authorization", "Login"],
 )
+app.include_router(voice_agent.router)
 
 @app.on_event("startup")
 async def init_db_tables():
     """Create PostgreSQL tables and load knowledge base on startup."""
-    logger.info("🚀 Starting up — initialising PostgreSQL schema...")
+    logger.info("ðŸš€ Starting up â€” initialising PostgreSQL schema...")
     create_tables()
-    logger.info("📚 Loading knowledge base (DuckDB + FAISS)...")
+    logger.info("ðŸ“š Loading knowledge base (DuckDB + FAISS)...")
     await asyncio.to_thread(knowledge_loader.load_all, ai_resources.embeddings)
-    logger.info("✅ Knowledge base ready.")
+    logger.info("âœ… Knowledge base ready.")
 
 
 # ===========================
@@ -2855,7 +2857,7 @@ async def ai_role_based_chat(message: Message, Login: str = Header(...)):
     try:
         login_dto = json.loads(Login)
         username = login_dto.get("UserName", "anonymous")
-        # ✅ FIX: Always get user_role from login_dto, not from session
+        # âœ… FIX: Always get user_role from login_dto, not from session
         role_id = str(login_dto.get("roleid", ""))
         user_role = ROLEID_TO_NAME.get(role_id, "client").lower()
     except Exception:
@@ -2871,33 +2873,33 @@ async def ai_role_based_chat(message: Message, Login: str = Header(...)):
         return JSONResponse(status_code=429, content={"response": "Too many requests. Please wait a moment before sending another message."})
 
     try:
-        # Create new thread first — thread_id is unique per conversation/device
+        # Create new thread first â€” thread_id is unique per conversation/device
         thread_id = await asyncio.to_thread(history_manager.create_new_thread, username, user_input)
-        logger.info(f"📍 Created new thread: {thread_id}")
+        logger.info(f"ðŸ“ Created new thread: {thread_id}")
 
-        # Use thread_id as session key — isolates sessions per device/conversation
+        # Use thread_id as session key â€” isolates sessions per device/conversation
         session_info = user_sessions.get(thread_id, {})
         is_registered = session_info.get("registered", False)
         
         thread = history_manager.get_thread(thread_id)
         
-        # ✅ FIX: Check if current request is role setup or actual question
+        # âœ… FIX: Check if current request is role setup or actual question
         parsed_name, parsed_role = parse_name_and_role(user_input)
         
         if parsed_role:
-            # Username comes from login_dto — no need to ask for name
+            # Username comes from login_dto â€” no need to ask for name
             user_role = parsed_role
 
-            # ✅ FIX: Save role info to thread IMMEDIATELY
+            # âœ… FIX: Save role info to thread IMMEDIATELY
             thread.user_role = user_role
             thread.user_name = username
             await asyncio.to_thread(history_manager.save_threads)
 
-            logger.info(f"🎭 User set role to: {user_role}, name: {username} in thread {thread_id}")
+            logger.info(f"ðŸŽ­ User set role to: {user_role}, name: {username} in thread {thread_id}")
 
             confirmation = f"Got it, {username}! You're set as **{user_role}**.\n\nHow can I help you with GoodBooks ERP today?"
 
-            # ✅ FIX: Store this setup message in thread
+            # âœ… FIX: Store this setup message in thread
             await asyncio.to_thread(
                 history_manager.add_message_to_thread,
                 thread_id, user_input, confirmation, "role_setup"
@@ -2922,9 +2924,9 @@ async def ai_role_based_chat(message: Message, Login: str = Header(...)):
                 }
             }
 
-        # ✅ FIX: Check if user is already registered
+        # âœ… FIX: Check if user is already registered
         if not is_registered or user_role == "unknown":
-            # Ask only for role — username already known from login_dto
+            # Ask only for role â€” username already known from login_dto
             prompt = f"Hello {username}! I'm your GoodBooks ERP assistant.\n\nWhich role best describes you?\n\n**developer** | **implementation** | **marketing** | **client** | **admin** | **system admin** | **manager** | **sales**\n\nJust reply with your role to get started."
             
             # Store role request in thread
@@ -2944,8 +2946,8 @@ async def ai_role_based_chat(message: Message, Login: str = Header(...)):
                 }
             }
         
-        # ✅ FIX: User is registered and has role, process as normal query
-        logger.info(f"✅ User {username} is registered as {user_role}")
+        # âœ… FIX: User is registered and has role, process as normal query
+        logger.info(f"âœ… User {username} is registered as {user_role}")
         
         # Set thread role if not already set
         if not thread.user_role:
@@ -2954,7 +2956,7 @@ async def ai_role_based_chat(message: Message, Login: str = Header(...)):
         
         # Check if it's a greeting
         if is_greeting(user_input):
-            logger.info(f"⚡ INSTANT greeting response (0.0s)")
+            logger.info(f"âš¡ INSTANT greeting response (0.0s)")
             greeting_response = get_greeting_response(user_role)
             
             asyncio.create_task(
@@ -2976,12 +2978,12 @@ async def ai_role_based_chat(message: Message, Login: str = Header(...)):
             }
         
         # Build filtered context
-        logger.info("📚 Building conversational context...")
+        logger.info("ðŸ“š Building conversational context...")
         context, source_files = await build_filtered_context(
             username, user_input, thread_id=thread_id, is_existing_thread=False
         )
         
-        logger.info(f"📍 Built filtered context from {len(source_files)} source(s)")
+        logger.info(f"ðŸ“ Built filtered context from {len(source_files)} source(s)")
         
         # Process request
         result = await ai_orchestrator.process_request(username, user_role, user_input, thread_id, is_existing_thread=False, login_dto=login_dto)
@@ -2991,12 +2993,12 @@ async def ai_role_based_chat(message: Message, Login: str = Header(...)):
         result["sources_used"] = formatted_sources
         result["thread_id"] = thread_id
         
-        logger.info(f"✅ Response sent using sources: {source_files}")
-        logger.info(f"✅ Chat response sent to {username} ({user_role})")
+        logger.info(f"âœ… Response sent using sources: {source_files}")
+        logger.info(f"âœ… Chat response sent to {username} ({user_role})")
         return result
         
     except Exception as e:
-        logger.error(f"❌ AI orchestration error: {str(e)}")
+        logger.error(f"âŒ AI orchestration error: {str(e)}")
         logger.error(f"Traceback: {traceback.format_exc()}")
         
         error_response = "I encountered an error processing your request. Please try again or rephrase your question."
@@ -3030,7 +3032,7 @@ async def ai_thread_chat(request: ThreadRequest, Login: str = Header(...)):
         logger.warning(f"[RateLimit] {username} exceeded {_RATE_MAX} req/{_RATE_WINDOW}s")
         return JSONResponse(status_code=429, content={"response": "Too many requests. Please wait a moment before sending another message."})
 
-    # Use thread_id as session key — isolates sessions per device/conversation
+    # Use thread_id as session key â€” isolates sessions per device/conversation
     session_info = user_sessions.get(thread_id, {})
 
     # Verify thread exists and belongs to user
@@ -3038,26 +3040,26 @@ async def ai_thread_chat(request: ThreadRequest, Login: str = Header(...)):
     if not thread or thread.username != username:
         return JSONResponse(status_code=404, content={"response": "Thread not found or access denied"})
     
-    # ✅ FIX: Prioritize thread's persisted role if it exists
+    # âœ… FIX: Prioritize thread's persisted role if it exists
     if thread.user_role and thread.user_role != "unknown":
         user_role = thread.user_role
-        logger.info(f"🎭 Using persisted role from thread: {user_role}")
+        logger.info(f"ðŸŽ­ Using persisted role from thread: {user_role}")
 
-    # ✅ FIX: Check if still waiting for role setup
+    # âœ… FIX: Check if still waiting for role setup
     if not thread.user_role or thread.user_role == "unknown":
         # Still waiting for role info
         parsed_name, parsed_role = parse_name_and_role(user_input)
         
         if parsed_role:
-            # Username comes from login_dto — no need to ask for name
+            # Username comes from login_dto â€” no need to ask for name
             user_role = parsed_role
 
-            # ✅ FIX: Save to thread
+            # âœ… FIX: Save to thread
             thread.user_role = user_role
             thread.user_name = username
             await asyncio.to_thread(history_manager.save_threads)
 
-            logger.info(f"🎭 User set role to: {user_role}, name: {username} in thread {thread_id}")
+            logger.info(f"ðŸŽ­ User set role to: {user_role}, name: {username} in thread {thread_id}")
 
             confirmation = f"Got it, {username}! You're set as **{user_role}**.\n\nHow can I help you with GoodBooks ERP today?"
 
@@ -3104,16 +3106,16 @@ async def ai_thread_chat(request: ThreadRequest, Login: str = Header(...)):
                 }
             }
     
-    # ✅ FIX: User has role, process normally
+    # âœ… FIX: User has role, process normally
     try:
-        logger.info(f"📍 Continuing thread {thread_id} with role: {user_role}")
+        logger.info(f"ðŸ“ Continuing thread {thread_id} with role: {user_role}")
         
         # Build filtered context FOR EXISTING THREAD
         context, source_files = await build_filtered_context(
             username, user_input, thread_id=thread_id, is_existing_thread=True
         )
         
-        logger.info(f"📍 Built filtered context from {len(source_files)} source(s)")
+        logger.info(f"ðŸ“ Built filtered context from {len(source_files)} source(s)")
         
         result = await ai_orchestrator.process_request(
             username, user_role, user_input, thread_id, is_existing_thread=True, login_dto=login_dto
@@ -3124,12 +3126,12 @@ async def ai_thread_chat(request: ThreadRequest, Login: str = Header(...)):
         result["sources_used"] = formatted_sources
         result["thread_id"] = thread_id
         
-        logger.info(f"✅ Response sent using sources: {source_files}")
-        logger.info(f"✅ Thread response sent to {username} ({user_role})")
+        logger.info(f"âœ… Response sent using sources: {source_files}")
+        logger.info(f"âœ… Thread response sent to {username} ({user_role})")
         return result
         
     except Exception as e:
-        logger.error(f"❌ Thread chat error: {str(e)}")
+        logger.error(f"âŒ Thread chat error: {str(e)}")
         logger.error(f"Traceback: {traceback.format_exc()}")
         error_response = "I encountered an error. Please try again."
         return JSONResponse(
@@ -3144,7 +3146,7 @@ async def get_conversation_threads(Login: str = Header(...), limit: int = 50):
         login_dto = json.loads(Login)
         username = login_dto.get("UserName", "anonymous")
         
-        # ✅ Map roleid to role name if present, otherwise fallback to "Role"
+        # âœ… Map roleid to role name if present, otherwise fallback to "Role"
         role_id = str(login_dto.get("roleid", ""))
         user_role = ROLEID_TO_NAME.get(role_id, "client").lower()
     except Exception:
@@ -3276,16 +3278,16 @@ async def system_status():
         "bot_status": bot_status,
         "memory_system": memory_stats,
         "features": [
-            "⚡ INSTANT greeting responses (<1s)",
-            "🚀 Enhanced keyword-based fast routing with math detection",
-            "🎯 Improved AI intent detection with 10s timeout",
-            "🔄 Comprehensive fallback chain (Primary → General → Out-of-scope)",
-            "🎭 Smart role adaptation (skips only when appropriate)",
-            "⏱️ Increased timeouts for all LLM operations",
-            "📝 Enhanced logging throughout entire pipeline",
-            "🔍 Intelligent fallback based on question structure",
-            "💾 Background memory storage (non-blocking)",
-            "🧠 Context-aware routing decisions"
+            "âš¡ INSTANT greeting responses (<1s)",
+            "ðŸš€ Enhanced keyword-based fast routing with math detection",
+            "ðŸŽ¯ Improved AI intent detection with 10s timeout",
+            "ðŸ”„ Comprehensive fallback chain (Primary â†’ General â†’ Out-of-scope)",
+            "ðŸŽ­ Smart role adaptation (skips only when appropriate)",
+            "â±ï¸ Increased timeouts for all LLM operations",
+            "ðŸ“ Enhanced logging throughout entire pipeline",
+            "ðŸ” Intelligent fallback based on question structure",
+            "ðŸ’¾ Background memory storage (non-blocking)",
+            "ðŸ§  Context-aware routing decisions"
         ],
         "performance": {
             "greeting_response": "<1 second",
@@ -3298,17 +3300,17 @@ async def system_status():
             "role_adaptation_timeout": "15 seconds"
         },
         "optimizations": [
-            "✅ Enhanced keyword detection with math pattern recognition",
-            "✅ Intent caching system",
-            "✅ Smart role adaptation (only when needed)",
-            "✅ Comprehensive fallback chain",
-            "✅ Parallel async execution",
-            "✅ Background memory storage",
-            "✅ Increased timeouts for stability",
-            "✅ Better error handling and logging",
-            "✅ Question structure analysis for fallbacks",
-            "✅ Sub-bot availability checking",
-            "✅ Detailed performance tracking"
+            "âœ… Enhanced keyword detection with math pattern recognition",
+            "âœ… Intent caching system",
+            "âœ… Smart role adaptation (only when needed)",
+            "âœ… Comprehensive fallback chain",
+            "âœ… Parallel async execution",
+            "âœ… Background memory storage",
+            "âœ… Increased timeouts for stability",
+            "âœ… Better error handling and logging",
+            "âœ… Question structure analysis for fallbacks",
+            "âœ… Sub-bot availability checking",
+            "âœ… Detailed performance tracking"
         ]
     }
 
@@ -3319,7 +3321,7 @@ async def get_user_statistics(Login: str = Header(...)):
         login_dto = json.loads(Login)
         username = login_dto.get("UserName", "anonymous")
         
-        # ✅ Map roleid to role name if present, otherwise fallback to "Role"
+        # âœ… Map roleid to role name if present, otherwise fallback to "Role"
         role_id = str(login_dto.get("roleid", ""))
         user_role = ROLEID_TO_NAME.get(role_id, "client").lower()
     except Exception:
@@ -3370,7 +3372,7 @@ async def cleanup_old_data(Login: str = Header(...), days_to_keep: int = 90):
     try:
         login_dto = json.loads(Login)
         
-        # ✅ Map roleid to role name if present, otherwise fallback to "Role"
+        # âœ… Map roleid to role name if present, otherwise fallback to "Role"
         role_id = str(login_dto.get("roleid", ""))
         user_role = ROLEID_TO_NAME.get(role_id, "client").lower()
         
@@ -3417,7 +3419,7 @@ async def get_performance_stats():
             "primary": "Keyword-based fast routing",
             "secondary": "AI-based intent detection",
             "fallback": "Question structure analysis",
-            "bot_chain": "Primary bot → General bot → Out-of-scope"
+            "bot_chain": "Primary bot â†’ General bot â†’ Out-of-scope"
         }
     }
 
@@ -3428,7 +3430,7 @@ async def test_bot(bot_name: str, question: str = "What is GoodBooks?", Login: s
         login_dto = json.loads(Login)
         username = login_dto.get("UserName", "anonymous")
         
-        # ✅ Map roleid to role name if present, otherwise fallback to "Role"
+        # âœ… Map roleid to role name if present, otherwise fallback to "Role"
         role_id = str(login_dto.get("roleid", ""))
         user_role = ROLEID_TO_NAME.get(role_id, "client").lower()
     except Exception:
@@ -3438,7 +3440,7 @@ async def test_bot(bot_name: str, question: str = "What is GoodBooks?", Login: s
         return JSONResponse(status_code=404, content={"response": f"Bot '{bot_name}' not found. Available: {list(ai_orchestrator.bots.keys())}"})
     
     try:
-        logger.info(f"🧪 Testing {bot_name} bot with question: {question}")
+        logger.info(f"ðŸ§ª Testing {bot_name} bot with question: {question}")
         start_time = time.time()
         
         selected_bot = ai_orchestrator.bots[bot_name]
@@ -3475,7 +3477,7 @@ async def test_bot(bot_name: str, question: str = "What is GoodBooks?", Login: s
 async def test_routing(question: str):
     """Test intent routing without executing bot (for debugging)"""
     try:
-        logger.info(f"🧪 Testing routing for question: {question}")
+        logger.info(f"ðŸ§ª Testing routing for question: {question}")
         
         keyword_intent = ai_orchestrator._get_cached_intent(question)
         
@@ -3512,24 +3514,92 @@ async def clear_intent_cache():
 async def voice_chat(request: Request, Login: str = Header(...)):
     """
     Real-time multilingual voice AI endpoint.
-    - Detects language of input automatically
-    - Translates to English → processes via existing orchestrator → translates back
-    - Streams response sentence-by-sentence via Server-Sent Events (SSE)
-    - Uses existing RunPod LLM — zero extra cost
+    - JSON body keeps the existing SSE text workflow
+    - Multipart/form-data adds audio upload support and returns JSON + audio_url
     """
     try:
         login_dto = json.loads(Login)
-        username  = login_dto.get("UserName", "anonymous")
-        role_id   = str(login_dto.get("roleid", ""))
+        username = login_dto.get("UserName", "anonymous")
+        role_id = str(login_dto.get("roleid", ""))
         user_role = ROLEID_TO_NAME.get(role_id, "client").lower()
     except Exception:
         return JSONResponse(status_code=400, content={"response": "Invalid login header."})
 
+    content_type = (request.headers.get("content-type") or "").lower()
+
+    if "multipart/form-data" in content_type or content_type.startswith("audio/"):
+        try:
+            form = await request.form()
+            upload = form.get("file") or form.get("audio") or form.get("voice")
+            message_hint = (form.get("message") or form.get("content") or "").strip()
+            language = (form.get("language") or "").strip().lower()
+            thread_id = (form.get("thread_id") or "").strip() or None
+        except Exception:
+            return JSONResponse(status_code=400, content={"success": False, "response": "Invalid multipart request body."})
+
+        audio_bytes = b""
+        audio_name = "voice_input.wav"
+        if upload is not None:
+            try:
+                audio_bytes = await upload.read()
+                audio_name = getattr(upload, "filename", None) or audio_name
+            except Exception as exc:
+                logger.error(f"[Voice] Failed to read uploaded audio: {exc}")
+                return JSONResponse(status_code=400, content={"success": False, "response": "Unable to read uploaded audio."})
+
+        if audio_bytes and len(audio_bytes) > voice_agent.MAX_AUDIO_SIZE_BYTES:
+            return JSONResponse(status_code=413, content={"success": False, "response": "Audio file is too large."})
+
+        if _is_rate_limited(username):
+            return JSONResponse(status_code=429, content={"success": False, "response": "Too many requests. Please wait a moment."})
+
+        try:
+            transcribed_text = ""
+            if audio_bytes:
+                transcribed_text = await voice_agent.transcribe_audio_bytes(audio_bytes, audio_name)
+
+            user_input = (transcribed_text or message_hint).strip()
+            if not user_input:
+                return JSONResponse(status_code=400, content={"success": False, "response": "Please provide a valid audio file or message."})
+
+            detected_lang = language if language else voice_engine.detect_language(user_input)
+            english_input = voice_engine.translate_to_english(user_input, detected_lang)
+            logger.info(f"[Voice] {username} | lang={detected_lang} | input: {user_input[:60]}")
+
+            _thread_obj = await asyncio.to_thread(history_manager.get_thread, thread_id) if thread_id else None
+            is_existing = bool(thread_id and _thread_obj)
+            if not thread_id:
+                thread_id = await asyncio.to_thread(history_manager.create_new_thread, username, english_input)
+
+            result = await ai_orchestrator.process_request(
+                username, user_role, english_input, thread_id, is_existing_thread=is_existing, login_dto=login_dto
+            )
+
+            raw_response = result.get("response", "")
+            bot_type = result.get("bot_type", "general")
+            voice_text, localized_response, audio_url = await voice_agent.clean_and_speak_response(raw_response, detected_lang)
+            await asyncio.to_thread(voice_agent.cleanup_old_audio_files)
+
+            return JSONResponse(content={
+                "success": True,
+                "detected_language": detected_lang,
+                "transcribed_text": transcribed_text or user_input,
+                "translated_text": english_input,
+                "chatbot_response": voice_text,
+                "localized_response": localized_response,
+                "audio_url": audio_url,
+                "thread_id": thread_id,
+                "bot_type": bot_type,
+            })
+        except Exception as e:
+            logger.error(f"[Voice] Audio voice pipeline error: {e}", exc_info=True)
+            return JSONResponse(status_code=500, content={"success": False, "response": "An error occurred while processing the audio request."})
+
     try:
-        body       = await request.json()
+        body = await request.json()
         user_input = (body.get("message") or body.get("content") or "").strip()
-        language   = (body.get("language") or "").strip().lower()  # optional override
-        thread_id  = body.get("thread_id")
+        language = (body.get("language") or "").strip().lower()
+        thread_id = body.get("thread_id")
     except Exception:
         return JSONResponse(status_code=400, content={"response": "Invalid request body. Expected JSON with 'message' field."})
 
@@ -3539,12 +3609,10 @@ async def voice_chat(request: Request, Login: str = Header(...)):
     if _is_rate_limited(username):
         return JSONResponse(status_code=429, content={"response": "Too many requests. Please wait a moment."})
 
-    # ── Language detection & translation to English ───────────────────────────
     detected_lang = language if language else voice_engine.detect_language(user_input)
     english_input = voice_engine.translate_to_english(user_input, detected_lang)
     logger.info(f"[Voice] {username} | lang={detected_lang} | input: {user_input[:60]}")
 
-    # ── Process via existing orchestrator (same as /chat and /thread_chat) ────
     _thread_obj = await asyncio.to_thread(history_manager.get_thread, thread_id) if thread_id else None
     is_existing = bool(thread_id and _thread_obj)
     if not thread_id:
@@ -3559,38 +3627,34 @@ async def voice_chat(request: Request, Login: str = Header(...)):
         return JSONResponse(status_code=500, content={"response": "An error occurred. Please try again."})
 
     raw_response = result.get("response", "")
-    bot_type     = result.get("bot_type", "general")
+    bot_type = result.get("bot_type", "general")
 
-    # ── Voice post-processing ─────────────────────────────────────────────────
-    voice_text    = voice_engine.prepare_response_for_voice(raw_response)
-    final_text    = voice_engine.translate_from_english(voice_text, detected_lang)
-    sentences     = voice_engine.split_into_sentences(final_text)
+    voice_text = voice_engine.prepare_response_for_voice(raw_response)
+    final_text = voice_engine.translate_from_english(voice_text, detected_lang)
+    sentences = voice_engine.split_into_sentences(final_text)
 
-    # ── Stream sentences via SSE ──────────────────────────────────────────────
     async def sentence_stream():
-        # Send metadata first as a comment
         yield f"data: {json.dumps({'type': 'meta', 'thread_id': thread_id, 'bot_type': bot_type, 'language': detected_lang})}\n\n"
         for sentence in sentences:
             if sentence.strip():
                 yield f"data: {json.dumps({'type': 'sentence', 'text': sentence})}\n\n"
-                await asyncio.sleep(0.05)   # small delay for natural pacing
+                await asyncio.sleep(0.05)
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
 
     return StreamingResponse(
         sentence_stream(),
         media_type="text/event-stream",
         headers={
-            "Cache-Control":               "no-cache",
-            "X-Accel-Buffering":           "no",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
             "Access-Control-Allow-Origin": "*",
         }
     )
 
-
 @app.post("/gbaiapi/upload", tags=["File Intelligence"])
 async def upload_file(file: UploadFile = File(...), Login: str = Header(...), thread_id: str = Form(None)):
     """
-    Upload a file (PDF, CSV, Excel, JSON, TXT — max 10 MB).
+    Upload a file (PDF, CSV, Excel, JSON, TXT â€” max 10 MB).
     The system builds a per-user FAISS index so you can ask questions about it.
     """
     try:
@@ -3629,7 +3693,7 @@ async def upload_file(file: UploadFile = File(...), Login: str = Header(...), th
                 content={"response": "Error processing file. Please try another file or format."},
             )
 
-        logger.info(f"[Upload] {username} → '{filename}': {status_msg[:80]}")
+        logger.info(f"[Upload] {username} â†’ '{filename}': {status_msg[:80]}")
 
         # Auto-summarize after successful indexing
         summary = status_msg
@@ -3653,7 +3717,7 @@ async def upload_file(file: UploadFile = File(...), Login: str = Header(...), th
                         f"**Summary:**\n{_summary_text}\n\n"
                         f"You can now ask me any questions about this file."
                     )
-                    logger.info(f"[Upload] Summary generated for {username} → '{filename}'")
+                    logger.info(f"[Upload] Summary generated for {username} â†’ '{filename}'")
             except Exception as _se:
                 logger.warning(f"[Upload] Summary generation failed, returning default message: {_se}")
 
@@ -3705,83 +3769,83 @@ async def startup_event():
     global history_manager, embeddings, enhanced_memory, ai_orchestrator
     
     logger.info("=" * 80)
-    logger.info("🚀 GoodBooks AI Orchestrator starting")
+    logger.info("ðŸš€ GoodBooks AI Orchestrator starting")
     logger.info("=" * 80)
 
     try:
         # --------------------------------------------------
-        # 🔥 INITIALIZE HEAVY COMPONENTS FIRST
+        # ðŸ”¥ INITIALIZE HEAVY COMPONENTS FIRST
         # --------------------------------------------------
-        # Reuse the already-loaded embeddings from ai_resources singleton — avoids loading
+        # Reuse the already-loaded embeddings from ai_resources singleton â€” avoids loading
         # the same 500MB model twice and prevents OOM crashes on low-memory containers.
-        logger.info("📦 Reusing shared embeddings from ai_resources...")
+        logger.info("ðŸ“¦ Reusing shared embeddings from ai_resources...")
         embeddings = ai_resources.embeddings
-        logger.info("✅ Embeddings ready (shared)")
+        logger.info("âœ… Embeddings ready (shared)")
 
-        logger.info("💾 Loading conversation memory from PostgreSQL...")
+        logger.info("ðŸ’¾ Loading conversation memory from PostgreSQL...")
         enhanced_memory = EnhancedConversationalMemory(
             vectorstore_path="memory_store",
             metadata_file="memory_meta.json",
             embeddings=embeddings
         )
-        logger.info("✅ Memory loaded")
+        logger.info("âœ… Memory loaded")
 
-        logger.info("📚 Loading conversation threads from PostgreSQL...")
+        logger.info("ðŸ“š Loading conversation threads from PostgreSQL...")
         history_manager = ConversationHistoryManager()
-        logger.info("✅ Threads loaded")
+        logger.info("âœ… Threads loaded")
         
-        logger.info("🤖 Initializing AI orchestrator...")
+        logger.info("ðŸ¤– Initializing AI orchestrator...")
         ai_orchestrator = AIOrchestrationAgent()
-        logger.info("✅ Orchestrator ready")
+        logger.info("âœ… Orchestrator ready")
 
         # --------------------------------------------------
-        # 🔥 WARM RUNPOD MODELS (optional — non-fatal)
-        # Main endpoint (routing + response): wait for it — fast (~10s), needed immediately.
-        # SQL endpoint: fire in background — slow model, must not block startup.
+        # ðŸ”¥ WARM RUNPOD MODELS (optional â€” non-fatal)
+        # Main endpoint (routing + response): wait for it â€” fast (~10s), needed immediately.
+        # SQL endpoint: fire in background â€” slow model, must not block startup.
         # --------------------------------------------------
         async def _warm(coro, name):
             try:
                 await asyncio.wait_for(coro, timeout=250)
-                logger.info(f"✅ {name} warmed")
+                logger.info(f"âœ… {name} warmed")
             except Exception as e:
-                logger.warning(f"⚠️ {name} warm-up failed (non-fatal): {e}")
+                logger.warning(f"âš ï¸ {name} warm-up failed (non-fatal): {e}")
 
-        # Wait for main endpoint (routing + response) — completes in ~10s
-        logger.info("🔥 Warming main RunPod endpoint (routing + response)...")
+        # Wait for main endpoint (routing + response) â€” completes in ~10s
+        logger.info("ðŸ”¥ Warming main RunPod endpoint (routing + response)...")
         await asyncio.gather(
             _warm(asyncio.to_thread(ai_resources.routing_llm.invoke, "ping"), "routing_llm"),
             _warm(asyncio.to_thread(ai_resources.response_llm.invoke, "ping"), "response_llm"),
         )
-        logger.info("🔥 Main endpoint warm-up complete")
+        logger.info("ðŸ”¥ Main endpoint warm-up complete")
 
-        # Fire sql_llm warmup in background — heavy model, don't block startup
+        # Fire sql_llm warmup in background â€” heavy model, don't block startup
         # Must use call_sql_endpoint (correct payload format: query + schema)
         from shared_resources import call_sql_endpoint
         asyncio.create_task(
             _warm(asyncio.to_thread(call_sql_endpoint, "list all records", "test(id)"), "sql_llm")
         )
-        logger.info("🔥 SQL endpoint warming in background (non-blocking)")
+        logger.info("ðŸ”¥ SQL endpoint warming in background (non-blocking)")
 
-        # Build Schema RAG index in background — non-blocking, safe to fail
+        # Build Schema RAG index in background â€” non-blocking, safe to fail
         from schema_rag import build_or_load_index
         asyncio.create_task(asyncio.to_thread(build_or_load_index))
-        logger.info("📐 Schema RAG index building in background (non-blocking)")
+        logger.info("ðŸ“ Schema RAG index building in background (non-blocking)")
 
         # --------------------------------------------------
-        # 📦 FORCE FAISS INTO MEMORY (if exists)
+        # ðŸ“¦ FORCE FAISS INTO MEMORY (if exists)
         # --------------------------------------------------
         if enhanced_memory and enhanced_memory.memory_vectorstore:
-            logger.info("📦 Warming FAISS index...")
+            logger.info("ðŸ“¦ Warming FAISS index...")
             try:
                 enhanced_memory.memory_vectorstore.similarity_search("warmup", k=1)
-                logger.info("✅ FAISS warmed")
+                logger.info("âœ… FAISS warmed")
             except Exception as e:
-                logger.warning(f"⚠️ FAISS warming failed: {e}")
+                logger.warning(f"âš ï¸ FAISS warming failed: {e}")
 
         # --------------------------------------------------
-        # 🧪 REAL QUERY DRY RUN (MOST IMPORTANT)
+        # ðŸ§ª REAL QUERY DRY RUN (MOST IMPORTANT)
         # --------------------------------------------------
-        logger.info("🧪 Running real-query warmup...")
+        logger.info("ðŸ§ª Running real-query warmup...")
         await ai_orchestrator.process_request(
             username="__warmup__",
             user_role="client",
@@ -3789,10 +3853,10 @@ async def startup_event():
             thread_id=None,
             is_existing_thread=False
         )
-        logger.info("✅ Real-query warmup completed")
+        logger.info("âœ… Real-query warmup completed")
 
         # --------------------------------------------------
-        # 🤖 PRE-WARM SUB BOTS (SAFE)
+        # ðŸ¤– PRE-WARM SUB BOTS (SAFE)
         # --------------------------------------------------
         async def warm_bot(bot, name):
             try:
@@ -3800,18 +3864,18 @@ async def startup_event():
                     bot.answer("hello", "", "client", "__warmup__"),
                     timeout=30
                 )
-                logger.info(f"🔥 {name} bot warmed")
+                logger.info(f"ðŸ”¥ {name} bot warmed")
             except Exception:
-                logger.warning(f"⚠️ {name} bot warm skipped")
+                logger.warning(f"âš ï¸ {name} bot warm skipped")
 
-        # 🔥 Warm general bot only — other bots have no dedicated model to warm.
+        # ðŸ”¥ Warm general bot only â€” other bots have no dedicated model to warm.
         # formula/report/menu/project/schema all use the same shared RunPod endpoint
         # which is already warmed above. Calling them here only wastes SQL calls.
         await warm_bot(GeneralBotWrapper(), "general")
 
 
         # --------------------------------------------------
-        # 🧹 BACKGROUND CLEANUP
+        # ðŸ§¹ BACKGROUND CLEANUP
         # --------------------------------------------------
         asyncio.create_task(
             asyncio.to_thread(history_manager.cleanup_old_threads, 180)
@@ -3828,39 +3892,39 @@ async def startup_event():
                 for k in stale:
                     user_sessions.pop(k, None)
                 if stale:
-                    logger.info(f"🧹 Evicted {len(stale)} stale user sessions")
+                    logger.info(f"ðŸ§¹ Evicted {len(stale)} stale user sessions")
 
         asyncio.create_task(_periodic_cleanup())
 
         logger.info("=" * 80)
-        logger.info("✅ ALL SYSTEMS READY - App startup complete")
+        logger.info("âœ… ALL SYSTEMS READY - App startup complete")
         logger.info("=" * 80)
 
     except Exception as e:
-        logger.error(f"❌ STARTUP FAILED: {str(e)}", exc_info=True)
+        logger.error(f"âŒ STARTUP FAILED: {str(e)}", exc_info=True)
         raise
     
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info("="*80)
-    logger.info("🛑 Shutting down gracefully...")
+    logger.info("ðŸ›‘ Shutting down gracefully...")
     logger.info("="*80)
     try:
         await asyncio.to_thread(history_manager.save_threads)
-        logger.info("✅ All thread data saved to Firestore")
+        logger.info("âœ… All thread data saved to Firestore")
         
         if enhanced_memory and enhanced_memory.memory_vectorstore:
-            logger.info("💾 Saving memory vectorstore...")
+            logger.info("ðŸ’¾ Saving memory vectorstore...")
             await asyncio.to_thread(enhanced_memory.memory_vectorstore.save_local, MEMORY_VECTORSTORE_PATH)
-            logger.info("✅ Memory vectorstore saved")
+            logger.info("âœ… Memory vectorstore saved")
         else:
-            logger.info("⚠️ No memory vectorstore to save (no conversations yet)")
+            logger.info("âš ï¸ No memory vectorstore to save (no conversations yet)")
         
     except Exception as e:
-        logger.error(f"❌ Shutdown save error: {e}")
+        logger.error(f"âŒ Shutdown save error: {e}")
     
     logger.info("="*80)
-    logger.info("👋 Shutdown complete")
+    logger.info("ðŸ‘‹ Shutdown complete")
     logger.info("="*80)
 
 # ===========================
@@ -3870,7 +3934,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8010))
     logger.info("="*80)
-    logger.info(f"🚀 Starting FIXED & ENHANCED server on port {port}")
+    logger.info(f"ðŸš€ Starting FIXED & ENHANCED server on port {port}")
     logger.info("="*80)
     uvicorn.run(app, host="0.0.0.0", port=port)
 
