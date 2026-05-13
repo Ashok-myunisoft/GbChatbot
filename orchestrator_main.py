@@ -3661,7 +3661,12 @@ async def voice_chat(request: Request, Login: str = Header(...)):
     )
 
 @app.post("/gbaiapi/upload", tags=["File Intelligence"])
-async def upload_file(file: UploadFile = File(...), Login: str = Header(...), thread_id: str = Form(None)):
+async def upload_file(
+    request: Request,
+    file: UploadFile = File(None),
+    Login: str = Header(None),
+    thread_id: str = Form(None),
+):
     """
     Upload a file (PDF, CSV, Excel, JSON, TXT â€” max 10 MB).
     The system builds a per-user FAISS index so you can ask questions about it.
@@ -3673,7 +3678,14 @@ async def upload_file(file: UploadFile = File(...), Login: str = Header(...), th
                 content={"response": "File intelligence not available. Install: pymupdf, faiss-cpu"},
             )
 
-        login_dto = json.loads(Login)
+        login_raw = Login
+        if not login_raw:
+            login_raw = request.headers.get("Login") or request.headers.get("login") or request.headers.get("X-Login")
+        if not login_raw:
+            form_data = await request.form()
+            login_raw = form_data.get("Login") or form_data.get("login") or form_data.get("X-Login")
+
+        login_dto = json.loads(login_raw)
         username  = login_dto.get("UserName", "anonymous")
     except Exception as e:
         logger.warning(f"[Upload] Invalid login header: {e}")
@@ -3686,6 +3698,20 @@ async def upload_file(file: UploadFile = File(...), Login: str = Header(...), th
             return JSONResponse(
                 status_code=503,
                 content={"response": "File intelligence is temporarily unavailable. Please try again later."},
+            )
+
+        if file is None:
+            form_data = await request.form()
+            for key in ("file", "upload", "audio", "voice"):
+                candidate = form_data.get(key)
+                if candidate is not None and hasattr(candidate, "read"):
+                    file = candidate
+                    break
+
+        if file is None:
+            return JSONResponse(
+                status_code=400,
+                content={"response": "No uploaded file found. Please send the file as multipart/form-data with field name 'file'."},
             )
 
         content  = await file.read()
