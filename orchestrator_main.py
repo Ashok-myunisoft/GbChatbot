@@ -3695,33 +3695,9 @@ async def upload_file(file: UploadFile = File(...), Login: str = Header(...), th
 
         logger.info(f"[Upload] {username} â†’ '{filename}': {status_msg[:80]}")
 
-        # Auto-summarize after successful indexing
-        summary = status_msg
-        if "uploaded successfully" in status_msg:
-            try:
-                full_text = file_engine.get_full_text(username)
-                if full_text:
-                    _summary_prompt = (
-                        f"You have been given the content of a file named **{filename}**.\n\n"
-                        f"File Content:\n{full_text[:6000]}\n\n"
-                        f"Please provide a clear and concise summary of this file. "
-                        f"Mention the key topics, data, or sections it contains."
-                    )
-                    _summary_response = await asyncio.wait_for(
-                        ai_resources.response_llm.ainvoke(_summary_prompt),
-                        timeout=70.0
-                    )
-                    _summary_text = (_summary_response.content if hasattr(_summary_response, 'content') else str(_summary_response)).strip()
-                    summary = (
-                        f"File **{filename}** uploaded and analyzed successfully.\n\n"
-                        f"**Summary:**\n{_summary_text}\n\n"
-                        f"You can now ask me any questions about this file."
-                    )
-                    logger.info(f"[Upload] Summary generated for {username} â†’ '{filename}'")
-            except Exception as _se:
-                logger.warning(f"[Upload] Summary generation failed, returning default message: {_se}")
-
-        return {"response": summary, "filename": filename}
+        # Return immediately after indexing so the request stays under proxy timeout limits.
+        # Summary generation was the expensive part and can be done separately if needed.
+        return {"response": status_msg, "filename": filename}
 
     except Exception as e:
         logger.error(f"[Upload] Unexpected upload error for {username if 'username' in locals() else 'unknown'}: {e}", exc_info=True)
