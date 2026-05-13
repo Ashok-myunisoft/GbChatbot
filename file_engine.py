@@ -32,7 +32,7 @@ MAX_FILE_MB          = 10     # hard limit: 10 MB
 MAX_FILE_BYTES       = MAX_FILE_MB * 1024 * 1024
 RELEVANCE_THRESHOLD  = 0.3    # minimum FAISS score to treat a question as file-related
 
-# Per-user store: { username → { index, filename, df, ts, chunks, thread_id } }
+# Per-user store: { username -> { index, filename, df, ts, chunks, thread_id, status } }
 _store: dict = {}
 _lock  = threading.Lock()
 
@@ -62,6 +62,8 @@ def has_file(username: str, thread_id: str = None) -> bool:
         entry = _store.get(username)
         if not entry:
             return False
+        if entry.get("status") == "processing":
+            return False
         if time.time() - entry["ts"] > FILE_TTL:
             del _store[username]
             logger.info(f"[FileEngine] Session expired for {username}")
@@ -71,6 +73,36 @@ def has_file(username: str, thread_id: str = None) -> bool:
         stored_tid = entry.get("thread_id")
         if stored_tid and thread_id and stored_tid != thread_id:
             logger.info(f"[FileEngine] Thread mismatch for {username} — file belongs to thread '{stored_tid}', request from '{thread_id}'")
+            return False
+        return True
+
+
+def mark_processing(username: str, filename: str, thread_id: str = None) -> None:
+    """Register a file as processing so the UI can avoid routing too early."""
+    with _lock:
+        _store[username] = {
+            "index": None,
+            "filename": filename,
+            "df": None,
+            "ts": time.time(),
+            "chunks": 0,
+            "full_text": None,
+            "thread_id": thread_id,
+            "status": "processing",
+        }
+    logger.info(f"[FileEngine] Marked processing for {username} -> '{filename}'")
+
+
+def is_processing(username: str, thread_id: str = None) -> bool:
+    """Return True when the user's uploaded file is still being indexed."""
+    with _lock:
+        entry = _store.get(username)
+        if not entry:
+            return False
+        if entry.get("status") != "processing":
+            return False
+        stored_tid = entry.get("thread_id")
+        if stored_tid and thread_id and stored_tid != thread_id:
             return False
         return True
 
@@ -127,6 +159,7 @@ def process(username: str, filename: str, content: bytes, embeddings, thread_id:
                 "chunks":    len(chunks),
                 "full_text": full_text,
                 "thread_id": thread_id,   # binds file to uploading thread
+                "status":    "ready",
             }
 
         logger.info(f"[FileEngine] {username} → '{filename}' ({len(chunks)} chunks indexed)")
@@ -221,7 +254,9 @@ def get_full_text(username: str) -> Optional[str]:
     """Return full parsed text of the uploaded file (for summarization)."""
     with _lock:
         entry = _store.get(username)
-        return entry.get("full_text") if entry else None
+        if not entry or entry.get("status") == "processing":
+            return None
+        return entry.get("full_text")
 
 
 def clear(username: str):

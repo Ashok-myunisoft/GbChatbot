@@ -2216,6 +2216,15 @@ For example: "Name: John, Role: developer" """
             }
         
         # â”€â”€ File Intelligence: answer from uploaded file first â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        if FILE_ENGINE_AVAILABLE and hasattr(file_engine, "is_processing") and file_engine.is_processing(username, thread_id):
+            return {
+                "response": "Your uploaded file is still being processed. Please wait a moment and try again.",
+                "bot_type": "file_processing",
+                "thread_id": thread_id,
+                "user_role": user_role,
+                "download_url": None
+            }
+
         if FILE_ENGINE_AVAILABLE and file_engine.has_file(username, thread_id):
             file_context = await asyncio.to_thread(file_engine.search, username, question, thread_id)
             if file_context and len(file_context.strip()) >= 20:
@@ -3682,22 +3691,31 @@ async def upload_file(file: UploadFile = File(...), Login: str = Header(...), th
         content  = await file.read()
         filename = file.filename or "upload"
 
-        try:
-            status_msg = await asyncio.to_thread(
-                file_engine.process, username, filename, content, embeddings, thread_id
-            )
-        except Exception as e:
-            logger.error(f"[Upload] File engine crashed for {username} / '{filename}': {e}", exc_info=True)
-            return JSONResponse(
-                status_code=500,
-                content={"response": "Error processing file. Please try another file or format."},
-            )
+        if hasattr(file_engine, "mark_processing"):
+            file_engine.mark_processing(username, filename, thread_id)
 
-        logger.info(f"[Upload] {username} â†’ '{filename}': {status_msg[:80]}")
+        def _process_file_background():
+            try:
+                status_msg = file_engine.process(username, filename, content, embeddings, thread_id)
+                logger.info(f"[Upload] {username} -> '{filename}': {status_msg[:80]}")
+                if "uploaded successfully" not in status_msg and hasattr(file_engine, "clear"):
+                    file_engine.clear(username)
+            except Exception as e:
+                logger.error(f"[Upload] Background file processing failed for {username} / '{filename}': {e}", exc_info=True)
+                if hasattr(file_engine, "clear"):
+                    file_engine.clear(username)
 
-        # Return immediately after indexing so the request stays under proxy timeout limits.
-        # Summary generation was the expensive part and can be done separately if needed.
-        return {"response": status_msg, "filename": filename}
+        threading.Thread(
+            target=_process_file_background,
+            daemon=True,
+            name=f"file-upload-{username}",
+        ).start()
+
+        return {
+            "response": f"File **{filename}** upload accepted. It is now being processed in the background. Please wait a moment before asking questions about it.",
+            "filename": filename,
+            "status": "processing",
+        }
 
     except Exception as e:
         logger.error(f"[Upload] Unexpected upload error for {username if 'username' in locals() else 'unknown'}: {e}", exc_info=True)
