@@ -3685,8 +3685,18 @@ async def upload_file(
             form_data = await request.form()
             login_raw = form_data.get("Login") or form_data.get("login") or form_data.get("X-Login")
 
-        login_dto = json.loads(login_raw)
-        username  = login_dto.get("UserName", "anonymous")
+        login_dto = None
+        if login_raw:
+            login_dto = json.loads(login_raw)
+        elif thread_id:
+            thread = history_manager.get_thread(thread_id)
+            if thread and getattr(thread, "username", None):
+                login_dto = {"UserName": thread.username}
+
+        if not login_dto:
+            raise ValueError("Missing login header")
+
+        username = login_dto.get("UserName", "anonymous")
     except Exception as e:
         logger.warning(f"[Upload] Invalid login header: {e}")
         return JSONResponse(status_code=400, content={"response": "Invalid login header."})
