@@ -107,7 +107,41 @@ def create_tables():
             """)
 
             # ------------------------------------------------------------------
-            # Table 3: user_sessions
+            # Table 3: file_upload_sessions
+            # Persists per-user file intelligence metadata and storage paths so
+            # uploads remain available across workers, restarts, and redeploys.
+            # ------------------------------------------------------------------
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS file_upload_sessions (
+                    username       TEXT PRIMARY KEY,
+                    thread_id      TEXT,
+                    upload_token    TEXT,
+                    filename        TEXT,
+                    file_ext        TEXT,
+                    file_size       INTEGER,
+                    status          TEXT NOT NULL DEFAULT 'processing',
+                    storage_dir     TEXT NOT NULL,
+                    index_path      TEXT,
+                    dataframe_path  TEXT,
+                    full_text_path  TEXT,
+                    chunks          INTEGER DEFAULT 0,
+                    created_at      TIMESTAMPTZ DEFAULT NOW(),
+                    updated_at      TIMESTAMPTZ DEFAULT NOW(),
+                    last_access_at  TIMESTAMPTZ DEFAULT NOW(),
+                    last_error      TEXT
+                );
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_file_upload_sessions_thread
+                    ON file_upload_sessions(thread_id);
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_file_upload_sessions_status
+                    ON file_upload_sessions(status);
+            """)
+
+            # ------------------------------------------------------------------
+            # Table 4: user_sessions
             # Replaces Firestore 'user_sessions' collection.
             # Tracks per-user activity and role.
             # ------------------------------------------------------------------

@@ -3689,9 +3689,22 @@ async def upload_file(
         if login_raw:
             login_dto = json.loads(login_raw)
         elif thread_id:
-            thread = history_manager.get_thread(thread_id)
-            if thread and getattr(thread, "username", None):
-                login_dto = {"UserName": thread.username}
+            conn = get_pg_conn()
+            try:
+                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(
+                        """
+                        SELECT username
+                        FROM conversation_threads
+                        WHERE thread_id = %s
+                        """,
+                        (thread_id,),
+                    )
+                    thread_row = cur.fetchone()
+                if thread_row and thread_row.get("username"):
+                    login_dto = {"UserName": thread_row["username"]}
+            finally:
+                release_pg_conn(conn)
 
         if not login_dto:
             raise ValueError("Missing login header")
@@ -3811,6 +3824,9 @@ async def startup_event():
         logger.info("ðŸ“¦ Reusing shared embeddings from ai_resources...")
         embeddings = ai_resources.embeddings
         logger.info("âœ… Embeddings ready (shared)")
+        if FILE_ENGINE_AVAILABLE and hasattr(file_engine, "set_embeddings"):
+            file_engine.set_embeddings(embeddings)
+            logger.info("âœ… File engine embeddings configured")
 
         logger.info("ðŸ’¾ Loading conversation memory from PostgreSQL...")
         enhanced_memory = EnhancedConversationalMemory(
