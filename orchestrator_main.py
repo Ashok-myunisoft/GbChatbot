@@ -3739,6 +3739,12 @@ async def upload_file(
 
         content  = await file.read()
         filename = file.filename or "upload"
+        upload_summary = None
+        try:
+            if hasattr(file_engine, "build_upload_summary"):
+                upload_summary = file_engine.build_upload_summary(filename, content)
+        except Exception as summary_exc:
+            logger.warning(f"[Upload] Quick summary failed for {username} / '{filename}': {summary_exc}")
 
         if hasattr(file_engine, "mark_processing"):
             file_engine.mark_processing(username, filename, thread_id)
@@ -3760,10 +3766,18 @@ async def upload_file(
             name=f"file-upload-{username}",
         ).start()
 
+        response_text = (
+            f"File **{filename}** upload accepted. It is now being processed in the background. "
+            "Please wait a moment before asking questions about it."
+        )
+        if upload_summary:
+            response_text += f"\n\n{upload_summary}"
+
         return {
-            "response": f"File **{filename}** upload accepted. It is now being processed in the background. Please wait a moment before asking questions about it.",
+            "response": response_text,
             "filename": filename,
             "status": "processing",
+            "summary": upload_summary,
         }
 
     except Exception as e:

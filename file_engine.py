@@ -614,6 +614,118 @@ def get_full_text(username: str) -> Optional[str]:
     return _load_full_text(record.get("full_text_path"))
 
 
+def _compact_preview(text: str, max_chars: int = 700, max_sentences: int = 3) -> str:
+    """Create a short, readable preview from extracted text."""
+    cleaned = re.sub(r"\s+", " ", text or "").strip()
+    if not cleaned:
+        return ""
+
+    sentences = re.split(r"(?<=[.!?])\s+", cleaned)
+    preview = " ".join(sentence.strip() for sentence in sentences[:max_sentences] if sentence.strip())
+    if len(preview) < 80:
+        preview = cleaned
+    return preview[:max_chars].rstrip()
+
+
+def build_upload_summary(filename: str, content: bytes) -> str:
+    """
+    Build a lightweight summary for the uploaded file without changing the
+    main indexing/search pipeline.
+
+    This is intentionally extractive and fast so the upload response can show a
+    helpful summary immediately while background indexing continues.
+    """
+    ext = os.path.splitext(filename)[1].lower()
+
+    try:
+        if ext == ".pdf":
+            docs = _parse_pdf(content, filename)
+            text = "\n\n".join(d.page_content for d in docs)
+            preview = _compact_preview(text)
+            if not preview:
+                return f"File **{filename}** is a PDF, but no readable text was extracted yet."
+            return (
+                f"File **{filename}** is a PDF with **{len(docs)}** readable page sections.\n\n"
+                f"**Quick summary:** {preview}"
+            )
+
+        if ext == ".csv":
+            df, _ = _parse_tabular(content, filename, "csv")
+            if df is None or df.empty:
+                return f"File **{filename}** is a CSV file, but no rows were extracted."
+            cols = ", ".join(map(str, df.columns[:12]))
+            if len(df.columns) > 12:
+                cols += ", ..."
+            sample = df.head(3).to_string(index=False)
+            return (
+                f"File **{filename}** is a CSV with **{len(df)}** rows and **{len(df.columns)}** columns.\n\n"
+                f"**Columns:** {cols}\n\n"
+                f"**Sample rows:**\n{sample}"
+            )
+
+        if ext in (".xlsx", ".xls"):
+            df, _ = _parse_tabular(content, filename, "excel")
+            if df is None or df.empty:
+                return f"File **{filename}** is an Excel file, but no rows were extracted."
+            cols = ", ".join(map(str, df.columns[:12]))
+            if len(df.columns) > 12:
+                cols += ", ..."
+            sample = df.head(3).to_string(index=False)
+            return (
+                f"File **{filename}** is an Excel file with **{len(df)}** rows and **{len(df.columns)}** columns.\n\n"
+                f"**Columns:** {cols}\n\n"
+                f"**Sample rows:**\n{sample}"
+            )
+
+        if ext == ".json":
+            try:
+                data = json.loads(content.decode("utf-8", errors="ignore"))
+                if isinstance(data, list):
+                    preview = _compact_preview(json.dumps(data[:2], ensure_ascii=False, indent=2))
+                    return (
+                        f"File **{filename}** is a JSON array with **{len(data)}** item(s).\n\n"
+                        f"**Quick preview:** {preview}"
+                    )
+                if isinstance(data, dict):
+                    keys = ", ".join(list(data.keys())[:15])
+                    if len(data.keys()) > 15:
+                        keys += ", ..."
+                    preview = _compact_preview(json.dumps(data, ensure_ascii=False, indent=2))
+                    return (
+                        f"File **{filename}** is a JSON object.\n\n"
+                        f"**Top-level keys:** {keys or 'none'}\n\n"
+                        f"**Quick preview:** {preview}"
+                    )
+                preview = _compact_preview(str(data))
+                return (
+                    f"File **{filename}** is a JSON file.\n\n"
+                    f"**Quick preview:** {preview}"
+                )
+            except Exception:
+                return f"File **{filename}** is a JSON file, but a quick preview could not be generated."
+
+        if ext == ".txt":
+            text = content.decode("utf-8", errors="ignore")
+            preview = _compact_preview(text)
+            if not preview:
+                return f"File **{filename}** is a text file, but it appears empty."
+            return (
+                f"File **{filename}** is a text file.\n\n"
+                f"**Quick summary:** {preview}"
+            )
+
+        return (
+            f"File **{filename}** was uploaded successfully.\n\n"
+            "A quick summary is not available for this file type yet, but the file is being indexed for question answering."
+        )
+    except Exception as exc:
+        logger.warning(f"[FileEngine] Quick summary generation failed for {filename}: {exc}")
+        return (
+            f"File **{filename}** was uploaded successfully.\n\n"
+            "A quick summary could not be generated right now, but the file is still being indexed for question answering."
+        )
+
+
 def clear(username: str):
     """Manually clear a user's file session."""
     record = _get_record(username)
