@@ -6,6 +6,7 @@ from fastapi import Header
 from pydantic import BaseModel
 from shared_resources import ai_resources
 import db_query
+from response_formatter import format_data_response
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -314,7 +315,7 @@ async def chat(message, Login: str = None):
         if target_table and _is_data_only_question(user_input):
             logger.info("[FastPath] Simple data question — returning direct data, skipping RunPod")
             return {
-                "response":    context_str,
+                "response":    format_data_response(user_input, context_str),
                 "source_file": f"PostgreSQL table: {target_table}",
                 "bot_name":    "Schema Bot",
             }
@@ -346,7 +347,7 @@ async def chat(message, Login: str = None):
         answer = raw.content if hasattr(raw, 'content') else str(raw)
 
         return {
-            "response":    answer.strip(),
+            "response":    format_data_response(user_input, answer.strip()),
             "source_file": f"PostgreSQL table: {target_table}" if target_table else "PostgreSQL (live schema)",
             "bot_name":    "Schema Bot"
         }

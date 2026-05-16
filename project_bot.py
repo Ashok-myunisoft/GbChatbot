@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from shared_resources import ai_resources
 from fastapi import Header
 import db_query
+from response_formatter import format_data_response
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -292,7 +293,7 @@ async def project_chat(message: Message, Login: str = Header(...)):
         if _is_data_only_question(user_input):
             logger.info("[FastPath] Data-only question — returning direct data, skipping RunPod")
             return {
-                "response":    context_str,
+                "response":    format_data_response(user_input, context_str),
                 "source_file": "MFILE.csv",
                 "bot_name":    "Project Bot",
             }
@@ -327,7 +328,7 @@ async def project_chat(message: Message, Login: str = Header(...)):
         answer = raw.content if hasattr(raw, 'content') else str(raw)
 
         cleaned_answer = clean_response(answer)
-        formatted_answer = format_as_points(cleaned_answer)
+        formatted_answer = format_data_response(user_input, cleaned_answer)
 
         return {
             "response": formatted_answer,

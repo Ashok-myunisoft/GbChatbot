@@ -276,3 +276,13 @@ def format_response(question: str, raw: str) -> str:
         return _clean(f"{bolded}\n\n{rest}" if rest else bolded)
 
     return _clean(text)
+
+
+def format_data_response(question: str, raw: str) -> str:
+    """
+    Present raw database-style output in a cleaner, user-friendly format.
+
+    This is a thin wrapper around format_response() so bot code can make its
+    intent explicit without changing retrieval behavior.
+    """
+    return format_response(question, raw)

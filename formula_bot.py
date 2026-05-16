@@ -14,6 +14,7 @@ from langchain_core.documents import Document
 from fastapi.middleware.cors import CORSMiddleware
 from shared_resources import ai_resources
 import db_query
+from response_formatter import format_data_response
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -510,7 +511,7 @@ async def chat(message: Message, Login: str = Header(...)):
         if _is_data_only_question(user_input):
             logger.info("[FastPath] Data-only question — returning direct data, skipping RunPod")
             return {
-                "response":    context_str,
+                "response":    format_data_response(user_input, context_str),
                 "source_file": "MFORMULAFIELD.csv",
                 "bot_name":    "Formula Bot",
             }
@@ -564,7 +565,7 @@ async def chat(message: Message, Login: str = Header(...)):
                 formulas_json["bot_name"] = "Formula Bot"
                 return formulas_json
             return {
-                "response": cleaned_answer,
+                "response": format_data_response(user_input, cleaned_answer),
                 "source_file": "MFORMULAFIELD.csv",
                 "bot_name": "Formula Bot"
             }
