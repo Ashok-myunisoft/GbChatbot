@@ -34,6 +34,18 @@ def _embed_documents(texts: List[str]) -> List[List[float]]:
         return [embeddings.embed_query(text) for text in texts]
 
 
+def _blend_vectors(primary: Sequence[float], secondary: Sequence[float], primary_weight: float = 0.78) -> List[float]:
+    if not primary:
+        return list(secondary)
+    if not secondary:
+        return list(primary)
+    secondary_weight = 1.0 - primary_weight
+    return [
+        (p * primary_weight) + (s * secondary_weight)
+        for p, s in zip(primary, secondary)
+    ]
+
+
 @dataclass(frozen=True)
 class CandidateScore:
     name: str
@@ -192,7 +204,21 @@ class SemanticEmbeddingRouter:
         scored.sort(key=lambda item: item.score, reverse=True)
         return scored
 
-    def _best_match(self, query: str) -> RoutingDecision:
+    @staticmethod
+    def _should_use_context(query: str, context_text: str) -> bool:
+        if not context_text.strip():
+            return False
+        words = _normalize(query).split()
+        if len(words) > 14:
+            return False
+        markers = {
+            "it", "that", "this", "those", "them", "same", "more", "again",
+            "continue", "continue", "above", "previous", "earlier", "one",
+            "there", "here", "also", "either", "which", "follow", "followup",
+        }
+        return any(word in markers for word in words)
+
+    def _best_match(self, query: str, context_text: str = "") -> RoutingDecision:
         normalized = _normalize(query)
         if normalized in self._exact_targets:
             target = self._exact_targets[normalized]
@@ -210,6 +236,9 @@ class SemanticEmbeddingRouter:
             )
 
         query_vec = self._embed_query(query)
+        if context_text and self._should_use_context(query, context_text):
+            context_vec = self._embed_query(context_text)
+            query_vec = _blend_vectors(query_vec, context_vec)
 
         domain_scores = self._score_candidates(query_vec, self._domain_candidates, self._domain_embeddings)
         if not domain_scores:
@@ -317,14 +346,14 @@ class SemanticEmbeddingRouter:
             },
         )
 
-    def route(self, query: str) -> RoutingDecision:
+    def route(self, query: str, context_text: str = "") -> RoutingDecision:
         normalized = _normalize(query)
         with self._lock:
             cached = self._query_cache.get(normalized)
             if cached:
                 return cached
 
-        decision = self._best_match(query)
+        decision = self._best_match(query, context_text=context_text)
         with self._lock:
             if len(self._query_cache) >= 500:
                 self._query_cache = dict(list(self._query_cache.items())[250:])

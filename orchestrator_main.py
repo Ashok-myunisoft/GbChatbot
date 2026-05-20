@@ -38,6 +38,14 @@ except Exception as _semantic_router_import_error:
     SEMANTIC_ROUTER_AVAILABLE = False
     logging.warning(f"Semantic router unavailable: {_semantic_router_import_error}")
 
+try:
+    from core.answer_learning_memory import AnswerLearningMemory
+    ANSWER_LEARNING_AVAILABLE = True
+except Exception as _answer_learning_import_error:
+    AnswerLearningMemory = None
+    ANSWER_LEARNING_AVAILABLE = False
+    logging.warning(f"Answer learning memory unavailable: {_answer_learning_import_error}")
+
 # Import bot modules
 try:
     import formula_bot
@@ -124,6 +132,22 @@ class RoutingFeedbackRequest(BaseModel):
     correct_route: str
     reason: str = ""
     thread_id: str = ""
+
+
+class AnswerFeedbackRequest(BaseModel):
+    query: str
+    original_answer: str = ""
+    corrected_answer: str = ""
+    feedback_type: str = "answer_correction"
+    rating: int = 0
+    reason: str = ""
+    thread_id: str = ""
+    bot_type: str = ""
+    user_role: str = ""
+
+
+class LearningTaskRequest(BaseModel):
+    output_dir: str = "learning_exports"
     
 
 # ===========================
@@ -1006,6 +1030,7 @@ os.environ["OMP_NUM_THREADS"] = "2"
 # Initialize as None - will be loaded at startup
 embeddings = None
 enhanced_memory = None
+answer_learning_memory = None
 
 # ===========================
 # SHARED CONTEXT REGISTRY SYSTEM
@@ -1543,15 +1568,71 @@ def build_conversational_context(username: str, current_query: str, thread_id: s
             context_parts.append(f"Previous Q: {memory.get('user_message', '')[:80]}")
             context_parts.append(f"Previous A: {memory.get('bot_response', '')[:80]}")
         context_parts.append("")
-    
+
+    if answer_learning_memory:
+        answer_examples = answer_learning_memory.retrieve_relevant_examples(
+            username,
+            current_query,
+            k=2,
+            thread_id=thread_id,
+            thread_isolation=thread_isolation,
+        )
+        if answer_examples:
+            context_parts.append("=== Relevant Answer Feedback Examples ===")
+            for i, example in enumerate(answer_examples, 1):
+                context_parts.append(f"\nResolved Example {i}:")
+                context_parts.append(f"Question: {example.get('query', '')[:120]}")
+                context_parts.append(f"Preferred Answer: {example.get('preferred_answer', '')[:400]}")
+                reason = (example.get("reason") or "").strip()
+                if reason:
+                    context_parts.append(f"Reason: {reason[:160]}")
+                feedback_type = (example.get("feedback_type") or "").strip()
+                if feedback_type:
+                    context_parts.append(f"Feedback Type: {feedback_type}")
+            context_parts.append("")
+
     full_context = "\n".join(context_parts)
     
     logger.info(f"ðŸ“š Built conversational context:")
     logger.info(f"   - Thread messages: {len(thread.messages) if thread_id and thread else 0}")
     logger.info(f"   - Retrieved memories: {len(memories)}")
     logger.info(f"   - Total context size: {len(full_context)} chars")
-    
+
     return full_context
+
+
+def build_semantic_route_context(username: str, thread_id: str = None) -> Dict[str, object]:
+    """Build a compact thread snapshot for semantic routing and feedback matching."""
+    thread = history_manager.get_thread(thread_id) if thread_id else None
+    recent_turns = thread.messages[-3:] if thread and thread.messages else []
+
+    context: Dict[str, object] = {
+        "username": username,
+        "thread_id": thread_id or "",
+        "thread_title": thread.title if thread else "",
+        "thread_message_count": len(thread.messages) if thread and thread.messages else 0,
+        "last_user_message": recent_turns[-1].get("user_message", "") if recent_turns else "",
+        "last_bot_response": recent_turns[-1].get("bot_response", "") if recent_turns else "",
+        "bot_type": recent_turns[-1].get("bot_type", "") if recent_turns else "",
+        "last_bot_type": recent_turns[-1].get("bot_type", "") if recent_turns else "",
+        "recent_turns": recent_turns,
+        "domain_hint": "",
+        "intent_hint": "",
+    }
+
+    if thread and thread.messages:
+        context_lines = [f"Thread: {thread.title}"]
+        for index, msg in enumerate(recent_turns, 1):
+            context_lines.append(
+                f"Turn {index}: User: {msg.get('user_message', '')[:220]} | "
+                f"Bot: {msg.get('bot_response', '')[:220]} | "
+                f"Type: {msg.get('bot_type', '')}"
+            )
+        context["context_text"] = "\n".join(context_lines)
+    else:
+        context["context_text"] = ""
+
+    return context
 
 # ===========================
 # FILTERED CONTEXT BUILDER
@@ -1678,11 +1759,13 @@ class AIOrchestrationAgent:
         if not self.semantic_router:
             return None
         try:
+            semantic_context = build_semantic_route_context(username, thread_id)
             decision = await asyncio.to_thread(
                 self.semantic_router.route,
                 question,
                 username,
                 thread_id,
+                semantic_context,
             )
             logger.info(
                 "[SemanticRouter] domain=%s intent=%s action=%s target=%s confidence=%.3f source=%s",
@@ -2868,6 +2951,42 @@ def update_enhanced_memory(username: str, question: str, answer: str, bot_type: 
         logger.error(f"Error storing memory: {e}")
 
 
+def update_answer_learning_memory(
+    username: str,
+    question: str,
+    original_answer: str,
+    corrected_answer: str = "",
+    feedback_type: str = "answer_correction",
+    rating: int = 0,
+    reason: str = "",
+    bot_type: str = "",
+    user_role: str = "",
+    thread_id: str = None,
+    context: object = None,
+):
+    """Store explicit answer-quality feedback without affecting normal conversation memory."""
+    try:
+        if answer_learning_memory:
+            record = answer_learning_memory.store_feedback(
+                username=username,
+                query=question,
+                original_answer=original_answer,
+                corrected_answer=corrected_answer,
+                feedback_type=feedback_type,
+                rating=rating,
+                reason=reason,
+                bot_type=bot_type,
+                user_role=user_role,
+                thread_id=thread_id or "",
+                context=context,
+            )
+            logger.info("💾 Answer feedback memory stored successfully")
+            return record
+    except Exception as e:
+        logger.error(f"Error storing answer feedback memory: {e}")
+    return None
+
+
 async def _generate_thread_title(thread_id: str, user_message: str):
     """
     Generate a ChatGPT-style short title using the LLM synchronously before
@@ -3358,6 +3477,7 @@ async def system_status():
         "total_sessions": len(user_sessions),
         "total_conversations": sum(len(chats) for chats in chats_db.values()),
         "total_memories": enhanced_memory.memory_counter if enhanced_memory else 0,
+        "total_answer_feedback": answer_learning_memory.memory_counter if answer_learning_memory else 0,
         "total_threads": len(history_manager.threads),
         "active_threads": len([t for t in history_manager.threads.values() if t.is_active])
     }
@@ -3632,6 +3752,7 @@ async def record_routing_feedback(payload: RoutingFeedbackRequest, Login: str = 
         )
 
     try:
+        feedback_context = build_semantic_route_context(username, payload.thread_id)
         record = await asyncio.to_thread(
             ai_orchestrator.semantic_router.record_feedback,
             payload.query,
@@ -3640,6 +3761,7 @@ async def record_routing_feedback(payload: RoutingFeedbackRequest, Login: str = 
             payload.reason,
             username,
             payload.thread_id,
+            feedback_context,
         )
         return {
             "success": True,
@@ -3657,6 +3779,169 @@ async def record_routing_feedback(payload: RoutingFeedbackRequest, Login: str = 
         return JSONResponse(
             status_code=500,
             content={"success": False, "message": "Failed to store routing feedback."},
+        )
+
+
+@app.post("/gbaiapi/answer/feedback", tags=["Debug"])
+@app.post("/gbaiapi/feedback/answer", tags=["Debug"])
+async def record_answer_feedback(payload: AnswerFeedbackRequest, Login: str = Header(...)):
+    try:
+        login_dto = json.loads(Login)
+        username = login_dto.get("UserName", "anonymous")
+        role_id = str(login_dto.get("roleid", ""))
+        login_role = ROLEID_TO_NAME.get(role_id, "client").lower()
+    except Exception:
+        username = "anonymous"
+        login_role = "client"
+
+    if not answer_learning_memory:
+        return JSONResponse(
+            status_code=503,
+            content={"success": False, "message": "Answer learning memory is not available."},
+        )
+
+    try:
+        feedback_context = build_semantic_route_context(username, payload.thread_id)
+        bot_type = (payload.bot_type or feedback_context.get("bot_type") or "").strip()
+        user_role = (payload.user_role or login_role or "").strip()
+        feedback_type = (payload.feedback_type or "answer_correction").strip().lower()
+        original_answer = (payload.original_answer or "").strip()
+        corrected_answer = (payload.corrected_answer or "").strip()
+
+        if feedback_type in {"helpful", "positive", "good_answer"} and not corrected_answer:
+            corrected_answer = original_answer
+
+        record = await asyncio.to_thread(
+            update_answer_learning_memory,
+            username,
+            payload.query,
+            original_answer,
+            corrected_answer,
+            feedback_type,
+            payload.rating,
+            payload.reason,
+            bot_type,
+            user_role,
+            payload.thread_id,
+            feedback_context,
+        )
+        if not record:
+            return JSONResponse(
+                status_code=500,
+                content={"success": False, "message": "Failed to store answer feedback."},
+            )
+        return {
+            "success": True,
+            "message": "Answer feedback stored.",
+            "record": {
+                "feedback_id": record.feedback_id,
+                "query": record.query,
+                "feedback_type": record.feedback_type,
+                "rating": record.rating,
+                "reason": record.reason,
+                "timestamp": record.timestamp,
+                "bot_type": record.bot_type,
+                "user_role": record.user_role,
+                "corrected_answer": record.corrected_answer,
+            },
+        }
+    except Exception as e:
+        logger.error(f"Failed to store answer feedback: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "message": "Failed to store answer feedback."},
+        )
+
+
+@app.get("/gbaiapi/learning/status", tags=["Learning"])
+async def learning_status(Login: str = Header(...)):
+    try:
+        login_dto = json.loads(Login)
+        username = login_dto.get("UserName", "anonymous")
+    except Exception:
+        username = "anonymous"
+
+    routing_feedback_count = 0
+    routing_feedback_path = ""
+    try:
+        from core.semantic_router.learning_memory import get_feedback_records, get_feedback_file_path
+
+        routing_feedback_records = get_feedback_records()
+        routing_feedback_count = len(routing_feedback_records)
+        routing_feedback_path = get_feedback_file_path()
+    except Exception:
+        routing_feedback_records = []
+
+    answer_stats = {}
+    if answer_learning_memory:
+        try:
+            answer_stats = answer_learning_memory.get_statistics()
+        except Exception as exc:
+            logger.warning(f"[Learning] Could not load answer stats: {exc}")
+
+    return {
+        "username": username,
+        "routing_feedback_count": routing_feedback_count,
+        "routing_feedback_path": routing_feedback_path,
+        "answer_feedback": answer_stats,
+        "features": {
+            "routing_learning": bool(ai_orchestrator and getattr(ai_orchestrator, "semantic_router", None)),
+            "answer_learning": bool(answer_learning_memory),
+            "offline_export": True,
+            "offline_replay": True,
+        },
+    }
+
+
+@app.post("/gbaiapi/learning/export", tags=["Learning"])
+async def export_learning_dataset(payload: LearningTaskRequest, Login: str = Header(...)):
+    try:
+        login_dto = json.loads(Login)
+        username = login_dto.get("UserName", "anonymous")
+    except Exception:
+        username = "anonymous"
+
+    try:
+        from core.learning_pipeline.dataset_exporter import LearningDatasetExporter
+
+        exporter = LearningDatasetExporter()
+        result = await asyncio.to_thread(exporter.export, payload.output_dir)
+        return {
+            "success": True,
+            "username": username,
+            "result": result.__dict__,
+        }
+    except Exception as e:
+        logger.error(f"[Learning] Dataset export failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "message": "Dataset export failed."},
+        )
+
+
+@app.post("/gbaiapi/learning/replay", tags=["Learning"])
+async def replay_learning(payload: LearningTaskRequest, Login: str = Header(...)):
+    try:
+        login_dto = json.loads(Login)
+        username = login_dto.get("UserName", "anonymous")
+    except Exception:
+        username = "anonymous"
+
+    try:
+        from core.learning_pipeline.replay_job import LearningReplayJob
+
+        job = LearningReplayJob()
+        result = await asyncio.to_thread(job.run, payload.output_dir, answer_learning_memory)
+        return {
+            "success": True,
+            "username": username,
+            "result": result.__dict__,
+        }
+    except Exception as e:
+        logger.error(f"[Learning] Replay job failed: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "message": "Replay job failed."},
         )
 
 @app.post("/gbaiapi/voice_chat", tags=["Voice AI"])
@@ -3963,7 +4248,7 @@ async def health_check():
 # ===========================
 @app.on_event("startup")
 async def startup_event():
-    global history_manager, embeddings, enhanced_memory, ai_orchestrator
+    global history_manager, embeddings, enhanced_memory, answer_learning_memory, ai_orchestrator
     
     logger.info("=" * 80)
     logger.info("ðŸš€ GoodBooks AI Orchestrator starting")
@@ -3989,6 +4274,13 @@ async def startup_event():
             embeddings=embeddings
         )
         logger.info("âœ… Memory loaded")
+
+        if ANSWER_LEARNING_AVAILABLE and AnswerLearningMemory:
+            logger.info("ðŸ§  Loading answer feedback memory from PostgreSQL...")
+            answer_learning_memory = AnswerLearningMemory()
+            logger.info("âœ… Answer feedback memory loaded")
+        else:
+            logger.warning("âš ï¸ Answer feedback memory unavailable; continuing without it")
 
         logger.info("ðŸ“š Loading conversation threads from PostgreSQL...")
         history_manager = ConversationHistoryManager()

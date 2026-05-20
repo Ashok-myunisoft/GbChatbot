@@ -7,7 +7,7 @@ import os
 import re
 import threading
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields as dataclass_fields
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -52,6 +52,16 @@ def _load_records() -> List[Dict]:
     return []
 
 
+def get_feedback_records() -> List[Dict]:
+    """Public accessor for stored routing feedback records."""
+    return _load_records()
+
+
+def get_feedback_file_path() -> str:
+    """Public accessor for the routing feedback file path."""
+    return str(_FEEDBACK_FILE)
+
+
 def _normalize_query(query: str) -> str:
     text = re.sub(r"[^\w\s]", " ", query.lower().strip())
     tokens = [token for token in text.split() if token and token not in _STOP_WORDS]
@@ -86,6 +96,13 @@ class FeedbackRecord:
     timestamp: float
     username: str = ""
     thread_id: str = ""
+    bot_type: str = ""
+    thread_title: str = ""
+    last_user_message: str = ""
+    last_bot_response: str = ""
+    context_text: str = ""
+    domain_hint: str = ""
+    intent_hint: str = ""
 
     @property
     def normalized_query(self) -> str:
@@ -106,8 +123,64 @@ class SemanticLearningMemory:
             if self._cache_loaded:
                 return
             raw = _load_records()
-            self._cache = [FeedbackRecord(**record) for record in raw if isinstance(record, dict)]
+            allowed_fields = {field.name for field in dataclass_fields(FeedbackRecord)}
+            cleaned: List[FeedbackRecord] = []
+            for record in raw:
+                if not isinstance(record, dict):
+                    continue
+                payload = {key: value for key, value in record.items() if key in allowed_fields}
+                try:
+                    cleaned.append(FeedbackRecord(**payload))
+                except TypeError as exc:
+                    logger.warning("[SemanticRouter] Skipping malformed feedback record: %s", exc)
+            self._cache = cleaned
             self._cache_loaded = True
+
+    @staticmethod
+    def _context_to_text(context: object) -> str:
+        if context is None:
+            return ""
+        if isinstance(context, str):
+            return context.strip()
+        if isinstance(context, dict):
+            parts: List[str] = []
+            for key in (
+                "thread_title",
+                "last_user_message",
+                "last_bot_response",
+                "bot_type",
+                "domain_hint",
+                "intent_hint",
+                "context_text",
+            ):
+                value = context.get(key)
+                if value:
+                    parts.append(f"{key}: {value}")
+            for key in ("recent_turns", "recent_messages"):
+                value = context.get(key)
+                if isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, str) and item.strip():
+                            parts.append(item.strip())
+                        elif isinstance(item, dict):
+                            user_message = (item.get("user_message") or "").strip()
+                            bot_response = (item.get("bot_response") or "").strip()
+                            bot_type = (item.get("bot_type") or "").strip()
+                            if user_message or bot_response or bot_type:
+                                parts.append(
+                                    " | ".join(
+                                        part for part in (
+                                            f"user: {user_message}" if user_message else "",
+                                            f"bot: {bot_response}" if bot_response else "",
+                                            f"type: {bot_type}" if bot_type else "",
+                                        )
+                                        if part
+                                    )
+                                )
+            return "\n".join(parts).strip()
+        if isinstance(context, (list, tuple)):
+            return "\n".join(str(item).strip() for item in context if str(item).strip())
+        return str(context).strip()
 
     def add_feedback(
         self,
@@ -117,8 +190,11 @@ class SemanticLearningMemory:
         reason: str,
         username: str = "",
         thread_id: str = "",
+        context: object = None,
     ) -> FeedbackRecord:
         self._ensure_cache()
+        context_text = self._context_to_text(context)
+        context_payload = context if isinstance(context, dict) else {}
         record = FeedbackRecord(
             query=query.strip(),
             wrong_route=wrong_route.strip(),
@@ -127,6 +203,13 @@ class SemanticLearningMemory:
             timestamp=time.time(),
             username=username.strip(),
             thread_id=thread_id.strip(),
+            bot_type=str(context_payload.get("bot_type", "")).strip(),
+            thread_title=str(context_payload.get("thread_title", "")).strip(),
+            last_user_message=str(context_payload.get("last_user_message", "")).strip(),
+            last_bot_response=str(context_payload.get("last_bot_response", "")).strip(),
+            context_text=context_text,
+            domain_hint=str(context_payload.get("domain_hint", "")).strip(),
+            intent_hint=str(context_payload.get("intent_hint", "")).strip(),
         )
         with self._cache_lock:
             self._cache.append(record)
@@ -151,6 +234,9 @@ class SemanticLearningMemory:
     def find_matching_correction(
         self,
         query: str,
+        context_text: str = "",
+        username: str = "",
+        thread_id: str = "",
         threshold: float = 0.86,
     ) -> Optional[Dict]:
         self._ensure_cache()
@@ -158,6 +244,8 @@ class SemanticLearningMemory:
             return None
 
         query_vec = self._embed_query(query)
+        context_norm = _normalize_query(context_text) if context_text else ""
+        context_vec = self._embed_query(context_text) if context_text else []
         query_norm = _normalize_query(query)
 
         best_record: Optional[FeedbackRecord] = None
@@ -180,6 +268,21 @@ class SemanticLearningMemory:
                 self._query_embeddings[record.normalized_query] = record_vec
 
             score = _cosine(query_vec, record_vec)
+            if context_norm and record.context_text:
+                record_context_norm = _normalize_query(record.context_text)
+                if record_context_norm == context_norm:
+                    score = min(1.0, score + 0.12)
+                else:
+                    record_context_vec = self._query_embeddings.get(record_context_norm)
+                    if record_context_vec is None:
+                        record_context_vec = self._embed_query(record.context_text)
+                        self._query_embeddings[record_context_norm] = record_context_vec
+                    context_score = _cosine(context_vec, record_context_vec)
+                    score = (score * 0.78) + (context_score * 0.22)
+            if username and record.username and record.username == username:
+                score = min(1.0, score + 0.02)
+            if thread_id and record.thread_id and record.thread_id == thread_id:
+                score = min(1.0, score + 0.03)
             if score > best_score:
                 best_score = score
                 best_record = record
@@ -194,4 +297,3 @@ class SemanticLearningMemory:
                 "score": best_score,
             }
         return None
-

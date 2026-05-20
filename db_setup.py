@@ -107,6 +107,38 @@ def create_tables():
             """)
 
             # ------------------------------------------------------------------
+            # Table 2b: answer_feedback_vectors
+            # Stores explicit answer-quality feedback and corrected answers for
+            # retrieval during future responses.
+            # ------------------------------------------------------------------
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS answer_feedback_vectors (
+                    id               SERIAL PRIMARY KEY,
+                    feedback_id      TEXT UNIQUE,
+                    username         TEXT NOT NULL,
+                    thread_id        TEXT REFERENCES conversation_threads(thread_id) ON DELETE CASCADE,
+                    bot_type         TEXT,
+                    user_role        TEXT,
+                    feedback_type    TEXT NOT NULL DEFAULT 'answer_correction',
+                    rating           INTEGER DEFAULT 0,
+                    query            TEXT NOT NULL,
+                    original_answer  TEXT,
+                    corrected_answer TEXT,
+                    reason           TEXT,
+                    context_text     TEXT,
+                    created_at       TIMESTAMPTZ DEFAULT NOW()
+                );
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_afv_username
+                    ON answer_feedback_vectors(username);
+            """)
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_afv_thread
+                    ON answer_feedback_vectors(thread_id);
+            """)
+
+            # ------------------------------------------------------------------
             # Table 3: file_upload_sessions
             # Persists per-user file intelligence metadata and storage paths so
             # uploads remain available across workers, restarts, and redeploys.
