@@ -30,6 +30,13 @@ import voice_engine
 import voice_agent
 import formatter_agent
 import agentic_classifier
+try:
+    from core.semantic_router.routing_orchestrator import get_semantic_router
+    SEMANTIC_ROUTER_AVAILABLE = True
+except Exception as _semantic_router_import_error:
+    get_semantic_router = None
+    SEMANTIC_ROUTER_AVAILABLE = False
+    logging.warning(f"Semantic router unavailable: {_semantic_router_import_error}")
 
 # Import bot modules
 try:
@@ -109,6 +116,14 @@ class UserRole:
     SYSTEM_ADMIN = "system admin"
     MANAGER = "manager"
     SALES = "sales"
+
+
+class RoutingFeedbackRequest(BaseModel):
+    query: str
+    wrong_route: str
+    correct_route: str
+    reason: str = ""
+    thread_id: str = ""
     
 
 # ===========================
@@ -1644,6 +1659,55 @@ class AIOrchestrationAgent:
         
         self.intent_cache = {}
         self._intent_cache_lock = threading.Lock()
+        self.semantic_router = None
+        if SEMANTIC_ROUTER_AVAILABLE and get_semantic_router:
+            try:
+                self.semantic_router = get_semantic_router()
+                logger.info("Semantic router initialized successfully")
+            except Exception as e:
+                logger.warning(f"Semantic router init failed: {e}")
+                self.semantic_router = None
+
+    async def _resolve_semantic_route(
+        self,
+        question: str,
+        username: str,
+        user_role: str,
+        thread_id: str,
+    ):
+        if not self.semantic_router:
+            return None
+        try:
+            decision = await asyncio.to_thread(
+                self.semantic_router.route,
+                question,
+                username,
+                thread_id,
+            )
+            logger.info(
+                "[SemanticRouter] domain=%s intent=%s action=%s target=%s confidence=%.3f source=%s",
+                decision.domain,
+                decision.intent,
+                decision.action,
+                decision.target,
+                decision.confidence,
+                decision.source,
+            )
+            if decision.should_clarify():
+                return {
+                    "kind": "clarify",
+                    "decision": decision,
+                    "response": decision.clarification,
+                }
+            if decision.route_now and decision.target in self.bots:
+                return {
+                    "kind": "route",
+                    "decision": decision,
+                    "bot_type": decision.target,
+                }
+        except Exception as e:
+            logger.warning(f"[SemanticRouter] routing failed for '{question[:80]}': {e}")
+        return None
     
     def _understand_query(self, question: str) -> Optional[str]:
         """
@@ -2483,8 +2547,26 @@ For example: "Name: John, Role: developer" """
                         }
         # â”€â”€ End follow-up detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
+        semantic_route = await self._resolve_semantic_route(question, username, user_role, thread_id)
+        intent = None
+        if semantic_route:
+            if semantic_route["kind"] == "clarify":
+                clarification = semantic_route["response"]
+                logger.info(f"[SemanticRouter] Clarification returned: {clarification[:120]}")
+                return {
+                    "response": clarification,
+                    "formatted": await asyncio.to_thread(formatter_agent.format, question, clarification),
+                    "bot_type": "clarification",
+                    "thread_id": thread_id,
+                    "user_role": user_role,
+                    "download_url": None
+                }
+            intent = semantic_route["bot_type"]
+            logger.info(f"[SemanticRouter] Direct route selected: {intent}")
+
         logger.info("ðŸŽ¯ Detecting intent...")
-        intent = await self.detect_intent_with_ai(question, context)
+        if intent is None:
+            intent = await self.detect_intent_with_ai(question, context)
         logger.info(f"ðŸŽ¯ INTENT SELECTED: {intent}")
 
         # ðŸ”— ENHANCED: Add cross-bot context sharing
@@ -3411,6 +3493,7 @@ async def get_performance_stats():
         },
         "optimization_status": {
             "keyword_routing": "enabled",
+            "semantic_routing": "enabled" if getattr(ai_orchestrator, "semantic_router", None) else "disabled",
             "intent_caching": "enabled",
             "smart_role_adaptation": "enabled",
             "fallback_chain": "enabled",
@@ -3426,6 +3509,7 @@ async def get_performance_stats():
         },
         "routing_strategy": {
             "primary": "Keyword-based fast routing",
+            "semantic_layer": "Additive semantic routing with fallback",
             "secondary": "AI-based intent detection",
             "fallback": "Question structure analysis",
             "bot_chain": "Primary bot â†’ General bot â†’ Out-of-scope"
@@ -3489,6 +3573,17 @@ async def test_routing(question: str):
         logger.info(f"ðŸ§ª Testing routing for question: {question}")
         
         keyword_intent = ai_orchestrator._get_cached_intent(question)
+        semantic_intent = "none"
+        semantic_confidence = None
+        if getattr(ai_orchestrator, "semantic_router", None):
+            semantic_result = await asyncio.to_thread(
+                ai_orchestrator.semantic_router.route,
+                question,
+                "",
+                "",
+            )
+            semantic_intent = semantic_result.target
+            semantic_confidence = semantic_result.confidence
         
         start_time = time.time()
         ai_intent = await ai_orchestrator.detect_intent_with_ai(question, "")
@@ -3497,6 +3592,8 @@ async def test_routing(question: str):
         return {
             "question": question,
             "keyword_based_intent": keyword_intent or "none (will use AI)",
+            "semantic_intent": semantic_intent,
+            "semantic_confidence": semantic_confidence,
             "ai_detected_intent": ai_intent,
             "routing_time": f"{elapsed:.2f}s",
             "routing_method": "keyword" if keyword_intent else "ai",
@@ -3518,6 +3615,49 @@ async def clear_intent_cache():
         "previous_cache_size": cache_size,
         "current_cache_size": len(ai_orchestrator.intent_cache)
     }
+
+
+@app.post("/gbaiapi/routing/feedback", tags=["Debug"])
+async def record_routing_feedback(payload: RoutingFeedbackRequest, Login: str = Header(...)):
+    try:
+        login_dto = json.loads(Login)
+        username = login_dto.get("UserName", "anonymous")
+    except Exception:
+        username = "anonymous"
+
+    if not ai_orchestrator or not getattr(ai_orchestrator, "semantic_router", None):
+        return JSONResponse(
+            status_code=503,
+            content={"success": False, "message": "Semantic router is not available."},
+        )
+
+    try:
+        record = await asyncio.to_thread(
+            ai_orchestrator.semantic_router.record_feedback,
+            payload.query,
+            payload.wrong_route,
+            payload.correct_route,
+            payload.reason,
+            username,
+            payload.thread_id,
+        )
+        return {
+            "success": True,
+            "message": "Routing feedback stored.",
+            "record": {
+                "query": record.query,
+                "wrong_route": record.wrong_route,
+                "correct_route": record.correct_route,
+                "reason": record.reason,
+                "timestamp": record.timestamp,
+            },
+        }
+    except Exception as e:
+        logger.error(f"Failed to store routing feedback: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "message": "Failed to store routing feedback."},
+        )
 
 @app.post("/gbaiapi/voice_chat", tags=["Voice AI"])
 async def voice_chat(request: Request, Login: str = Header(...)):
