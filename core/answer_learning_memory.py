@@ -69,6 +69,71 @@ class AnswerLearningMemory:
         self._query_embeddings: Dict[str, List[float]] = {}
         self.load_memory_vectorstore()
 
+    def _load_records_from_db(self) -> List[AnswerFeedbackRecord]:
+        """Fetch answer feedback rows from PostgreSQL and normalize them into records."""
+        conn = None
+        try:
+            conn = get_pg_conn()
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT feedback_id, query, original_answer, corrected_answer, feedback_type,
+                           rating, reason, username, thread_id, bot_type, user_role,
+                           context_text, created_at
+                    FROM answer_feedback_vectors
+                    ORDER BY created_at DESC
+                    LIMIT 5000
+                    """
+                )
+                rows = cur.fetchall()
+
+            allowed_fields = {field.name for field in dataclass_fields(AnswerFeedbackRecord)}
+            records: List[AnswerFeedbackRecord] = []
+            for row in rows:
+                payload = {key: value for key, value in dict(row).items() if key in allowed_fields}
+                if "feedback_id" not in payload:
+                    continue
+                payload.setdefault("original_answer", "")
+                payload.setdefault("corrected_answer", "")
+                payload.setdefault("feedback_type", "answer_correction")
+                payload.setdefault("rating", 0)
+                payload.setdefault("reason", "")
+                payload.setdefault("timestamp", time.time())
+                payload.setdefault("username", "")
+                payload.setdefault("thread_id", "")
+                payload.setdefault("bot_type", "")
+                payload.setdefault("user_role", "")
+                payload.setdefault("context_text", "")
+                try:
+                    records.append(AnswerFeedbackRecord(**payload))
+                except TypeError as exc:
+                    logger.warning("[AnswerLearning] Skipping malformed feedback row: %s", exc)
+            return records
+        finally:
+            if conn is not None:
+                release_pg_conn(conn)
+
+    def load_memory_vectorstore(self) -> None:
+        """Load answer feedback from PostgreSQL and rebuild the in-memory FAISS index."""
+        try:
+            records = self._load_records_from_db()
+            with self._cache_lock:
+                self._cache = records
+                self._cache_loaded = True
+                self._query_embeddings.clear()
+                self.memory_counter = len(records)
+            self._rebuild_vectorstore_from_cache()
+            logger.info("[AnswerLearning] Loaded %s feedback rows into memory.", len(records))
+        except Exception as exc:
+            logger.error("[AnswerLearning] Failed to load feedback records: %s", exc, exc_info=True)
+            with self._cache_lock:
+                self._cache = []
+                self._cache_loaded = True
+                self._query_embeddings.clear()
+                self.memory_counter = 0
+            dummy = Document(page_content="Answer learning memory initialized", metadata={"feedback_id": "init"})
+            self.memory_vectorstore = FAISS.from_documents([dummy], self.embeddings)
+
     @staticmethod
     def _context_to_text(context: object) -> str:
         if context is None:
@@ -117,54 +182,7 @@ class AnswerLearningMemory:
     def _ensure_cache(self) -> None:
         if self._cache_loaded:
             return
-        with self._cache_lock:
-            if self._cache_loaded:
-                return
-            try:
-                conn = get_pg_conn()
-                with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                    cur.execute(
-                        """
-                        SELECT feedback_id, query, original_answer, corrected_answer, feedback_type,
-                               rating, reason, username, thread_id, bot_type, user_role,
-                               context_text, created_at
-                        FROM answer_feedback_vectors
-                        ORDER BY created_at DESC
-                        LIMIT 5000
-                        """
-                    )
-                    rows = cur.fetchall()
-                release_pg_conn(conn)
-                allowed_fields = {field.name for field in dataclass_fields(AnswerFeedbackRecord)}
-                records: List[AnswerFeedbackRecord] = []
-                for row in rows:
-                    payload = {key: value for key, value in dict(row).items() if key in allowed_fields}
-                    if "feedback_id" not in payload:
-                        continue
-                    payload.setdefault("original_answer", "")
-                    payload.setdefault("corrected_answer", "")
-                    payload.setdefault("feedback_type", "answer_correction")
-                    payload.setdefault("rating", 0)
-                    payload.setdefault("reason", "")
-                    payload.setdefault("timestamp", time.time())
-                    payload.setdefault("username", "")
-                    payload.setdefault("thread_id", "")
-                    payload.setdefault("bot_type", "")
-                    payload.setdefault("user_role", "")
-                    payload.setdefault("context_text", "")
-                    try:
-                        records.append(AnswerFeedbackRecord(**payload))
-                    except TypeError as exc:
-                        logger.warning("[AnswerLearning] Skipping malformed feedback row: %s", exc)
-                self._cache = records
-                self._cache_loaded = True
-                self._rebuild_vectorstore_from_cache()
-            except Exception as exc:
-                logger.error("[AnswerLearning] Failed to load feedback records: %s", exc, exc_info=True)
-                self._cache = []
-                self._cache_loaded = True
-                dummy = Document(page_content="Answer learning memory initialized", metadata={"feedback_id": "init"})
-                self.memory_vectorstore = FAISS.from_documents([dummy], self.embeddings)
+        self.load_memory_vectorstore()
 
     def refresh(self) -> None:
         """Reload feedback records and rebuild the vectorstore from PostgreSQL."""
