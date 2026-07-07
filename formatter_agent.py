@@ -252,7 +252,12 @@ def _parse_bullet_list(text: str) -> list:
             items.append(re.sub(r"\*+", "", m.group(1)).strip())
         elif re.match(r"^\*\*(.+)\*\*", line):
             items.append(re.sub(r"\*+", "", line).strip())
-    return items if items else [l.strip() for l in text.split("\n") if l.strip()]
+    if items:
+        return items
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    if len(lines) == 1 and "," in lines[0]:
+        return [i.strip() for i in lines[0].split(",") if i.strip()]
+    return lines
 
 def _parse_summary(text: str) -> list:
     """Extract key sentences — skip fluff."""

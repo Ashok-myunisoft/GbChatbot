@@ -131,8 +131,8 @@ def is_slot_filling_response(question: str) -> bool:
     if any(kw in q for kw in _SLOT_FILLING_KEYWORDS):
         return True
 
-    # Long question-style message → clearly not a slot-filling response
-    if len(q.split()) > 5 and any(q.startswith(s) for s in _QUESTION_STARTERS):
+    # Question-style message → clearly not a slot-filling response
+    if any(q.startswith(s) for s in _QUESTION_STARTERS):
         return False
 
     # Default: conservative — don't break session unless clearly non-slot
@@ -274,8 +274,12 @@ _ACTION_PATTERNS = [
 
 def classify(question: str) -> str:
     """
-    Classify question intent.
-    Greetings always return "general" — never routed to the API.
+    Two-stage intent classifier.
+
+    Stage 1 — regex (existing patterns): strong, unambiguous matches resolved instantly.
+    Stage 2 — LLM confirmation: only fires when weak signals are present but no strong
+              pattern matched. Prevents false positives (e.g. "leave approval workflow"
+              → GENERAL) and false negatives (e.g. "I need a day off" → ACTION).
 
     Returns:
         "personal"  → route to Chat Interface API
@@ -289,20 +293,59 @@ def classify(question: str) -> str:
 
     q = question.lower().strip()
 
-    # Time slip requests should route to the agentic workflow even if phrased directly.
+    # ── Stage 1: Strong regex matches (existing logic, unchanged) ─────────────
+    # Time slip — explicit fast path
     if re.search(r"\bsubmit\s+(a\s+)?time\s*slip\b", q) or re.search(r"\btime\s*slip\b", q):
-        logger.info(f"[AgenticClassifier] ACTION intent: '{question[:60]}'")
+        logger.info(f"[AgenticClassifier] ACTION intent (strong): '{question[:60]}'")
         return "action"
 
     for pattern in _PERSONAL_PATTERNS:
         if re.search(pattern, q):
-            logger.info(f"[AgenticClassifier] PERSONAL intent: '{question[:60]}'")
+            logger.info(f"[AgenticClassifier] PERSONAL intent (strong): '{question[:60]}'")
             return "personal"
 
     for pattern in _ACTION_PATTERNS:
         if re.search(pattern, q):
-            logger.info(f"[AgenticClassifier] ACTION intent: '{question[:60]}'")
+            logger.info(f"[AgenticClassifier] ACTION intent (strong): '{question[:60]}'")
             return "action"
+
+    # ── Stage 2: Weak signal → LLM confirmation ───────────────────────────────
+    # Only runs when no strong pattern matched but the message contains words that
+    # COULD relate to personal/action intent (catches novel phrasings like
+    # "I need a day off" or prevents "leave approval workflow" being misrouted).
+    _WEAK_SIGNALS = {
+        "leave", "permission", "attendance", "absent", "day off",
+        "time off", "half day", "comp off", "holiday", "off day",
+    }
+    if any(w in q for w in _WEAK_SIGNALS):
+        try:
+            from shared_resources import ai_resources
+            _prompt = (
+                "Classify this ERP chatbot message into one category:\n"
+                "PERSONAL — user asking about their OWN leave/permission/attendance/salary data\n"
+                "ACTION   — user wants to apply/cancel/submit/approve leave, permission, or time slip\n"
+                "GENERAL  — asking about ERP concepts, policies, workflows, reports, or general info\n\n"
+                "Examples:\n"
+                "  'I need a day off next Monday'       → ACTION\n"
+                "  'show leave approval workflow'       → GENERAL\n"
+                "  'how many leaves do I have'          → PERSONAL\n"
+                "  'what is the leave approval process' → GENERAL\n"
+                "  'leave policy in HR module'          → GENERAL\n"
+                "  'book me off on Friday'              → ACTION\n\n"
+                "Reply with PERSONAL, ACTION, or GENERAL only.\n"
+                f"Message: {question}"
+            )
+            raw = ai_resources.routing_llm.invoke(_prompt)
+            answer = (raw.content if hasattr(raw, "content") else str(raw)).strip().upper()
+            if answer.startswith("PERSONAL"):
+                logger.info(f"[AgenticClassifier] PERSONAL intent (LLM confirmed): '{question[:60]}'")
+                return "personal"
+            if answer.startswith("ACTION"):
+                logger.info(f"[AgenticClassifier] ACTION intent (LLM confirmed): '{question[:60]}'")
+                return "action"
+            logger.info(f"[AgenticClassifier] GENERAL intent (LLM confirmed): '{question[:60]}'")
+        except Exception as _e:
+            logger.warning(f"[AgenticClassifier] LLM confirmation failed, defaulting to general: {_e}")
 
     logger.info(f"[AgenticClassifier] GENERAL intent — passing to existing bots: '{question[:60]}'")
     return "general"

@@ -15,9 +15,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel
 
-# Configure logging first â€” before any module-level log calls
+# Configure logging first -- before any module-level log calls
 logging.basicConfig(level=logging.INFO)
-# RunPodLLM via shared_resources â€” ChatOllama no longer used
+# RunPodLLM via shared_resources -- ChatOllama no longer used
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 import psycopg2
@@ -254,11 +254,11 @@ ROLEID_TO_NAME = {
 # Memory storage
 MEMORY_VECTORSTORE_PATH = "conversational_memory_vectorstore"
 chats_db = {}
-user_sessions = {}          # { key â†’ session_data }; evicted hourly
+user_sessions = {}          # { key â†' session_data }; evicted hourly
 _USER_SESSION_TTL = 86400   # 24 hours
 
 # ===========================
-# RATE LIMITER (no extra library â€” pure Python)
+# RATE LIMITER (no extra library -- pure Python)
 # 30 requests per user per 60 seconds.
 # Prevents a single user from burning RunPod credits.
 # ===========================
@@ -267,6 +267,10 @@ _rate_lock   = threading.Lock()
 _RATE_MAX    = int(os.getenv("RATE_LIMIT_MAX",    "30"))   # requests
 _RATE_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))   # seconds
 BASE_URL     = os.getenv("BASE_URL", "").rstrip("/")        # e.g. http://183.82.250.223:92
+
+# Per-user KMS source store — updated after every bot call, read on source inquiry
+_user_kms_sources: dict = {}
+_user_kms_sources_lock = threading.Lock()
 
 def _is_rate_limited(username: str) -> bool:
     with _rate_lock:
@@ -407,6 +411,228 @@ def get_greeting_response(user_role: str) -> str:
     """Get instant greeting response"""
     return ROLE_GREETINGS.get(user_role, ROLE_GREETINGS[UserRole.CLIENT])
 
+_SOURCE_INQUIRY_SIGNALS = {
+    "source", "where", "origin", "reference",
+    "come from", "comes from", "came from",
+}
+
+_SOURCE_INQUIRY_FALLBACK = [
+    "where did you get", "where did you find",
+    "where does this come from", "which source", "what source",
+    "where is this from", "where it comes from",
+    "what is the source", "source of this",
+]
+
+async def is_source_inquiry(text: str) -> bool:
+    """Two-stage source inquiry detection.
+    Stage 1: fast word/phrase pre-filter (microseconds) — skips LLM for obvious non-source questions.
+    Stage 1b: exact phrase match against fallback list — returns True immediately, no LLM needed.
+    Stage 2: LLM binary YES/NO for ambiguous cases that pass Stage 1 but miss Stage 1b.
+    """
+    t = text.lower().strip()
+    if not any(signal in t for signal in _SOURCE_INQUIRY_SIGNALS):
+        return False
+    # Exact phrase match — skip LLM entirely for known source inquiry phrases
+    if any(phrase in t for phrase in _SOURCE_INQUIRY_FALLBACK):
+        return True
+    try:
+        _prompt = (
+            "You are classifying a user question in an ERP chatbot conversation.\n"
+            "Does this question ask about WHERE the chatbot's PREVIOUS ANSWER came from — "
+            "its source document, knowledge base article, or reference?\n\n"
+            "Examples that are YES:\n"
+            "  - 'where it comes from'\n"
+            "  - 'where does this come from'\n"
+            "  - 'what is the source of this'\n"
+            "  - 'which document did you use'\n"
+            "  - 'where did you get this'\n"
+            "  - 'what is your source'\n"
+            "  - 'from where'\n\n"
+            "Examples that are NO:\n"
+            "  - 'what are the modules'\n"
+            "  - 'show leave balance'\n"
+            "  - 'where is the payroll module'\n"
+            "  - 'list all menus'\n\n"
+            "Reply YES or NO only.\n"
+            f"Question: {text}"
+        )
+        raw = await asyncio.to_thread(ai_resources.routing_llm.invoke, _prompt)
+        answer = (raw.content if hasattr(raw, "content") else str(raw)).strip().upper()
+        return answer.startswith("YES")
+    except Exception:
+        return False
+
+
+_RETRY_SIGNALS = {
+    "again", "retry", "wrong", "incorrect", "not right", "try",
+    "correct", "better", "another", "different", "misunderstood",
+    "not what", "not asking", "not about", "meant", "helpful",
+}
+_EXACT_RETRY_PHRASES = {"try again", "retry", "try once more", "please retry", "try that again", "again"}
+
+async def detect_retry_intent(text: str, has_thread: bool) -> bool:
+    """Two-stage retry intent detection — LLM-based, not keyword-based.
+    Stage 1: structural pre-filter (no thread = impossible retry; exact known phrases = fast path).
+    Stage 2: LLM YES/NO for all other cases (handles correction+retry, implicit retry, topic hints).
+    Falls back to exact phrase match if LLM fails.
+    """
+    if not has_thread:
+        return False
+    t = text.lower().strip()
+    # Fast path — exact known phrases skip LLM entirely
+    if t in _EXACT_RETRY_PHRASES:
+        return True
+    # Stage 1 pre-filter — must have at least one retry signal to warrant LLM call
+    if not any(signal in t for signal in _RETRY_SIGNALS):
+        return False
+    # Stage 2 — LLM intent classification
+    try:
+        _prompt = (
+            "A user just replied to an ERP chatbot response.\n"
+            "Does this message ask for a retry, correction, or better answer "
+            "for the PREVIOUS response?\n\n"
+            "Examples YES:\n"
+            "  - 'try again'\n"
+            "  - 'I am not asking leave balance, give the correct answer'\n"
+            "  - 'that is not what I asked, retry'\n"
+            "  - 'wrong answer, try again'\n"
+            "  - 'that is not helpful'\n"
+            "  - 'focus on Finance not HR'\n"
+            "  - 'you misunderstood, try again'\n"
+            "  - 'give me a better answer'\n\n"
+            "Examples NO:\n"
+            "  - 'what is the GST formula'\n"
+            "  - 'show payroll report'\n"
+            "  - 'list all modules'\n"
+            "  - 'what are the menus'\n\n"
+            "Reply YES or NO only.\n"
+            f"Message: {text}"
+        )
+        raw = await asyncio.to_thread(ai_resources.routing_llm.invoke, _prompt)
+        answer = (raw.content if hasattr(raw, "content") else str(raw)).strip().upper()
+        return answer.startswith("YES")
+    except Exception:
+        return t in _EXACT_RETRY_PHRASES
+
+
+async def is_session_exit(question: str) -> bool:
+    """Intent-based session exit detection.
+    Skips LLM for provably clear slot values (numbers, dates, simple confirmations).
+    Uses LLM binary YES/NO for everything else.
+    Falls back to False (keep session open) if LLM fails.
+    """
+    import re as _re
+    q = question.lower().strip()
+    # Pure slot values — never exit intent, skip LLM
+    if _re.match(r'^\d+$', q):
+        return False
+    if _re.search(r'\b\d{1,2}[/\-\.]\d{1,2}', q):
+        return False
+    if q.rstrip('.,!') in {'yes', 'no', 'y', 'n', 'ok', 'okay', 'sure', 'confirm'}:
+        return False
+    try:
+        _prompt = (
+            "A user is currently filling out a form in an ERP chatbot "
+            "(for example: applying for leave, submitting a time slip, or booking a day off).\n"
+            "Does the following message mean the user wants to EXIT or ABANDON "
+            "this form and return to normal chat?\n\n"
+            "Examples that are YES (user wants to exit):\n"
+            "  - 'quit'\n"
+            "  - 'never mind'\n"
+            "  - 'I changed my mind'\n"
+            "  - 'forget it'\n"
+            "  - 'I don't want to do this'\n"
+            "  - 'stop'\n"
+            "  - 'exit'\n"
+            "  - 'I want to do something else'\n\n"
+            "Examples that are NO (valid form input, continue the form):\n"
+            "  - 'sick leave'\n"
+            "  - 'full day'\n"
+            "  - 'January 15'\n"
+            "  - 'first half'\n"
+            "  - 'casual'\n"
+            "  - 'cancel leave'\n\n"
+            "Reply YES or NO only.\n"
+            f"Message: {question}"
+        )
+        raw = await asyncio.to_thread(ai_resources.routing_llm.invoke, _prompt)
+        answer = (raw.content if hasattr(raw, "content") else str(raw)).strip().upper()
+        return answer.startswith("YES")
+    except Exception:
+        return False
+
+
+# ── Inline feedback detection ─────────────────────────────────────────────────
+_FEEDBACK_SIGNALS = {
+    "wrong", "incorrect", "right", "correct", "helpful",
+    "bad answer", "not right", "good answer",
+}
+
+async def detect_feedback_intent(text: str) -> dict | None:
+    """
+    Two-stage feedback detector — same pattern as is_source_inquiry / is_session_exit.
+    Stage 1: fast pre-filter (short message + signal word).
+    Stage 2: LLM binary YES/NO with few-shot examples.
+    Returns a dict with keys: type, corrected_answer, reason — or None if not feedback.
+    """
+    t = text.lower().strip()
+
+    # Stage 1: must be short AND contain a feedback signal (or be an emoji)
+    if t not in {"👍", "👎"} and len(t.split()) > 8:
+        return None
+    if t not in {"👍", "👎"} and not any(s in t for s in _FEEDBACK_SIGNALS):
+        return None
+
+    try:
+        _prompt = (
+            "A user just sent a short message to an ERP chatbot AFTER receiving an answer.\n"
+            "Does this message express feedback about the PREVIOUS answer "
+            "(positive reaction, negative reaction, or a correction)?\n\n"
+            "Examples that are YES (feedback about previous answer):\n"
+            "  - '\U0001f44d'\n"
+            "  - '\U0001f44e'\n"
+            "  - 'wrong'\n"
+            "  - 'that is not right'\n"
+            "  - 'the correct answer is X'\n"
+            "  - 'it should be X'\n"
+            "  - 'helpful'\n\n"
+            "Examples that are NO (new ERP question, not feedback):\n"
+            "  - 'what is the correct formula'\n"
+            "  - 'is this the right module'\n"
+            "  - 'show the wrong entries'\n"
+            "  - 'good morning'\n"
+            "  - 'where is the right menu'\n\n"
+            "Reply YES or NO only.\n"
+            f"Message: {text}"
+        )
+        raw = await asyncio.to_thread(ai_resources.routing_llm.invoke, _prompt)
+        answer = (raw.content if hasattr(raw, "content") else str(raw)).strip().upper()
+        if not answer.startswith("YES"):
+            return None
+    except Exception:
+        # Fallback: only accept unambiguous single-token signals
+        if t.rstrip("!.,?") not in {"wrong", "incorrect", "helpful", "👍", "👎"}:
+            return None
+
+    # Classify the feedback type
+    _POSITIVE_EXACT = {"👍", "helpful", "correct", "right", "good answer", "good", "great", "perfect"}
+    _NEGATIVE_EXACT = {"👎", "wrong", "incorrect", "bad answer", "not right", "bad"}
+
+    if t.rstrip("!.,?") in _POSITIVE_EXACT:
+        return {"type": "positive", "corrected_answer": None, "reason": t}
+    if t.rstrip("!.,?") in _NEGATIVE_EXACT:
+        return {"type": "negative", "corrected_answer": None, "reason": t}
+
+    m = re.search(
+        r"(?:should be|correct(?:ly)? is|actually|it is|the answer is)[:\s]+(.+)",
+        t, re.IGNORECASE
+    )
+    if m:
+        return {"type": "correction", "corrected_answer": m.group(1).strip(), "reason": t}
+
+    return {"type": "negative", "corrected_answer": None, "reason": t}
+
+
 # ===========================
 # ROLE-BASED SYSTEM PROMPTS
 # ===========================
@@ -546,8 +772,8 @@ OUT_OF_SCOPE_SYSTEM_PROMPT = """You are a GoodBooks ERP assistant speaking to a 
 User question: {question}
 
 Instructions:
-- If the question is related to ERP, business processes, HR, payroll, accounting, inventory, finance, company management, software features, or GoodBooks modules â†’ answer it helpfully using your ERP knowledge. Do NOT redirect.
-- If the question is completely unrelated to ERP or business software (e.g. sports, entertainment, politics, personal advice) â†’ politely explain you are a GoodBooks ERP assistant and redirect them to relevant GoodBooks features.
+- If the question is related to ERP, business processes, HR, payroll, accounting, inventory, finance, company management, software features, or GoodBooks modules â†' answer it helpfully using your ERP knowledge. Do NOT redirect.
+- If the question is completely unrelated to ERP or business software (e.g. sports, entertainment, politics, personal advice) â†' politely explain you are a GoodBooks ERP assistant and redirect them to relevant GoodBooks features.
 
 Keep the response brief and appropriate for a {role}.
 
@@ -724,9 +950,9 @@ class ConversationHistoryManager:
     def create_new_thread(self, username: str, initial_message: str = None) -> str:
         thread_id = str(uuid.uuid4())
         thread = ConversationThread(thread_id, username)
-        # Title will be set by LLM after first response â€” keep as "New Conversation" for now
+        # Title will be set by LLM after first response -- keep as "New Conversation" for now
         self.threads[thread_id] = thread
-        # Skip DB write for warmup â€” don't pollute conversation_threads table
+        # Skip DB write for warmup -- don't pollute conversation_threads table
         if username != "__warmup__":
             self._upsert_thread(thread)
         logger.info(f"Created new thread {thread_id} for {username}")
@@ -862,7 +1088,7 @@ class EnhancedConversationalMemory:
                 logger.info("âœ… Created fresh FAISS memory vectorstore.")
         except Exception as e:
             logger.error(
-                f"CRITICAL: Failed to load conversation memory from PostgreSQL â€” "
+                f"CRITICAL: Failed to load conversation memory from PostgreSQL -- "
                 f"all prior user context is unavailable this session: {e}",
                 exc_info=True
             )
@@ -922,9 +1148,9 @@ class EnhancedConversationalMemory:
 
     def retrieve_contextual_memories(self, username: str, query: str, k: int = 3, thread_id: str = None, thread_isolation: bool = False) -> List[Dict]:
         try:
-            # Single FAISS search â€” fetches k*3 to allow deduplication and filtering
+            # Single FAISS search -- fetches k*3 to allow deduplication and filtering
             # Removed secondary/tertiary searches: same model, same index, same embeddings
-            # â†’ results were near-identical duplicates, just wasting 3x CPU per request
+            # â†' results were near-identical duplicates, just wasting 3x CPU per request
             all_docs = self.memory_vectorstore.similarity_search(query, k=k * 3)
 
             user_memories = {}
@@ -1128,7 +1354,7 @@ class SharedContextRegistry:
         relevant_contexts.sort(key=lambda x: x['relevance_score'], reverse=True)
         top_contexts = relevant_contexts[:max_contexts]
 
-        logger.info(f"ðŸ”— Found {len(top_contexts)} relevant cross-bot contexts for {username}:{current_bot_type}")
+        logger.info(f"ðŸ“— Found {len(top_contexts)} relevant cross-bot contexts for {username}:{current_bot_type}")
         return top_contexts
 
     def _calculate_context_relevance(self, context_data: Dict, query: str) -> float:
@@ -1216,7 +1442,7 @@ def _extract_clean_response(response: str) -> str:
         return response
     stripped = response.strip()
     if stripped.startswith("{'output':") or stripped.startswith('{"output":'):
-        # Try regex first â€” works even on truncated strings
+        # Try regex first -- works even on truncated strings
         match = re.search(r"""['"]output['"]\s*:\s*['"](.+)""", stripped, re.DOTALL)
         if match:
             raw = match.group(1)
@@ -1249,7 +1475,13 @@ class GeneralBotWrapper:
             login_header = json.dumps({"UserName": username, "Role": user_role})
             
             result = await general_bot.chat(message, Login=login_header)
-            
+
+            # Capture KMS sources as side effect before extracting response
+            _kms_srcs = result.get("kms_sources", []) if isinstance(result, dict) else []
+            if _kms_srcs and username:
+                with _user_kms_sources_lock:
+                    _user_kms_sources[username] = _kms_srcs
+
             response = None
             if isinstance(result, JSONResponse):
                 body = json.loads(result.body.decode())
@@ -1258,7 +1490,7 @@ class GeneralBotWrapper:
                 response = result.get("response")
             else:
                 response = str(result) if result else None
-            
+
             if response:
                 response_lower = response.lower()
                 # Only treat as refusal if the ENTIRE response is a refusal
@@ -1306,7 +1538,13 @@ class FormulaBot:
             login_header = json.dumps({"UserName": username, "Role": user_role})
             
             result = await formula_bot.chat(message, Login=login_header)
-            
+
+            # Capture KMS sources as side effect before extracting response
+            _kms_srcs = result.get("kms_sources", []) if isinstance(result, dict) else []
+            if _kms_srcs and username:
+                with _user_kms_sources_lock:
+                    _user_kms_sources[username] = _kms_srcs
+
             response = None
             if isinstance(result, JSONResponse):
                 body = json.loads(result.body.decode())
@@ -1315,7 +1553,7 @@ class FormulaBot:
                 response = result.get("response")
             else:
                 response = str(result) if result else None
-            
+
             if response:
                 response_lower = response.lower()
                 refusal_patterns = [
@@ -1353,7 +1591,13 @@ class ReportBot:
             login_header = json.dumps({"UserName": username, "Role": user_role})
             
             result = await report_bot.report_chat(message, Login=login_header)
-            
+
+            # Capture KMS sources as side effect before extracting response
+            _kms_srcs = result.get("kms_sources", []) if isinstance(result, dict) else []
+            if _kms_srcs and username:
+                with _user_kms_sources_lock:
+                    _user_kms_sources[username] = _kms_srcs
+
             response = None
             if isinstance(result, JSONResponse):
                 body = json.loads(result.body.decode())
@@ -1400,7 +1644,13 @@ class MenuBot:
             login_header = json.dumps({"UserName": username, "Role": user_role})
             
             result = await menu_bot.chat(message, Login=login_header)
-            
+
+            # Capture KMS sources as side effect before extracting response
+            _kms_srcs = result.get("kms_sources", []) if isinstance(result, dict) else []
+            if _kms_srcs and username:
+                with _user_kms_sources_lock:
+                    _user_kms_sources[username] = _kms_srcs
+
             response = None
             if isinstance(result, JSONResponse):
                 body = json.loads(result.body.decode())
@@ -1409,7 +1659,7 @@ class MenuBot:
                 response = result.get("response")
             else:
                 response = str(result) if result else None
-            
+
             if response:
                 response_lower = response.lower()
                 refusal_patterns = [
@@ -1447,7 +1697,13 @@ class ProjectBot:
             login_header = json.dumps({"UserName": username, "Role": user_role})
             
             result = await project_bot.project_chat(message, Login=login_header)
-            
+
+            # Capture KMS sources as side effect before extracting response
+            _kms_srcs = result.get("kms_sources", []) if isinstance(result, dict) else []
+            if _kms_srcs and username:
+                with _user_kms_sources_lock:
+                    _user_kms_sources[username] = _kms_srcs
+
             response = None
             if isinstance(result, JSONResponse):
                 body = json.loads(result.body.decode())
@@ -1456,7 +1712,7 @@ class ProjectBot:
                 response = result.get("response")
             else:
                 response = str(result) if result else None
-            
+
             if response:
                 response_lower = response.lower()
                 refusal_patterns = [
@@ -1494,6 +1750,12 @@ class SchemaBot:
             login_header = json.dumps({"UserName": username, "Role": user_role})
 
             result = await schema_bot.chat(message, Login=login_header)
+
+            # Capture KMS sources as side effect before extracting response
+            _kms_srcs = result.get("kms_sources", []) if isinstance(result, dict) else []
+            if _kms_srcs and username:
+                with _user_kms_sources_lock:
+                    _user_kms_sources[username] = _kms_srcs
 
             response = None
             if isinstance(result, JSONResponse):
@@ -1720,6 +1982,63 @@ Relevance Score: {memory.get('relevance_score', 'N/A')}
     
     return context, source_files
 
+# ── Source-matching helpers ────────────────────────────────────────────────────
+
+_SRC_STOPWORDS = {
+    "the", "a", "an", "is", "in", "of", "and", "to", "for", "this",
+    "that", "with", "you", "can", "are", "was", "be", "it", "as",
+    "from", "by", "or", "at", "on", "your", "have", "has", "been",
+}
+
+def _find_best_sources(answer: str, sources: list, top_n: int = 2) -> list:
+    """Score stored KMS sources by word overlap with the previous answer."""
+    if not answer.strip():
+        return []
+    answer_words = set(
+        w for w in re.findall(r'\b\w{4,}\b', answer.lower())
+        if w not in _SRC_STOPWORDS
+    )
+    if not answer_words:
+        return []
+    scored = []
+    for src in sources:
+        src_text = (src.get("title", "") + " " + src.get("source", "")).lower()
+        src_words = set(
+            w for w in re.findall(r'\b\w{4,}\b', src_text)
+            if w not in _SRC_STOPWORDS
+        )
+        overlap = len(answer_words & src_words)
+        if overlap > 0:
+            scored.append((overlap, src))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [src for _, src in scored[:top_n]]
+
+
+async def _llm_match_sources(answer: str, sources: list) -> list:
+    """LLM fallback: ask response_llm to name the best matching source title."""
+    if not answer.strip() or not sources:
+        return []
+    try:
+        title_list = "\n".join(f"- {s['title']}" for s in sources[:15])
+        _prompt = (
+            "An ERP chatbot generated this answer. "
+            "From the list below, reply with the EXACT title of the ONE document "
+            "most likely used to generate this answer. Reply with the title only — nothing else.\n\n"
+            f"Answer: {answer[:500]}\n\n"
+            f"Documents:\n{title_list}"
+        )
+        raw = await asyncio.to_thread(ai_resources.response_llm.invoke, _prompt)
+        matched_title = (raw.content if hasattr(raw, "content") else str(raw)).strip()
+        for src in sources:
+            if (src["title"].lower() in matched_title.lower()
+                    or matched_title.lower() in src["title"].lower()):
+                return [src]
+    except Exception as _e:
+        logger.warning(f"[SourceMatch] LLM fallback failed: {_e}")
+    return []
+
+# ── End source-matching helpers ────────────────────────────────────────────────
+
 # ===========================
 # ENHANCED AI ORCHESTRATION AGENT
 # ===========================
@@ -1776,7 +2095,7 @@ class AIOrchestrationAgent:
                 decision.confidence,
                 decision.source,
             )
-            if decision.should_clarify():
+            if hasattr(decision, 'should_clarify') and decision.should_clarify():
                 return {
                     "kind": "clarify",
                     "decision": decision,
@@ -1794,10 +2113,10 @@ class AIOrchestrationAgent:
     
     def _understand_query(self, question: str) -> Optional[str]:
         """
-        Pure Python query understanding layer â€” runs BEFORE keyword matching.
+        Pure Python query understanding layer -- runs BEFORE keyword matching.
         Understands user INTENT from natural language, not just exact keywords.
         Covers ~30% of questions that miss the keyword cache and fall to RunPod.
-        Zero LLM calls â€” pure pattern matching, < 1ms.
+        Zero LLM calls -- pure pattern matching, < 1ms.
         """
         q = question.lower().strip()
         words = set(re.findall(r'\b\w+\b', q))
@@ -1833,6 +2152,15 @@ class AIOrchestrationAgent:
         if any(p in q for p in _NAV_PATTERNS):
             return "menu"
 
+        # --- Module location intent (must come before calc — "in which module can we calculate X" is menu, not formula) ---
+        _MODULE_QUERY_PATTERNS = [
+            'in which module', 'which module', 'in what module', 'what module',
+            'which section', 'in which section', 'where can we', 'where do we',
+            'where is this done', 'where can i do', 'where to do',
+        ]
+        if any(p in q for p in _MODULE_QUERY_PATTERNS):
+            return "menu"
+
         # --- Calculation intent ---
         _CALC_PATTERNS = [
             'calculate', 'compute', 'what is the formula', 'how is it calculated',
@@ -1852,7 +2180,7 @@ class AIOrchestrationAgent:
             if not any(token in q for token in _EXPLICIT_NON_AGENTIC):
                 return None
 
-        # --- ERP entity words â€” strong signal that user wants DB data ---
+        # --- ERP entity words -- strong signal that user wants DB data ---
         _SCHEMA_ENTITIES = {
             'employee', 'employees', 'staff', 'worker', 'workers', 'personnel',
             'salary', 'salaries', 'payslip', 'payroll', 'payment', 'payments',
@@ -1918,7 +2246,7 @@ class AIOrchestrationAgent:
             'calculate', 'compute', 'formula', 'math', 'sum', 'average', 'total',
             'count', 'percentage', 'divide', 'multiply', 'subtract', 'add',
             'equation', 'expression', 'result of',
-            # NOTE: 'what is' and 'how much' removed â€” too broad; stolen general questions
+            # NOTE: 'what is' and 'how much' removed -- too broad; stolen general questions
             '+', '-', '*', '/', '=', '%', 'mean', 'median', 'gst', 'tax', 'discount',
             'net amount', 'gross', 'valuation', 'variance',
             'interest', 'deduction', 'allowance', 'commission', 'wage',
@@ -1948,14 +2276,14 @@ class AIOrchestrationAgent:
             if not any(word in question_lower for word in explicit_non_agentic):
                 return None
         
-        # Report bot keywords â€” only explicit report/chart/analysis requests
+        # Report bot keywords -- only explicit report/chart/analysis requests
         # Removed: 'listing', 'history of', 'show me data', 'display data',
-        #          'performance', 'stats' (too generic â€” stolen schema/general queries)
+        #          'performance', 'stats' (too generic -- stolen schema/general queries)
         report_keywords = [
             'report', 'analyze', 'analysis', 'chart', 'graph',
             'dashboard', 'visualize', 'kpi', 'trend', 'breakdown',
             'generate report', 'view report', 'show chart', 'create graph',
-            # NOTE: 'export' removed â€” conflicts with export engine keyword detection
+            # NOTE: 'export' removed -- conflicts with export engine keyword detection
             'ledger', 'balance sheet', 'p&l', 'profit', 'loss',
             'payroll report', 'attendance report', 'sales report',
             'inventory report', 'purchase report', 'financial report',
@@ -1982,11 +2310,11 @@ class AIOrchestrationAgent:
         if any(word in question_lower for word in menu_keywords):
             logger.info("ðŸš€ Fast route: menu")
             return "menu"
-        # Compound "menu*" column words (menuname, menupath, menuid, menutype, etc.) â†’ menu bot
+        # Compound "menu*" column words (menuname, menupath, menuid, menutype, etc.) â†' menu bot
         if any(w.startswith('menu') and len(w) > 4 for w in question_lower.split()):
             logger.info("ðŸš€ Fast route: menu (menu* column word)")
             return "menu"
-        # Compound "formula*" column words (formulaexpression, formulaname, formulaid, etc.) â†’ formula bot
+        # Compound "formula*" column words (formulaexpression, formulaname, formulaid, etc.) â†' formula bot
         if any(w.startswith('formula') and len(w) > 7 for w in question_lower.split()):
             logger.info("ðŸš€ Fast route: formula (formula* column word)")
             return "formula"
@@ -2013,8 +2341,8 @@ class AIOrchestrationAgent:
             logger.info("ðŸš€ Fast route: project")
             return "project"
 
-        # PostgreSQL table name detection â€” works for ALL table prefixes (M, PL, FW, HR, GLâ€¦)
-        # Uses the cached table list from db_query â€” no extra DB call.
+        # PostgreSQL table name detection -- works for ALL table prefixes (M, PL, FW, HR, GLâ€¦)
+        # Uses the cached table list from db_query -- no extra DB call.
         try:
             import db_query as _dq
             _detected = _dq._detect_table_from_question(question)
@@ -2033,13 +2361,13 @@ class AIOrchestrationAgent:
                     logger.info(f"ðŸš€ Fast route: project (table {tname})")
                     return "project"
                 else:
-                    # All other tables (any prefix) â†’ schema bot
+                    # All other tables (any prefix) â†' schema bot
                     logger.info(f"ðŸš€ Fast route: schema (table {tname})")
                     return "schema"
         except Exception:
             pass  # Fall through to keyword and AI routing
 
-        # Schema bot keywords â€” structural and data-fetch queries
+        # Schema bot keywords -- structural and data-fetch queries
         schema_keywords = [
             'column', 'columns', 'field', 'fields', 'table', 'tables',
             'schema', 'database schema', 'db schema', 'table structure',
@@ -2051,13 +2379,13 @@ class AIOrchestrationAgent:
             'picklist', 'pick list', 'dropdown', 'lookup', 'masterdata',
             'master data',
             # NOTE: 'give me', 'show me', 'find me', 'fetch me', 'what are', 'what is the'
-            # removed â€” too broad; stolen general/menu/report queries
+            # removed -- too broad; stolen general/menu/report queries
         ]
         if any(word in question_lower for word in schema_keywords):
             logger.info("ðŸš€ Fast route: schema")
             return "schema"
 
-        # General bot keywords â€” only when NOT a data/list query
+        # General bot keywords -- only when NOT a data/list query
         # 'what is'/'explain' removed from here; handled after schema check to avoid
         # stealing DB queries like "what is the status of purchase order 123"
         general_keywords = [
@@ -2161,12 +2489,12 @@ class AIOrchestrationAgent:
                     fallback = "general"
                 else:
                     fallback = "general"
-            logger.info(f"ðŸ” Timeout fallback route: {fallback}")
+            logger.info(f"ðŸ“ Timeout fallback route: {fallback}")
             return fallback
         except Exception as e:
             logger.error(f"âŒ Intent detection error: {e}", exc_info=True)
             fallback = self._get_cached_intent(question) or "general"
-            logger.info(f"ðŸ” Error fallback route: {fallback}")
+            logger.info(f"ðŸ“ Error fallback route: {fallback}")
             return fallback
     
     async def generate_out_of_scope_response(self, question: str, user_role: str) -> str:
@@ -2247,6 +2575,51 @@ Rewritten Answer:"""
             logger.error(f"âŒ Role perspective error: {e}")
             return answer
     
+    async def _handle_source_inquiry(self, username: str, question: str, thread_id: str, user_role: str) -> dict:
+        with _user_kms_sources_lock:
+            _stored_sources = list(_user_kms_sources.get(username, []))
+
+        if not _stored_sources:
+            _src_answer = (
+                "I don't have source information for the previous answer — "
+                "either this is the first question in this session, or the answer came from "
+                "a path that does not use the Knowledge Base directly."
+            )
+        else:
+            # Get previous answer from thread history
+            _prev_answer = ""
+            if thread_id:
+                _thread = history_manager.get_thread(thread_id)
+                if _thread and _thread.messages:
+                    _prev_answer = _thread.messages[-1].get("bot_response", "")
+
+            # Stage 1: Python word overlap — fast, no LLM
+            _matched = _find_best_sources(_prev_answer, _stored_sources, top_n=2)
+
+            # Stage 2: LLM fallback — only when Stage 1 finds nothing
+            if not _matched and _prev_answer:
+                _matched = await _llm_match_sources(_prev_answer, _stored_sources)
+
+            # Final fallback: top 3 by original Qdrant order
+            if not _matched:
+                _matched = _stored_sources[:3]
+
+            _src_lines = "\n".join("  - " + s["title"] for s in _matched)
+            _src_answer = (
+                "The previous answer was drawn from the following GoodBooks Knowledge Base documents:\n\n"
+                + _src_lines
+                + "\n\nThese were the most relevant results retrieved from the KMS for your question."
+            )
+
+        return {
+            "response": _src_answer,
+            "formatted": await asyncio.to_thread(formatter_agent.format, question, _src_answer),
+            "bot_type": "source_inquiry",
+            "thread_id": thread_id,
+            "user_role": user_role,
+            "download_url": None,
+        }
+
     async def process_request(self, username: str, user_role: str, question: str,
                             thread_id: str = None, is_existing_thread: bool = False,
                             login_dto: dict = None) -> Dict[str, str]:
@@ -2255,7 +2628,7 @@ Rewritten Answer:"""
         start_time = time.time()
         logger.info("="*80)
         logger.info(f"ðŸš€ NEW REQUEST from {username} (Role: {user_role})")
-        logger.info(f"ðŸ’¬ Question: {question}")
+        logger.info(f"ðŸ'¬ Question: {question}")
         logger.info("="*80)
 
         # IMPROVED: Only prompt for role when it's a NEW thread with no role set
@@ -2361,8 +2734,67 @@ For example: "Name: John, Role: developer" """
                 "user_role":    user_role,
                 "download_url": None
             }
-        
-        # â”€â”€ File Intelligence: answer from uploaded file first â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+        # -- Source Inquiry: answer where does this data come from? --
+        if await is_source_inquiry(question):
+            return await self._handle_source_inquiry(username, question, thread_id, user_role)
+        # -- End Source Inquiry --
+
+        # ── Inline Feedback Detection ─────────────────────────────────────────
+        # Check session state once here — reused by both feedback and agentic classifier below
+        _in_session = await asyncio.to_thread(agentic_classifier.is_in_session, username)
+
+        if not _in_session and thread_id:
+            _fb_thread = history_manager.get_thread(thread_id)
+            if _fb_thread and _fb_thread.messages:
+                _feedback = await detect_feedback_intent(question)
+                if _feedback:
+                    _last      = _fb_thread.messages[-1]
+                    _prev_q    = _last.get("user_message", "")
+                    _prev_a    = _last.get("bot_response", "")
+                    _prev_bot  = _last.get("bot_type", "general")
+                    _fb_type   = _feedback["type"]
+                    _corrected = _feedback["corrected_answer"] or (
+                        _prev_a if _fb_type == "positive" else ""
+                    )
+                    _rating = 5 if _fb_type == "positive" else (3 if _fb_type == "correction" else 1)
+
+                    if answer_learning_memory:
+                        try:
+                            await asyncio.to_thread(
+                                update_answer_learning_memory,
+                                username,
+                                _prev_q,
+                                _prev_a,
+                                _corrected,
+                                _fb_type,
+                                _rating,
+                                _feedback["reason"],
+                                _prev_bot,
+                                user_role,
+                                thread_id,
+                                {},
+                            )
+                            logger.info(f"[InlineFeedback] Stored '{_fb_type}' feedback for {username}")
+                        except Exception as _fbe:
+                            logger.warning(f"[InlineFeedback] Storage failed (non-blocking): {_fbe}")
+
+                    _ack = (
+                        "Thanks for the feedback! I'll use that to improve future answers."
+                        if _fb_type in ("positive", "correction")
+                        else "Got it — I'll keep that in mind for future responses."
+                    )
+                    return {
+                        "response":     _ack,
+                        "formatted":    await asyncio.to_thread(formatter_agent.format, question, _ack),
+                        "bot_type":     "feedback",
+                        "thread_id":    thread_id,
+                        "user_role":    user_role,
+                        "download_url": None,
+                    }
+        # ── End Inline Feedback ───────────────────────────────────────────────
+
+        # ── File Intelligence: answer from uploaded file first ────────────────
         if FILE_ENGINE_AVAILABLE and hasattr(file_engine, "is_processing") and file_engine.is_processing(username, thread_id):
             return {
                 "response": "Your uploaded file is still being processed. Please wait a moment and try again.",
@@ -2415,27 +2847,40 @@ For example: "Name: John, Role: developer" """
                     "user_role":    user_role,
                     "download_url": _edownload_url
                 }
-        # â”€â”€ End File Intelligence â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # â“€â“€ End File Intelligence â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€
 
-        # â”€â”€ Agentic Classifier: personal + action intents â†’ Chat Interface API â”€
-        _in_session = await asyncio.to_thread(agentic_classifier.is_in_session, username)
+        # â“€â“€ Agentic Classifier: personal + action intents â†' Chat Interface API â“€
+        # _in_session already computed above in feedback block
 
-        # Session escape: if user is mid-session but sends a general question,
-        # end the session and fall through to existing bots.
+        # Session escape: exit intent or general question ends the session.
         if _in_session:
+            # Intent-based exit check — runs before slot-filling routing
+            if await is_session_exit(question):
+                logger.info(f"[AgenticClassifier] Exit intent detected for {username} — ending session")
+                await asyncio.to_thread(agentic_classifier.end_session, username)
+                _exit_msg = "Got it — I've cancelled the current process. What else can I help you with?"
+                return {
+                    "response":  _exit_msg,
+                    "formatted": await asyncio.to_thread(formatter_agent.format, question, _exit_msg),
+                    "bot_type":  "general",
+                    "thread_id": thread_id,
+                    "user_role": user_role,
+                    "download_url": None
+                }
+
             _is_slot = await asyncio.to_thread(
                 agentic_classifier.is_slot_filling_response, question
             )
             if not _is_slot:
                 logger.info(
                     f"[AgenticClassifier] Non-slot question during session for {username} "
-                    f"â€” ending session, routing to existing bots"
+                    f"-- ending session, routing to existing bots"
                 )
                 await asyncio.to_thread(agentic_classifier.end_session, username)
                 _in_session = False
 
         if _in_session:
-            # Genuine slot-filling response â€” send directly to API
+            # Genuine slot-filling response -- send directly to API
             _agentic_response = await asyncio.to_thread(
                 agentic_classifier.call_chat_interface, question, username, login_dto
             )
@@ -2444,7 +2889,7 @@ For example: "Name: John, Role: developer" """
                     update_enhanced_memory,
                     username, question, _agentic_response, "session", user_role, thread_id
                 )
-                logger.info(f"[AgenticClassifier] Slot-filling session active â€” returning API response for {username}")
+                logger.info(f"[AgenticClassifier] Slot-filling session active -- returning API response for {username}")
                 return {
                     "response":  _agentic_response,
                     "formatted": await asyncio.to_thread(formatter_agent.format, question, _agentic_response),
@@ -2453,10 +2898,10 @@ For example: "Name: John, Role: developer" """
                     "user_role": user_role,
                     "download_url": None
                 }
-            # Session API failed â†’ fall through to existing bots
-            logger.warning(f"[AgenticClassifier] Session API failed for {username} â€” falling back to existing bots")
+            # Session API failed â†' fall through to existing bots
+            logger.warning(f"[AgenticClassifier] Session API failed for {username} -- falling back to existing bots")
         else:
-            # No active session â€” classify the intent fresh
+            # No active session -- classify the intent fresh
             _agentic_intent = await asyncio.to_thread(agentic_classifier.classify, question)
             if _agentic_intent in ("personal", "action"):
                 # For action intent: normalize the message to a direct API command
@@ -2470,7 +2915,7 @@ For example: "Name: John, Role: developer" """
                     agentic_classifier.call_chat_interface, _api_question, username, login_dto
                 )
                 if _agentic_response:
-                    # Personal queries are one-shot â€” end session immediately.
+                    # Personal queries are one-shot -- end session immediately.
                     if _agentic_intent == "personal":
                         await asyncio.to_thread(agentic_classifier.end_session, username)
                     await asyncio.to_thread(
@@ -2486,9 +2931,9 @@ For example: "Name: John, Role: developer" """
                         "user_role": user_role,
                         "download_url": None
                     }
-                # API failed â†’ log and fall through to existing bots
-                logger.warning(f"[AgenticClassifier] API unavailable for intent={_agentic_intent} â€” falling back to existing bots")
-        # â”€â”€ End Agentic Classifier â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                # API failed â†' log and fall through to existing bots
+                logger.warning(f"[AgenticClassifier] API unavailable for intent={_agentic_intent} -- falling back to existing bots")
+        # â“€â“€ End Agentic Classifier â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€
 
         logger.info("ðŸ“š Building conversational context...")
         if is_existing_thread and thread_id:
@@ -2496,19 +2941,41 @@ For example: "Name: John, Role: developer" """
         else:
             context = build_conversational_context(username, question, thread_id, thread_isolation=False)
 
-        # Detect "try again" / "retry" â€” re-use the previous question and intent
-        retry_phrases = {"try again", "retry", "try once more", "please retry", "try that again", "again"}
-        if question.lower().strip() in retry_phrases and thread_id:
+        # Detect retry / correction intent -- LLM-based, handles all phrasing
+        _is_retry = False
+        _original_retry_msg = question
+        if await detect_retry_intent(question, bool(thread_id)):
             thread = history_manager.get_thread(thread_id)
             if thread and thread.messages:
                 last_msg = thread.messages[-1]
                 prev_question = last_msg.get("user_message", question)
                 prev_bot = last_msg.get("bot_type", "general")
-                logger.info(f"ðŸ”„ Retry detected â€” replaying question: '{prev_question}' with bot: {prev_bot}")
+                logger.info("[RetryDetect] replaying: %s (original: %s)", prev_question[:60], _original_retry_msg[:60])
                 question = prev_question
+                _is_retry = True
                 context = build_conversational_context(username, question, thread_id, thread_isolation=True)
+                # Extract correction hint and inject into context
+                _hint_patterns = [
+                    r"not (?:asking|about|for)\s+[\w\s]+",
+                    r"(?:wrong|incorrect)\s+[\w\s]+",
+                    r"i (?:meant|mean)\s+[\w\s]+",
+                    r"not what i (?:asked|wanted|meant)",
+                ]
+                _correction_hint = ""
+                for _pat in _hint_patterns:
+                    _m = re.search(_pat, _original_retry_msg.lower())
+                    if _m:
+                        _correction_hint = _m.group(0).strip()
+                        break
+                if _correction_hint:
+                    context = "[User correction on previous answer: " + _correction_hint + "]\n\n" + context
+                    logger.info("[RetryCorrection] hint injected: %s", _correction_hint)
 
-        # â”€â”€ Base Answer Quality (every question) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # If retry revealed the replayed question is a source inquiry, intercept before bot routing
+        if _is_retry and await is_source_inquiry(question):
+            return await self._handle_source_inquiry(username, question, thread_id, user_role)
+
+        # â“€â“€ Base Answer Quality (every question) â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€
         # Lightweight instruction appended to context for ALL questions.
         # Reinforces bot prompts to ensure complete, precise first-time answers.
         _base_quality = (
@@ -2520,11 +2987,11 @@ For example: "Name: John, Role: developer" """
             "=== END QUALITY STANDARD ==="
         )
         context = (context + _base_quality) if context else _base_quality
-        # â”€â”€ End Base Answer Quality â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # â“€â“€ End Base Answer Quality â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€
 
-        # â”€â”€ Deep Analysis Detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # â“€â“€ Deep Analysis Detection â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€
         # Triggers when user is dissatisfied OR repeats the same question.
-        # Only modifies the context string â€” no bot logic or routing is changed.
+        # Only modifies the context string -- no bot logic or routing is changed.
         deep_analysis_needed = False
 
         # Signal 1: User explicitly expresses dissatisfaction or asks for more
@@ -2538,7 +3005,7 @@ For example: "Name: John, Role: developer" """
         ]
         if any(phrase in question.lower() for phrase in dissatisfaction_phrases):
             deep_analysis_needed = True
-            logger.info("ðŸ” Deep analysis triggered: dissatisfaction signal detected")
+            logger.info("ðŸ“ Deep analysis triggered: dissatisfaction signal detected")
 
         # Signal 2: Current question has â‰¥70% word overlap with the last question
         # (same question asked again, possibly rephrased)
@@ -2556,7 +3023,7 @@ For example: "Name: John, Role: developer" """
                         _overlap = len(_curr_words & _prev_words) / max(len(_curr_words), len(_prev_words))
                         if _overlap >= 0.7:
                             deep_analysis_needed = True
-                            logger.info(f"ðŸ” Deep analysis triggered: question similarity {_overlap:.0%}")
+                            logger.info(f"ðŸ“ Deep analysis triggered: question similarity {_overlap:.0%}")
 
         if deep_analysis_needed:
             _depth_note = (
@@ -2571,9 +3038,9 @@ For example: "Name: John, Role: developer" """
             )
             context = (context + _depth_note) if context else _depth_note
             logger.info("ðŸ“£ Deep analysis instruction appended to context")
-        # â”€â”€ End Deep Analysis Detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # â“€â“€ End Deep Analysis Detection â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€
 
-        # â”€â”€ Follow-up detection: short question referencing previous turn â”€â”€â”€â”€â”€â”€
+        # â“€â“€ Follow-up detection: short question referencing previous turn â“€â“€â“€â“€â“€â“€
         # Reuse last bot_type so "tell me more" / "show more" stay in the same bot
         # instead of falling through to AI routing (saves 5-15s per follow-up)
         _FOLLOWUP_PHRASES = {
@@ -2583,9 +3050,12 @@ For example: "Name: John, Role: developer" """
             "those", "that one", "the first", "first one", "second one",
             "last one", "which of", "which has", "which have", "of those",
             "of them", "from those", "among those", "above", "listed",
-            # user wants more info on the same item
-            "also", "as well", "additionally", "and also", "too",
+            # explicit back-references to previous result
             "the above", "that record", "that item", "that entry",
+            # NOTE: "also", "too", "as well", "additionally", "and also" removed —
+            # these are additive conjunctions that appear in new-topic questions and
+            # caused the wrong bot to be reused (e.g. "also explain Finance module"
+            # was treated as a follow-up to whatever bot ran last).
         }
         _q_lower = question.lower().strip()
         _is_followup = (
@@ -2599,7 +3069,7 @@ For example: "Name: John, Role: developer" """
                 _last_bot = _thread.messages[-1].get("bot_type", "")
                 _skip_types = {"greeting", "role_setup", "role_prompt", "out_of_scope", "general_fallback", "error", ""}
                 if _last_bot not in _skip_types:
-                    logger.info(f"ðŸ”„ Follow-up detected â†’ reusing last bot: {_last_bot}")
+                    logger.info(f"ðŸ“„ Follow-up detected â†' reusing last bot: {_last_bot}")
                     intent = _last_bot
                     selected_bot = self.bots.get(intent, self.bots["general"])
                     answer = None
@@ -2611,7 +3081,7 @@ For example: "Name: John, Role: developer" """
                             timeout=120.0
                         )
                     except (asyncio.TimeoutError, Exception) as _fe:
-                        logger.warning(f"Follow-up bot failed: {_fe} â€” falling through to normal routing")
+                        logger.warning(f"Follow-up bot failed: {_fe} -- falling through to normal routing")
                         answer = None
                     if answer and len(answer.strip()) >= 10:
                         answer = _extract_clean_response(answer)
@@ -2628,7 +3098,7 @@ For example: "Name: John, Role: developer" """
                             "user_role":    user_role,
                             "download_url": None
                         }
-        # â”€â”€ End follow-up detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # â“€â“€ End follow-up detection â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€
 
         semantic_route = await self._resolve_semantic_route(question, username, user_role, thread_id)
         intent = None
@@ -2652,7 +3122,7 @@ For example: "Name: John, Role: developer" """
             intent = await self.detect_intent_with_ai(question, context)
         logger.info(f"ðŸŽ¯ INTENT SELECTED: {intent}")
 
-        # ðŸ”— ENHANCED: Add cross-bot context sharing
+        # ðŸ“— ENHANCED: Add cross-bot context sharing
         cross_bot_contexts = shared_context_registry.get_relevant_contexts(username, intent, question)
         if cross_bot_contexts:
             context_parts = [context] if context else []
@@ -2673,12 +3143,17 @@ For example: "Name: John, Role: developer" """
                 context_parts.append("")
 
             context = "\n".join(context_parts)
-            logger.info(f"ðŸ”— Added {len(cross_bot_contexts)} cross-bot contexts")
+            logger.info(f"ðŸ“— Added {len(cross_bot_contexts)} cross-bot contexts")
         
         selected_bot = self.bots.get(intent, self.bots["general"])
         answer = None
         bot_type = intent
-        
+
+        # Fix 3: How-to format enforcement for procedural queries
+        _HOW_TO_PATTERNS = ('how to ', 'steps to ', 'how do i ', 'how can i ', 'step by step')
+        if any(p in question.lower() for p in _HOW_TO_PATTERNS):
+            context += "\n\n=== ANSWERING RULE ===\nThis question asks HOW TO do something. You MUST respond with numbered navigation steps. Do NOT give a general module description.\n=== END RULE ==="
+
         logger.info(f"ðŸ¤– Executing {intent} bot...")
         try:
             answer = await asyncio.wait_for(
@@ -2692,12 +3167,30 @@ For example: "Name: John, Role: developer" """
         except Exception as e:
             logger.error(f"âŒ Bot {intent} execution error: {e}", exc_info=True)
             answer = None
-        
+
+        # Fix 4: Answer validation — retry with focus hint if topic overlap is too low
+        if answer and len(answer.strip()) > 50:
+            _query_terms = set(re.findall(r'\b\w{4,}\b', question.lower()))
+            _resp_terms  = set(re.findall(r'\b\w{4,}\b', answer.lower()))
+            _overlap     = len(_query_terms & _resp_terms) / max(len(_query_terms), 1)
+            if _overlap < 0.2:
+                logger.info(f"[AnswerValidation] Low overlap ({_overlap:.2f}) for {intent} — retrying with focus hint")
+                _corrected_ctx = f"[NOTE: Your answer MUST focus ONLY on: {question}]\n\n" + context
+                try:
+                    _retry = await asyncio.wait_for(
+                        selected_bot.answer(question, _corrected_ctx, user_role, username),
+                        timeout=120.0
+                    )
+                    if _retry and len(_retry.strip()) >= 10:
+                        answer = _retry
+                except Exception as _ve:
+                    logger.warning(f"[AnswerValidation] Retry failed: {_ve}")
+
         if not answer or len(answer.strip()) < 10:
             logger.warning(f"âš ï¸ Primary bot '{intent}' returned insufficient answer (len={len(answer) if answer else 0})")
             
             if intent != "general":
-                logger.info("ðŸ”„ Attempting fallback to general bot...")
+                logger.info("ðŸ“„ Attempting fallback to general bot...")
                 try:
                     answer = await asyncio.wait_for(
                         self.bots["general"].answer(question, context, user_role, username),
@@ -2727,12 +3220,12 @@ For example: "Name: John, Role: developer" """
         # Clean up LLM response if wrapped in {'output': '...'} format
         answer = _extract_clean_response(answer)
 
-        # Format response â€” converts DB record blocks / numbered lists to clean markdown
+        # Format response -- converts DB record blocks / numbered lists to clean markdown
         # Zero latency: pure Python, no LLM call
         answer = _fmt_response(question, answer)
         _formatted = await asyncio.to_thread(formatter_agent.format, question, answer)
 
-        # â”€â”€ Export check: user asked for a downloadable file â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # â“€â“€ Export check: user asked for a downloadable file â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€
         _download_url = None
         if EXPORT_ENGINE_AVAILABLE:
             _export_fmt = export_engine.detect_export_format(question)
@@ -2746,10 +3239,10 @@ For example: "Name: John, Role: developer" """
                 if _export_id:
                     _download_url = f"{BASE_URL}/gbaiapi/download/{_export_id}"
                     answer += f"\n\nðŸ“¥ Download {_export_fmt.upper()}: {_download_url}"
-                    logger.info(f"[ExportEngine] Built {_export_fmt} export â†’ {_export_id}")
-        # â”€â”€ End export check â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                    logger.info(f"[ExportEngine] Built {_export_fmt} export â†' {_export_id}")
+        # â“€â“€ End export check â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€
 
-        logger.info("ðŸ’¾ Storing conversation...")
+        logger.info("ðŸ'¾ Storing conversation...")
         await asyncio.to_thread(
             update_enhanced_memory,
             username, question, answer, bot_type, user_role, thread_id
@@ -2766,7 +3259,7 @@ For example: "Name: John, Role: developer" """
         logger.info(f"âœ… REQUEST COMPLETED in {elapsed:.2f}s")
         logger.info(f"ðŸ¤– Bot Type: {bot_type}")
         logger.info(f"ðŸ“ Response Length: {len(answer)} chars")
-        logger.info(f"ðŸ‘¤ User Role: {user_role}")
+        logger.info(f"ðŸ'¤ User Role: {user_role}")
         logger.info("="*80)
 
         return {
@@ -2811,7 +3304,7 @@ def parse_name_and_role(message: str) -> tuple[str, str]:
     # Valid roles for validation
     valid_roles = ["developer", "implementation", "marketing", "client", "admin", "system admin", "manager", "sales"]
 
-    # Strategy 0: Single word exact role match â€” user typed just "developer", "admin" etc.
+    # Strategy 0: Single word exact role match -- user typed just "developer", "admin" etc.
     if message_lower in valid_roles:
         return None, message_lower
 
@@ -2879,13 +3372,13 @@ def parse_name_and_role(message: str) -> tuple[str, str]:
         if role not in valid_roles:
             role = None  # Invalid role
     
-    logger.info(f"ðŸ” Parsed message: '{message}'")
-    logger.info(f"   â†’ Name: {name}, Role: {role}")
+    logger.info(f"ðŸ“ Parsed message: '{message}'")
+    logger.info(f"   â†' Name: {name}, Role: {role}")
     
     return name, role
 
 def update_user_session(username: str, name: str = None, current_role: str = None):
-    """Update user session in PostgreSQL â€” non-blocking."""
+    """Update user session in PostgreSQL -- non-blocking."""
     try:
         current_time = datetime.now().isoformat()
         conn = get_pg_conn()
@@ -2946,7 +3439,7 @@ def update_enhanced_memory(username: str, question: str, answer: str, bot_type: 
             history_manager.add_message_to_thread(thread_id, question, answer, bot_type)
 
         enhanced_memory.store_conversation_turn(username, question, answer, bot_type, user_role, thread_id)
-        logger.info("ðŸ’¾ Memory stored successfully")
+        logger.info("ðŸ'¾ Memory stored successfully")
     except Exception as e:
         logger.error(f"Error storing memory: {e}")
 
@@ -3037,7 +3530,7 @@ app.include_router(voice_agent.router)
 @app.on_event("startup")
 async def init_db_tables():
     """Create PostgreSQL tables and load knowledge base on startup."""
-    logger.info("ðŸš€ Starting up â€” initialising PostgreSQL schema...")
+    logger.info("ðŸš€ Starting up -- initialising PostgreSQL schema...")
     create_tables()
     logger.info("ðŸ“š Loading knowledge base (DuckDB + FAISS)...")
     await asyncio.to_thread(knowledge_loader.load_all, ai_resources.embeddings)
@@ -3083,11 +3576,11 @@ async def ai_role_based_chat(message: Message, Login: str = Header(...)):
         return JSONResponse(status_code=429, content={"response": "Too many requests. Please wait a moment before sending another message."})
 
     try:
-        # Create new thread first â€” thread_id is unique per conversation/device
+        # Create new thread first -- thread_id is unique per conversation/device
         thread_id = await asyncio.to_thread(history_manager.create_new_thread, username, user_input)
         logger.info(f"ðŸ“ Created new thread: {thread_id}")
 
-        # Use thread_id as session key â€” isolates sessions per device/conversation
+        # Use thread_id as session key -- isolates sessions per device/conversation
         session_info = user_sessions.get(thread_id, {})
         is_registered = session_info.get("registered", False)
         
@@ -3097,7 +3590,7 @@ async def ai_role_based_chat(message: Message, Login: str = Header(...)):
         parsed_name, parsed_role = parse_name_and_role(user_input)
         
         if parsed_role:
-            # Username comes from login_dto â€” no need to ask for name
+            # Username comes from login_dto -- no need to ask for name
             user_role = parsed_role
 
             # âœ… FIX: Save role info to thread IMMEDIATELY
@@ -3136,7 +3629,7 @@ async def ai_role_based_chat(message: Message, Login: str = Header(...)):
 
         # âœ… FIX: Check if user is already registered
         if not is_registered or user_role == "unknown":
-            # Ask only for role â€” username already known from login_dto
+            # Ask only for role -- username already known from login_dto
             prompt = f"Hello {username}! I'm your GoodBooks ERP assistant.\n\nWhich role best describes you?\n\n**developer** | **implementation** | **marketing** | **client** | **admin** | **system admin** | **manager** | **sales**\n\nJust reply with your role to get started."
             
             # Store role request in thread
@@ -3197,10 +3690,14 @@ async def ai_role_based_chat(message: Message, Login: str = Header(...)):
         
         # Process request
         result = await ai_orchestrator.process_request(username, user_role, user_input, thread_id, is_existing_thread=False, login_dto=login_dto)
-        
-        # Add actual source files used
-        formatted_sources = source_tracker.format_sources_for_response(source_files)
-        result["sources_used"] = formatted_sources
+
+        # Build sources_used: prefer KMS sources captured during bot call; fall back to source_tracker
+        with _user_kms_sources_lock:
+            _kms_srcs = list(_user_kms_sources.get(username, []))
+        if _kms_srcs:
+            result["sources_used"] = {"sources_count": len(_kms_srcs), "sources": [s["title"] for s in _kms_srcs]}
+        else:
+            result["sources_used"] = source_tracker.format_sources_for_response(source_files)
         result["thread_id"] = thread_id
         
         logger.info(f"âœ… Response sent using sources: {source_files}")
@@ -3242,7 +3739,7 @@ async def ai_thread_chat(request: ThreadRequest, Login: str = Header(...)):
         logger.warning(f"[RateLimit] {username} exceeded {_RATE_MAX} req/{_RATE_WINDOW}s")
         return JSONResponse(status_code=429, content={"response": "Too many requests. Please wait a moment before sending another message."})
 
-    # Use thread_id as session key â€” isolates sessions per device/conversation
+    # Use thread_id as session key -- isolates sessions per device/conversation
     session_info = user_sessions.get(thread_id, {})
 
     # Verify thread exists and belongs to user
@@ -3261,7 +3758,7 @@ async def ai_thread_chat(request: ThreadRequest, Login: str = Header(...)):
         parsed_name, parsed_role = parse_name_and_role(user_input)
         
         if parsed_role:
-            # Username comes from login_dto â€” no need to ask for name
+            # Username comes from login_dto -- no need to ask for name
             user_role = parsed_role
 
             # âœ… FIX: Save to thread
@@ -3331,11 +3828,15 @@ async def ai_thread_chat(request: ThreadRequest, Login: str = Header(...)):
             username, user_role, user_input, thread_id, is_existing_thread=True, login_dto=login_dto
         )
         
-        # Add actual source files used
-        formatted_sources = source_tracker.format_sources_for_response(source_files)
-        result["sources_used"] = formatted_sources
+        # Build sources_used: prefer KMS sources captured during bot call; fall back to source_tracker
+        with _user_kms_sources_lock:
+            _kms_srcs = list(_user_kms_sources.get(username, []))
+        if _kms_srcs:
+            result["sources_used"] = {"sources_count": len(_kms_srcs), "sources": [s["title"] for s in _kms_srcs]}
+        else:
+            result["sources_used"] = source_tracker.format_sources_for_response(source_files)
         result["thread_id"] = thread_id
-        
+
         logger.info(f"âœ… Response sent using sources: {source_files}")
         logger.info(f"âœ… Thread response sent to {username} ({user_role})")
         return result
@@ -3492,12 +3993,12 @@ async def system_status():
             "âš¡ INSTANT greeting responses (<1s)",
             "ðŸš€ Enhanced keyword-based fast routing with math detection",
             "ðŸŽ¯ Improved AI intent detection with 10s timeout",
-            "ðŸ”„ Comprehensive fallback chain (Primary â†’ General â†’ Out-of-scope)",
+            "ðŸ“„ Comprehensive fallback chain (Primary â†' General â†' Out-of-scope)",
             "ðŸŽ­ Smart role adaptation (skips only when appropriate)",
             "â±ï¸ Increased timeouts for all LLM operations",
             "ðŸ“ Enhanced logging throughout entire pipeline",
-            "ðŸ” Intelligent fallback based on question structure",
-            "ðŸ’¾ Background memory storage (non-blocking)",
+            "ðŸ“ Intelligent fallback based on question structure",
+            "ðŸ'¾ Background memory storage (non-blocking)",
             "ðŸ§  Context-aware routing decisions"
         ],
         "performance": {
@@ -3632,7 +4133,7 @@ async def get_performance_stats():
             "semantic_layer": "Additive semantic routing with fallback",
             "secondary": "AI-based intent detection",
             "fallback": "Question structure analysis",
-            "bot_chain": "Primary bot â†’ General bot â†’ Out-of-scope"
+            "bot_chain": "Primary bot â†' General bot â†' Out-of-scope"
         }
     }
 
@@ -4093,7 +4594,7 @@ async def upload_file(
     thread_id: str = Form(None),
 ):
     """
-    Upload a file (PDF, CSV, Excel, JSON, TXT â€” max 10 MB).
+    Upload a file (PDF, CSV, Excel, JSON, TXT -- max 10 MB).
     The system builds a per-user FAISS index so you can ask questions about it.
     """
     try:
@@ -4256,9 +4757,9 @@ async def startup_event():
 
     try:
         # --------------------------------------------------
-        # ðŸ”¥ INITIALIZE HEAVY COMPONENTS FIRST
+        # ðŸ“¥ INITIALIZE HEAVY COMPONENTS FIRST
         # --------------------------------------------------
-        # Reuse the already-loaded embeddings from ai_resources singleton â€” avoids loading
+        # Reuse the already-loaded embeddings from ai_resources singleton -- avoids loading
         # the same 500MB model twice and prevents OOM crashes on low-memory containers.
         logger.info("ðŸ“¦ Reusing shared embeddings from ai_resources...")
         embeddings = ai_resources.embeddings
@@ -4267,7 +4768,7 @@ async def startup_event():
             file_engine.set_embeddings(embeddings)
             logger.info("âœ… File engine embeddings configured")
 
-        logger.info("ðŸ’¾ Loading conversation memory from PostgreSQL...")
+        logger.info("ðŸ'¾ Loading conversation memory from PostgreSQL...")
         enhanced_memory = EnhancedConversationalMemory(
             vectorstore_path="memory_store",
             metadata_file="memory_meta.json",
@@ -4291,9 +4792,9 @@ async def startup_event():
         logger.info("âœ… Orchestrator ready")
 
         # --------------------------------------------------
-        # ðŸ”¥ WARM RUNPOD MODELS (optional â€” non-fatal)
-        # Main endpoint (routing + response): wait for it â€” fast (~10s), needed immediately.
-        # SQL endpoint: fire in background â€” slow model, must not block startup.
+        # ðŸ“¥ WARM RUNPOD MODELS (optional -- non-fatal)
+        # Main endpoint (routing + response): wait for it -- fast (~10s), needed immediately.
+        # SQL endpoint: fire in background -- slow model, must not block startup.
         # --------------------------------------------------
         async def _warm(coro, name):
             try:
@@ -4302,23 +4803,23 @@ async def startup_event():
             except Exception as e:
                 logger.warning(f"âš ï¸ {name} warm-up failed (non-fatal): {e}")
 
-        # Wait for main endpoint (routing + response) â€” completes in ~10s
-        logger.info("ðŸ”¥ Warming main RunPod endpoint (routing + response)...")
+        # Wait for main endpoint (routing + response) -- completes in ~10s
+        logger.info("ðŸ“¥ Warming main RunPod endpoint (routing + response)...")
         await asyncio.gather(
             _warm(asyncio.to_thread(ai_resources.routing_llm.invoke, "ping"), "routing_llm"),
             _warm(asyncio.to_thread(ai_resources.response_llm.invoke, "ping"), "response_llm"),
         )
-        logger.info("ðŸ”¥ Main endpoint warm-up complete")
+        logger.info("ðŸ“¥ Main endpoint warm-up complete")
 
-        # Fire sql_llm warmup in background â€” heavy model, don't block startup
+        # Fire sql_llm warmup in background -- heavy model, don't block startup
         # Must use call_sql_endpoint (correct payload format: query + schema)
         from shared_resources import call_sql_endpoint
         asyncio.create_task(
             _warm(asyncio.to_thread(call_sql_endpoint, "list all records", "test(id)"), "sql_llm")
         )
-        logger.info("ðŸ”¥ SQL endpoint warming in background (non-blocking)")
+        logger.info("ðŸ“¥ SQL endpoint warming in background (non-blocking)")
 
-        # Build Schema RAG index in background â€” non-blocking, safe to fail
+        # Build Schema RAG index in background -- non-blocking, safe to fail
         from schema_rag import build_or_load_index
         asyncio.create_task(asyncio.to_thread(build_or_load_index))
         logger.info("ðŸ“ Schema RAG index building in background (non-blocking)")
@@ -4356,11 +4857,11 @@ async def startup_event():
                     bot.answer("hello", "", "client", "__warmup__"),
                     timeout=30
                 )
-                logger.info(f"ðŸ”¥ {name} bot warmed")
+                logger.info(f"ðŸ“¥ {name} bot warmed")
             except Exception:
                 logger.warning(f"âš ï¸ {name} bot warm skipped")
 
-        # ðŸ”¥ Warm general bot only â€” other bots have no dedicated model to warm.
+        # ðŸ“¥ Warm general bot only -- other bots have no dedicated model to warm.
         # formula/report/menu/project/schema all use the same shared RunPod endpoint
         # which is already warmed above. Calling them here only wastes SQL calls.
         await warm_bot(GeneralBotWrapper(), "general")
@@ -4399,14 +4900,14 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     logger.info("="*80)
-    logger.info("ðŸ›‘ Shutting down gracefully...")
+    logger.info("ðŸ›' Shutting down gracefully...")
     logger.info("="*80)
     try:
         await asyncio.to_thread(history_manager.save_threads)
         logger.info("âœ… All thread data saved to Firestore")
         
         if enhanced_memory and enhanced_memory.memory_vectorstore:
-            logger.info("ðŸ’¾ Saving memory vectorstore...")
+            logger.info("ðŸ'¾ Saving memory vectorstore...")
             await asyncio.to_thread(enhanced_memory.memory_vectorstore.save_local, MEMORY_VECTORSTORE_PATH)
             logger.info("âœ… Memory vectorstore saved")
         else:
@@ -4416,7 +4917,7 @@ async def shutdown_event():
         logger.error(f"âŒ Shutdown save error: {e}")
     
     logger.info("="*80)
-    logger.info("ðŸ‘‹ Shutdown complete")
+    logger.info("ðŸ'‹ Shutdown complete")
     logger.info("="*80)
 
 # ===========================
