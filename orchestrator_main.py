@@ -2852,7 +2852,8 @@ For example: "Name: John, Role: developer" """
         # â“€â“€ Agentic Classifier: personal + action intents â†' Chat Interface API â“€
         # _in_session already computed above in feedback block
 
-        # Session escape: exit intent or general question ends the session.
+        # Session escape: only an explicit exit intent or task completion ends the
+        # session -- any other message while in-session is forwarded to the API.
         if _in_session:
             # Intent-based exit check — runs before slot-filling routing
             if await is_session_exit(question):
@@ -2868,18 +2869,6 @@ For example: "Name: John, Role: developer" """
                     "download_url": None
                 }
 
-            _is_slot = await asyncio.to_thread(
-                agentic_classifier.is_slot_filling_response, question
-            )
-            if not _is_slot:
-                logger.info(
-                    f"[AgenticClassifier] Non-slot question during session for {username} "
-                    f"-- ending session, routing to existing bots"
-                )
-                await asyncio.to_thread(agentic_classifier.end_session, username)
-                _in_session = False
-
-        if _in_session:
             # Genuine slot-filling response -- send directly to API
             _agentic_response = await asyncio.to_thread(
                 agentic_classifier.call_chat_interface, question, username, login_dto

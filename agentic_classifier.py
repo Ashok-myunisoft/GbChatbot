@@ -60,25 +60,6 @@ _GREETING_WORDS = {
     "good evening", "howdy", "greetings", "sup", "what's up",
 }
 
-# ── Slot-filling response detection ──────────────────────────────────────────
-_SLOT_FILLING_KEYWORDS = {
-    "leave", "permission", "half day", "full day", "first half", "second half",
-    "sick", "casual", "earned", "loss of pay", "comp off", "maternity",
-    "absent", "personal", "emergency", "health", "medical", "work from",
-    "time slip", "pack", "overtime", "from date", "to date",
-}
-
-_MONTH_PATTERN = r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\b"
-
-_QUESTION_STARTERS = (
-    "what is", "what are", "what was", "what were",
-    "how do", "how does", "how can", "how to", "how many", "how much",
-    "why is", "why does", "why can",
-    "can you explain", "could you explain", "explain",
-    "tell me about", "tell me how", "describe",
-    "what exactly", "who is", "where is", "can you tell",
-)
-
 # ── Action message normalization ──────────────────────────────────────────────
 _ACTION_TO_API_COMMAND = [
     (r"\b(apply|request|submit|book|take)\s+(for\s+|a\s+)?leave\b",  "apply leave"),
@@ -99,44 +80,6 @@ def is_greeting(question: str) -> bool:
     """Return True if the entire message is a greeting — should never hit the API."""
     q = question.lower().strip().rstrip("!.,?")
     return q in _GREETING_WORDS
-
-
-def is_slot_filling_response(question: str) -> bool:
-    """
-    Return True  → message is a valid slot-filling response (keep session open).
-    Return False → message is a general question (end session, route to existing bots).
-    Conservative: only returns False when the message is clearly not slot-filling.
-    """
-    q = question.lower().strip()
-
-    # Pure number → leave type / day type selection
-    if re.match(r'^\d+$', q):
-        return True
-
-    # Date pattern → from/to date input
-    if re.search(r'\b\d{1,2}[/\-\.]\d{1,2}([/\-\.]\d{2,4})?\b', q):
-        return True
-
-    # Month name → date input
-    # Use a non-capturing group so "may" does not get matched inside unrelated words.
-    if re.search(_MONTH_PATTERN, q):
-        return True
-
-    # Short control words
-    if q.rstrip('.,!') in {'yes', 'no', 'ok', 'okay', 'y', 'n', 'sure',
-                            'cancel', 'stop', 'quit', 'exit', 'done', 'confirm'}:
-        return True
-
-    # Contains a slot-filling keyword
-    if any(kw in q for kw in _SLOT_FILLING_KEYWORDS):
-        return True
-
-    # Question-style message → clearly not a slot-filling response
-    if any(q.startswith(s) for s in _QUESTION_STARTERS):
-        return False
-
-    # Default: conservative — don't break session unless clearly non-slot
-    return True
 
 
 def normalize_action_message(question: str) -> str:
