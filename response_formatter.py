@@ -66,6 +66,21 @@ def _clean(text: str) -> str:
     return text
 
 
+def _dedup_list_lines(text: str) -> str:
+    """Remove duplicate bullet/numbered lines — same text repeated by LLM when KMS has multiple matching chunks."""
+    seen = set()
+    out = []
+    for line in text.split('\n'):
+        key = line.strip()
+        if key and re.match(r'^(🔹|[-•*]|\d+\.)\s+', key):
+            normalized = re.sub(r'\*+', '', key).strip()
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+        out.append(line)
+    return '\n'.join(out)
+
+
 def _clean_query_text(question: str) -> str:
     """
     Turn a raw user question into a short, presentation-friendly heading.
