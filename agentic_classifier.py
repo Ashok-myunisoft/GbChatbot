@@ -193,6 +193,17 @@ _PERSONAL_PATTERNS = [
     r"\bleft\s+leaves?\b",
 ]
 
+# Navigational intent: user is asking WHERE a screen/menu/section lives, not
+# requesting an action or their own data. These often mention "leave"/"attendance"
+# incidentally (e.g. "how to access the leave request screen") and must be caught
+# before the weak-signal LLM stage misreads them as ACTION/PERSONAL.
+_NAVIGATION_PATTERNS = [
+    r"\bhow\s+(do|can|to)\s+i?\s*(access|open|navigate|reach|get\s+to|go\s+to|find)\b",
+    r"\bwhere\s+(is|are|can\s+i\s+find|do\s+i\s+find)\b",
+    r"\b(which|what)\s+(section|screen|module|menu|tab|page)\b",
+    r"\bin\s+which\s+(section|screen|module|menu|tab|page)\b",
+]
+
 # Action intent: user wants to trigger a workflow
 _ACTION_PATTERNS = [
     r"\bapply\s+(for\s+)?leave\b",
@@ -252,6 +263,14 @@ def classify(question: str) -> str:
             logger.info(f"[AgenticClassifier] ACTION intent (strong): '{question[:60]}'")
             return "action"
 
+    # ── Stage 1b: Navigational questions — never ACTION/PERSONAL ──────────────
+    # Checked after the strong patterns (so "my leave balance" etc. still win)
+    # but before the LLM stage, since these are deterministic UI-location asks.
+    for pattern in _NAVIGATION_PATTERNS:
+        if re.search(pattern, q):
+            logger.info(f"[AgenticClassifier] GENERAL intent (navigational): '{question[:60]}'")
+            return "general"
+
     # ── Stage 2: Weak signal → LLM confirmation ───────────────────────────────
     # Only runs when no strong pattern matched but the message contains words that
     # COULD relate to personal/action intent (catches novel phrasings like
@@ -267,14 +286,19 @@ def classify(question: str) -> str:
                 "Classify this ERP chatbot message into one category:\n"
                 "PERSONAL — user asking about their OWN leave/permission/attendance/salary data\n"
                 "ACTION   — user wants to apply/cancel/submit/approve leave, permission, or time slip\n"
-                "GENERAL  — asking about ERP concepts, policies, workflows, reports, or general info\n\n"
+                "GENERAL  — asking about ERP concepts, policies, workflows, reports, navigation, or general info\n\n"
+                "IMPORTANT: a question about WHERE/HOW TO FIND, ACCESS, or NAVIGATE TO a screen, "
+                "menu, or section is always GENERAL — even if it mentions leave/permission/attendance — "
+                "because the user wants directions to a UI location, not to submit a request or view their data.\n\n"
                 "Examples:\n"
-                "  'I need a day off next Monday'       → ACTION\n"
-                "  'show leave approval workflow'       → GENERAL\n"
-                "  'how many leaves do I have'          → PERSONAL\n"
-                "  'what is the leave approval process' → GENERAL\n"
-                "  'leave policy in HR module'          → GENERAL\n"
-                "  'book me off on Friday'              → ACTION\n\n"
+                "  'I need a day off next Monday'          → ACTION\n"
+                "  'show leave approval workflow'          → GENERAL\n"
+                "  'how many leaves do I have'             → PERSONAL\n"
+                "  'what is the leave approval process'    → GENERAL\n"
+                "  'leave policy in HR module'             → GENERAL\n"
+                "  'book me off on Friday'                 → ACTION\n"
+                "  'how do I get to the leave screen'      → GENERAL\n"
+                "  'where can I submit a leave request'    → GENERAL\n\n"
                 "Reply with PERSONAL, ACTION, or GENERAL only.\n"
                 f"Message: {question}"
             )
