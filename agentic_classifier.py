@@ -193,13 +193,16 @@ _PERSONAL_PATTERNS = [
     r"\bleft\s+leaves?\b",
 ]
 
-# Navigational intent: user is asking WHERE a screen/menu/section lives, not
-# requesting an action or their own data. These often mention "leave"/"attendance"
-# incidentally (e.g. "how to access the leave request screen") and must be caught
-# before the weak-signal LLM stage misreads them as ACTION/PERSONAL.
-_NAVIGATION_PATTERNS = [
-    r"\bhow\s+(do|can|to)\s+i?\s*(access|open|navigate|reach|get\s+to|go\s+to|find)\b",
-    r"\bwhere\s+(is|are|can\s+i\s+find|do\s+i\s+find)\b",
+# Navigational intent — UNAMBIGUOUS only: explicitly names a UI location
+# (module/screen/section/menu/tab/page). No reasonable reading of "which
+# module" is a data request or a command, so this is safe to auto-decide
+# with no LLM call, and must be checked before anything else (even before
+# action verbs), since e.g. "which screen do I apply leave in" is a
+# navigation question, not a request to actually apply.
+# Phrasings like "how do I access X" or "where is X" are deliberately NOT
+# here — those are genuinely ambiguous ("where is my leave balance" could
+# mean "show it to me") and are resolved by the LLM intent check instead.
+_NAVIGATION_LOCATION_PATTERNS = [
     r"\b(which|what)\s+(section|screen|module|menu|tab|page)\b",
     r"\bin\s+which\s+(section|screen|module|menu|tab|page)\b",
 ]
@@ -228,12 +231,21 @@ _ACTION_PATTERNS = [
 
 def classify(question: str) -> str:
     """
-    Two-stage intent classifier.
+    Intent-based classifier: only two things are ever decided by regex alone
+    (both are structurally unambiguous, no sentence context can change them).
+    Everything else that so much as mentions a relevant topic is resolved by
+    an LLM intent check, whose PERSONAL/ACTION/GENERAL answer is authoritative
+    -- no keyword match downstream overrides it. This avoids two failure modes
+    a pure keyword system can't escape at the same time:
+      - false positive: topic word present but the sentence isn't a data
+        request/command (e.g. "in which module I see my leave balance" is
+        navigational despite containing "my leave balance" verbatim)
+      - false negative: genuine request phrased in a way no regex anticipated
+        (e.g. "I need a day off next Monday" → ACTION)
 
-    Stage 1 — regex (existing patterns): strong, unambiguous matches resolved instantly.
-    Stage 2 — LLM confirmation: only fires when weak signals are present but no strong
-              pattern matched. Prevents false positives (e.g. "leave approval workflow"
-              → GENERAL) and false negatives (e.g. "I need a day off" → ACTION).
+    Deterministic tier 1 — explicit UI-location questions → GENERAL.
+    Deterministic tier 2 — explicit command verbs (apply/cancel/submit/...) → ACTION.
+    Everything else mentioning leave/permission/attendance/salary/time-slip/etc → LLM decides.
 
     Returns:
         "personal"  → route to Chat Interface API
@@ -247,39 +259,41 @@ def classify(question: str) -> str:
 
     q = question.lower().strip()
 
-    # ── Stage 1: Strong regex matches (existing logic, unchanged) ─────────────
-    # Time slip — explicit fast path
-    if re.search(r"\bsubmit\s+(a\s+)?time\s*slip\b", q) or re.search(r"\btime\s*slip\b", q):
+    # ── Deterministic tier 1: explicit UI-location questions — always GENERAL ──
+    # Checked first -- even before action verbs -- since "which screen do I
+    # apply leave in" is a navigation question, not a request to apply.
+    for pattern in _NAVIGATION_LOCATION_PATTERNS:
+        if re.search(pattern, q):
+            logger.info(f"[AgenticClassifier] GENERAL intent (navigational): '{question[:60]}'")
+            return "general"
+
+    # ── Deterministic tier 2: unambiguous command verbs — always ACTION ────────
+    # Only "submit a time slip" is unambiguous; a bare "time slip" mention
+    # (e.g. "is there a time slip report") is just a topic, not a command --
+    # that goes through the LLM check below like any other topic mention.
+    if re.search(r"\bsubmit\s+(a\s+)?time\s*slip\b", q):
         logger.info(f"[AgenticClassifier] ACTION intent (strong): '{question[:60]}'")
         return "action"
-
-    for pattern in _PERSONAL_PATTERNS:
-        if re.search(pattern, q):
-            logger.info(f"[AgenticClassifier] PERSONAL intent (strong): '{question[:60]}'")
-            return "personal"
 
     for pattern in _ACTION_PATTERNS:
         if re.search(pattern, q):
             logger.info(f"[AgenticClassifier] ACTION intent (strong): '{question[:60]}'")
             return "action"
 
-    # ── Stage 1b: Navigational questions — never ACTION/PERSONAL ──────────────
-    # Checked after the strong patterns (so "my leave balance" etc. still win)
-    # but before the LLM stage, since these are deterministic UI-location asks.
-    for pattern in _NAVIGATION_PATTERNS:
-        if re.search(pattern, q):
-            logger.info(f"[AgenticClassifier] GENERAL intent (navigational): '{question[:60]}'")
-            return "general"
-
-    # ── Stage 2: Weak signal → LLM confirmation ───────────────────────────────
-    # Only runs when no strong pattern matched but the message contains words that
-    # COULD relate to personal/action intent (catches novel phrasings like
-    # "I need a day off" or prevents "leave approval workflow" being misrouted).
+    # ── Intent confirmation: any relevant topic mention → ask the LLM ─────────
+    # _PERSONAL_PATTERNS is used here only to detect "this sentence mentions
+    # personal-data topics" (my leave/salary/payslip/profile/data/details/
+    # record/...) -- it no longer auto-returns "personal", since those phrases
+    # equally show up in navigational and informational sentences. The LLM
+    # reads the whole sentence and decides the real intent.
     _WEAK_SIGNALS = {
         "leave", "permission", "attendance", "absent", "day off",
-        "time off", "half day", "comp off", "holiday", "off day",
+        "time off", "half day", "comp off", "holiday", "off day", "time slip",
     }
-    if any(w in q for w in _WEAK_SIGNALS):
+    _mentions_personal_topic = any(re.search(p, q) for p in _PERSONAL_PATTERNS)
+    _mentions_weak_signal = any(w in q for w in _WEAK_SIGNALS)
+
+    if _mentions_personal_topic or _mentions_weak_signal:
         try:
             from shared_resources import ai_resources
             _prompt = (
