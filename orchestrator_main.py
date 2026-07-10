@@ -2947,6 +2947,7 @@ For example: "Name: John, Role: developer" """
                 _hint_patterns = [
                     r"not (?:asking|about|for)\s+[\w\s]+",
                     r"(?:wrong|incorrect)\s+[\w\s]+",
+                    r"(?:is|isn'?t|was|wasn'?t|not)\s+(?:correct|right|accurate)\b[\w\s]*",
                     r"i (?:meant|mean)\s+[\w\s]+",
                     r"not what i (?:asked|wanted|meant)",
                 ]
@@ -2992,13 +2993,23 @@ For example: "Name: John, Role: developer" """
             "more about", "explain further", "not helpful", "better answer",
             "still not", "still unclear", "want more", "i need more"
         ]
-        if any(phrase in question.lower() for phrase in dissatisfaction_phrases):
+        # NOTE: check _original_retry_msg, not `question` -- on a retry, `question`
+        # has already been overwritten with the replayed original question (see
+        # RetryDetect above), so checking `question` here would miss dissatisfaction
+        # wording the user actually typed (e.g. "the above answer is not correct").
+        if any(phrase in _original_retry_msg.lower() for phrase in dissatisfaction_phrases):
             deep_analysis_needed = True
             logger.info("ðŸ“ Deep analysis triggered: dissatisfaction signal detected")
 
         # Signal 2: Current question has â‰¥70% word overlap with the last question
         # (same question asked again, possibly rephrased)
-        if not deep_analysis_needed and thread_id:
+        # Skipped on a retry: `question` was just set equal to the replayed
+        # original question, so it would trivially ~100%-match the thread's last
+        # message every time -- forcing "cover all aspects" padding onto every
+        # plain "try again" even when the answer was already short and complete.
+        # Genuine retry dissatisfaction is already covered by Signal 1 (above,
+        # checked against the real user message) and the correction-hint inject.
+        if not deep_analysis_needed and not _is_retry and thread_id:
             _thread_obj = history_manager.get_thread(thread_id)
             if _thread_obj and _thread_obj.messages:
                 _last_msg = _thread_obj.messages[-1]
