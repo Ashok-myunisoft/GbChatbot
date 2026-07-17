@@ -32,6 +32,7 @@ import formatter_agent
 import agentic_classifier
 import retry_handler
 import feedback_classifier
+import kms_qdrant
 try:
     from core.semantic_router.routing_orchestrator import get_semantic_router
     SEMANTIC_ROUTER_AVAILABLE = True
