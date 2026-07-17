@@ -66,11 +66,6 @@ _PROPER_ENDINGS = (".", "!", "?", '"', "'", "`", ")", "]", "*")
 
 
 def _normalize_for_compare(text: str) -> str:
-    """
-    Strips markdown decoration and collapses whitespace so that purely
-    cosmetic reshuffles (bold-asterisk placement, stray code fences, extra
-    blank lines) don't register as a "real" correction (#3).
-    """
     if not text:
         return ""
     t = text.strip()
@@ -81,7 +76,6 @@ def _normalize_for_compare(text: str) -> str:
 
 
 def _word_overlap_ratio(a: str, b: str) -> float:
-    """Simple symmetric word-overlap ratio, 0.0-1.0, for similarity checks."""
     wa = set(re.findall(r"\b\w{3,}\b", (a or "").lower()))
     wb = set(re.findall(r"\b\w{3,}\b", (b or "").lower()))
     if not wa or not wb:
@@ -90,8 +84,6 @@ def _word_overlap_ratio(a: str, b: str) -> float:
 
 
 def _looks_truncated(text: str) -> bool:
-    """Heuristic: does the answer end mid-sentence/mid-word instead of a
-    natural stop? Catches things like '...Mobile App (MOBILE' (#2)."""
     t = (text or "").rstrip()
     if not t:
         return True
@@ -99,16 +91,6 @@ def _looks_truncated(text: str) -> bool:
 
 
 def is_meaningful_correction(old_answer: str, new_answer: str) -> tuple:
-    """
-    Decides whether `new_answer` should be allowed to be logged as a
-    "positive" correction of `old_answer`. Returns (ok: bool, reason: str).
-
-    Addresses improvement-notes #1, #2, #3:
-      - reject if empty / not actually different
-      - reject if identical after stripping markdown decoration (cosmetic-only)
-      - reject if it's a near-duplicate by word overlap
-      - reject if it's shorter/truncated/degraded relative to the old answer
-    """
     if not new_answer or not new_answer.strip():
         return False, "empty_answer"
 
@@ -142,15 +124,6 @@ def save_learning_example(
     thread_id: str = "",
     pair_id: str = "",
 ) -> None:
-    """
-    Appends one JSONL record — instruction/response pairs for LoRA/QLoRA
-    fine-tuning, plus raw fields (bot_type, label) for filtering/analysis.
-
-    thread_id/pair_id (#6) let a negative/positive pair be reconstructed
-    exactly, instead of inferred by matching instruction text + adjacent
-    timestamps (which breaks down on multi-retry chains or two users
-    asking the same question close together).
-    """
     try:
         os.makedirs(LEARNING_DIR, exist_ok=True)
         record = {
@@ -173,8 +146,6 @@ def save_learning_example(
 
 
 def new_pair_id() -> str:
-    """One short id generated per retry cycle, shared by the negative and
-    positive (or still_wrong) records that belong together (#6)."""
     return uuid.uuid4().hex[:12]
 
 
@@ -184,8 +155,6 @@ _MAX_PAIRS_PER_QUESTION = 2
 
 
 def _existing_pairs_for_question(question_norm: str) -> list:
-    """Every already-committed positive record for this normalized question,
-    read fresh from disk (works across threads/users/sessions)."""
     if not os.path.exists(LEARNING_FILE):
         return []
     out = []
@@ -217,27 +186,6 @@ def save_correction_pair(
     thread_id: str = "",
     extra: Optional[dict] = None,
 ) -> tuple:
-    """
-    The ONLY way a retry gets written to the training file. Writes the
-    negative and positive records TOGETHER, atomically, and only when all
-    of these hold:
-
-      1. The correction is real (see is_meaningful_correction) — not an
-         identical/cosmetic/truncated re-log of the same wrong answer (#1-3).
-      2. This exact question hasn't already been logged too many times,
-         globally, across every thread and user (#5) — capped at
-         _MAX_PAIRS_PER_QUESTION.
-
-    If the correction never comes through (retry failed, or produced junk),
-    NOTHING is written at all — there is no code path left that can leave a
-    lone, unpaired "negative" sitting in the file forever. That's the
-    behavior you asked for: only questions that got a real wrong-answer ->
-    right-answer cycle end up in the dataset, and each distinct question
-    only shows up a bounded number of times no matter how many times it's
-    retested.
-
-    Returns (saved: bool, reason: str).
-    """
     ok, reason = is_meaningful_correction(wrong_answer, corrected_answer)
     if not ok:
         logger.info(f"[RetryHandler] Correction pair discarded ({reason}): '{question[:60]}'")
@@ -265,14 +213,6 @@ def save_correction_pair(
 
 
 def mark_last_positive_as_still_wrong(thread_id: str, question: str) -> bool:
-    """
-    If the user rejects the SAME question again right after a "positive"
-    was logged for it in this thread, that positive was never actually
-    confirmed good (#8). Rewrites the most recent matching positive record
-    in-place to label="still_wrong" so it can be excluded from training.
-
-    Returns True if a record was downgraded.
-    """
     if not thread_id or not question or not os.path.exists(LEARNING_FILE):
         return False
     try:
@@ -311,18 +251,6 @@ def mark_last_positive_as_still_wrong(thread_id: str, question: str) -> bool:
 
 
 async def reformat_answer(llm, cached_answer: str, requested_columns: list, format_preference: str = "") -> Optional[str]:
-    """
-    Handles "the data was fine, just show it differently" feedback.
-
-    Unlike the Postgres version (which re-selected specific DataFrame
-    columns), Qdrant bots only produce free text — there's no structured
-    table to re-select from. Instead: ask the LLM to reformat the EXISTING
-    cached answer text according to what the user asked for. Zero re-fetch —
-    the underlying data doesn't change, only the presentation.
-
-    Returns the reformatted answer, or None if there's nothing usable cached
-    (caller should fall through to normal bot routing in that case).
-    """
     if not cached_answer or not cached_answer.strip():
         return None
 
