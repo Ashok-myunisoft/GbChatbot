@@ -13,8 +13,15 @@ import psycopg2.extras
 
 from db_setup import get_pg_conn, release_pg_conn
 from core.semantic_router.learning_memory import get_feedback_file_path, get_feedback_records
+import retry_handler
 
 logger = logging.getLogger(__name__)
+
+# Cap on how many examples per unique (normalized) question are allowed
+# into the final dataset -- without this, a handful of over-tested
+# questions (one seen ~20 times in manual testing) dominate the LoRA
+# training signal while rarer real corrections get drowned out (#5).
+_MAX_PER_QUESTION = 3
 
 
 def _normalize_text(text: str) -> str:
@@ -196,6 +203,98 @@ class LearningDatasetExporter:
             "normalized_query": _normalize_text(_safe_str(record.get("query"))),
         }
 
+    def _load_retry_jsonl_rows(self) -> List[Dict[str, object]]:
+        """
+        Reads learning_exports/retry_feedback_dataset.jsonl (written by
+        retry_handler.save_learning_example) and turns each confirmed
+        negative/positive pair into one training example: "don't answer
+        like the rejected one, answer like the corrected one." Records
+        still labeled "still_wrong" (a positive that was itself rejected
+        again -- see retry_handler.mark_last_positive_as_still_wrong) are
+        excluded, since they were never actually confirmed good (#8).
+        """
+        path = Path(retry_handler.LEARNING_FILE)
+        if not path.exists():
+            return []
+
+        rows: List[Dict[str, object]] = []
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rows.append(json.loads(line))
+                    except Exception:
+                        continue
+        except Exception as exc:
+            logger.warning("[LearningExport] Could not read retry JSONL: %s", exc)
+            return []
+
+        # Group by pair_id where available so a negative/positive pair is
+        # matched explicitly (#6) rather than reconstructed by proximity.
+        by_pair: Dict[str, Dict[str, Dict]] = {}
+        legacy_pending_negative: Optional[Dict] = None
+        examples: List[Dict[str, object]] = []
+
+        for row in rows:
+            label = row.get("label")
+            pair_id = row.get("pair_id") or ""
+
+            if pair_id:
+                bucket = by_pair.setdefault(pair_id, {})
+                bucket[label] = row
+                continue
+
+            # Legacy rows written before pair_id existed -- fall back to
+            # adjacent negative->positive matching, best effort only.
+            if label == "negative":
+                legacy_pending_negative = row
+            elif label == "positive" and legacy_pending_negative:
+                examples.append(self._build_retry_example(legacy_pending_negative, row))
+                legacy_pending_negative = None
+
+        for bucket in by_pair.values():
+            neg = bucket.get("negative")
+            pos = bucket.get("positive")
+            if neg and pos:
+                examples.append(self._build_retry_example(neg, pos))
+            # still_wrong / negative-only pairs are intentionally dropped --
+            # there's no confirmed-good answer to teach from.
+
+        return examples
+
+    def _build_retry_example(self, negative_row: Dict, positive_row: Dict) -> Dict[str, object]:
+        question = _safe_str(positive_row.get("instruction") or negative_row.get("instruction"))
+        rejected_answer = _safe_str(negative_row.get("response"))
+        corrected_answer = _safe_str(positive_row.get("response"))
+        input_text = "\n".join(
+            [
+                f"Bot Type: {_safe_str(positive_row.get('bot_type'))}",
+                f"Question: {question}",
+                f"Rejected answer (do not repeat): {rejected_answer[:800]}",
+            ]
+        ).strip()
+        return {
+            "task_type": "answer",
+            "source": "retry_feedback_dataset",
+            "feedback_id": _safe_str(positive_row.get("pair_id")),
+            "username": _safe_str(positive_row.get("username")),
+            "thread_id": _safe_str(positive_row.get("thread_id")),
+            "bot_type": _safe_str(positive_row.get("bot_type")),
+            "user_role": "",
+            "feedback_type": "retry_correction",
+            "rating": 5,
+            "reason": _safe_str(positive_row.get("category")),
+            "input": input_text,
+            "output": corrected_answer,
+            "original_answer": rejected_answer,
+            "corrected_answer": corrected_answer,
+            "context": {},
+            "normalized_query": _normalize_text(question),
+        }
+
     def load_records(self) -> Tuple[List[Dict[str, object]], int, int]:
         answer_rows: List[Dict[str, object]] = []
         route_rows: List[Dict[str, object]] = []
@@ -231,7 +330,7 @@ class LearningDatasetExporter:
 
         for row in answer_rows:
             record = self._build_answer_example(dict(row))
-            key = f"answer::{record['normalized_query']}::{record['output']}"
+            key = f"answer::{record['normalized_query']}::{_normalize_text(record['output'])}"
             if key not in seen:
                 seen.add(key)
                 records.append(record)
@@ -243,12 +342,39 @@ class LearningDatasetExporter:
 
         for row in route_rows:
             record = self._build_route_example(dict(row))
-            key = f"route::{record['normalized_query']}::{record['output']}"
+            key = f"route::{record['normalized_query']}::{_normalize_text(record['output'])}"
             if key not in seen:
                 seen.add(key)
                 records.append(record)
 
-        return records
+        for record in self._load_retry_jsonl_rows():
+            key = f"retry::{record['normalized_query']}::{_normalize_text(record['output'])}"
+            if key not in seen:
+                seen.add(key)
+                records.append(record)
+
+        return self._cap_per_question(records)
+
+    @staticmethod
+    def _cap_per_question(records: List[Dict[str, object]], max_per_question: int = _MAX_PER_QUESTION) -> List[Dict[str, object]]:
+        """
+        Keeps at most `max_per_question` examples per unique normalized
+        question so a handful of over-tested questions don't dominate the
+        fine-tune (#5). Keeps the most recent-looking / longest-answer
+        examples first as a simple quality proxy when trimming.
+        """
+        by_query: Dict[str, List[Dict[str, object]]] = {}
+        for record in records:
+            by_query.setdefault(record.get("normalized_query", ""), []).append(record)
+
+        capped: List[Dict[str, object]] = []
+        for query, group in by_query.items():
+            if not query or len(group) <= max_per_question:
+                capped.extend(group)
+                continue
+            group.sort(key=lambda r: len(r.get("output", "")), reverse=True)
+            capped.extend(group[:max_per_question])
+        return capped
 
     def export(
         self,

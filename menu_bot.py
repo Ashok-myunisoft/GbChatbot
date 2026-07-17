@@ -277,8 +277,17 @@ async def chat(message: Message, Login: str = Header(...)):
         history_str = _extract_recent_turns(message.context or '')
 
         logger.info(f"🔍 Searching KMS for: {user_input[:100]}")
-        _search_q = kms_qdrant.enrich_search_query(user_input, getattr(message, 'context', ''))
-        context_str, kms_sources = kms_qdrant.search_with_sources(_search_q)
+        _orch_ctx_raw = getattr(message, 'context', '') or ''
+        _deep_ctx = kms_qdrant.extract_deep_search_context(_orch_ctx_raw)
+        if _deep_ctx:
+            # Retry mode: use the orchestrator's deep-search results as the
+            # PRIMARY KMS context instead of re-running our own shallow search
+            # (which would just reproduce the answer the user rejected).
+            context_str, kms_sources = _deep_ctx, []
+            logger.info(f"🔎 Using deep-search context as primary source ({len(context_str)} chars)")
+        else:
+            _search_q = kms_qdrant.enrich_search_query(user_input, _orch_ctx_raw)
+            context_str, kms_sources = kms_qdrant.search_with_sources(_search_q)
 
         # Truncate at newline boundary to avoid cutting mid-record
         if len(context_str) > 8000:

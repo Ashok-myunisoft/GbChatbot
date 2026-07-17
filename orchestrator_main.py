@@ -30,6 +30,8 @@ import voice_engine
 import voice_agent
 import formatter_agent
 import agentic_classifier
+import retry_handler
+import feedback_classifier
 try:
     from core.semantic_router.routing_orchestrator import get_semantic_router
     SEMANTIC_ROUTER_AVAILABLE = True
@@ -468,13 +470,40 @@ _RETRY_SIGNALS = {
     "correct", "better", "another", "different", "misunderstood",
     "not what", "not asking", "not about", "meant", "helpful",
 }
+# Word-boundary regex per signal -- a plain `signal in t` substring check
+# false-positives badly (e.g. "again" matches inside "against", so any
+# question like "compare X against Y" used to trigger the LLM check and
+# risked being misread as a retry of the previous answer).
+_RETRY_SIGNAL_PATTERNS = [re.compile(r"\b" + re.escape(s) + r"\b") for s in _RETRY_SIGNALS]
 _EXACT_RETRY_PHRASES = {"try again", "retry", "try once more", "please retry", "try that again", "again"}
 
-async def detect_retry_intent(text: str, has_thread: bool) -> bool:
+
+def _retry_text_overlap(text: str, prev_question: str, prev_answer: str) -> float:
+    """Word overlap between the new message and the previous turn's Q+A."""
+    a_words = set(re.findall(r"\b\w{4,}\b", text.lower()))
+    b_words = set(re.findall(r"\b\w{4,}\b", (prev_question + " " + prev_answer).lower()))
+    if not a_words or not b_words:
+        return 0.0
+    return len(a_words & b_words) / len(a_words)
+
+
+async def detect_retry_intent(
+    text: str, has_thread: bool,
+    prev_question: str = "", prev_answer: str = "",
+) -> bool:
     """Two-stage retry intent detection — LLM-based, not keyword-based.
     Stage 1: structural pre-filter (no thread = impossible retry; exact known phrases = fast path).
     Stage 2: LLM YES/NO for all other cases (handles correction+retry, implicit retry, topic hints).
     Falls back to exact phrase match if LLM fails.
+
+    Safety net: a YES from the LLM is only trusted if the message is short
+    OR shares real topical overlap with the previous turn. A long message
+    with near-zero overlap that merely contains a retry-signal word (e.g.
+    "correct", "another", "different") is almost always a brand-new,
+    unrelated question -- not feedback on the last answer. Without this,
+    the bot would silently re-answer the OLD question instead of the new
+    one whenever a fresh question happened to contain one of these common
+    words.
     """
     if not has_thread:
         return False
@@ -483,8 +512,18 @@ async def detect_retry_intent(text: str, has_thread: bool) -> bool:
     if t in _EXACT_RETRY_PHRASES:
         return True
     # Stage 1 pre-filter — must have at least one retry signal to warrant LLM call
-    if not any(signal in t for signal in _RETRY_SIGNALS):
+    if not any(p.search(t) for p in _RETRY_SIGNAL_PATTERNS):
         return False
+
+    _word_count = len(re.findall(r"\b\w{4,}\b", t))
+    _overlap = _retry_text_overlap(text, prev_question, prev_answer) if (prev_question or prev_answer) else 1.0
+    if _word_count >= 6 and _overlap < 0.15:
+        logger.info(
+            "[RetryDetect] Overlap guard: '%s' has %d words, overlap=%.2f with prev turn -> treating as NEW question, not retry",
+            text[:60], _word_count, _overlap,
+        )
+        return False
+
     # Stage 2 — LLM intent classification
     try:
         _prompt = (
@@ -2620,6 +2659,148 @@ Rewritten Answer:"""
             "download_url": None,
         }
 
+    async def _execute_retry(
+        self, username: str, user_role: str, thread_id: str,
+        orig_question: str, orig_bot_type: str, wrong_answer: str,
+        hint: Optional[Dict] = None,
+        feedback_category: str = "wrong_data",
+        classifier_confidence: Optional[float] = None,
+    ) -> Dict[str, str]:
+        """
+        Actually RE-ANSWERS the rejected question, rather than just logging
+        feedback and saying "thanks" (that's all the old inline-feedback
+        block below used to do). Re-runs the SAME question through the SAME
+        bot, with the context enriched to say the previous answer was
+        rejected -- since these Qdrant-backed bots pass `context` straight
+        into their final answer-generation prompt (orchestrator_context=...),
+        this note actually reaches the LLM, unlike some of the old Postgres
+        bots which silently dropped it.
+
+        NOTE: unlike the Postgres version, there is no table to reconsider
+        the bot choice against (Qdrant has one flat document collection) --
+        this always retries with the SAME bot. For WRONG_DATA feedback, it
+        now also performs a Qdrant deep search before retrying.
+        """
+        logger.info(f"[Retry] Re-running: '{orig_question[:80]}' (bot: {orig_bot_type}, hint: {hint})")
+
+        # NOTE: we deliberately do NOT log the negative here anymore.
+        # Writing it immediately meant that if the retry below failed, or
+        # produced junk that got rejected by is_meaningful_correction, the
+        # negative sat in the training file forever with no matching
+        # positive -- a half-pair that's useless for LoRA training. Now the
+        # negative and positive are only ever written together, atomically,
+        # by retry_handler.save_correction_pair() once we actually have a
+        # confirmed correction (see below).
+
+        _retry_context = None
+        if feedback_category and feedback_category.lower().startswith("wrong_data"):
+            correction_hint = ""
+            if hint:
+                # Plain values (not "key:value" tokens) — this string is fed
+                # straight into a Qdrant embedding search in Strategy 2, and
+                # natural language embeds far better than "topic:sales module".
+                hint_parts = [
+                    str(hint[key]) for key in ("topic", "table", "column", "value", "condition")
+                    if hint.get(key)
+                ]
+                correction_hint = " ".join(hint_parts).strip()
+
+            try:
+                _deep_ctx, _deep_sources = kms_qdrant.deep_search_with_sources(
+                    orig_question,
+                    correction_hint=correction_hint,
+                    feedback_category="wrong_data",
+                    previous_answer=wrong_answer,
+                )
+                if _deep_ctx:
+                    _retry_context = _deep_ctx
+                    logger.info("[Retry] Deep search returned %d chars for retry", len(_deep_ctx))
+            except Exception as _dse:
+                logger.warning(f"[Retry] Deep search failed: {_dse}")
+
+        if _retry_context:
+            if correction_hint:
+                _retry_context = f"[User correction: {correction_hint}]\n\n" + _retry_context
+            _retry_context = (
+                "[DEEP SEARCH — previous answer was wrong, use these results]\n\n"
+                + _retry_context
+                + "\n\n[RETRY MODE]\n"
+                "The previous answer to this exact question was REJECTED by the user as wrong. "
+                "Search more thoroughly this time and do not simply repeat the same result.\n"
+            )
+        else:
+            _retry_context = build_conversational_context(username, orig_question, thread_id, thread_isolation=True)
+            _retry_context += (
+                "\n\n[RETRY MODE]\n"
+                "The previous answer to this exact question was REJECTED by the user as wrong. "
+                "Search more thoroughly this time and do not simply repeat the same result.\n"
+            )
+            if hint and (hint.get("column") or hint.get("table") or hint.get("value")):
+                _retry_context += f"\nUser-provided clue: {json.dumps(hint)}\n"
+
+        _retry_bot = self.bots.get(orig_bot_type, self.bots["general"])
+        try:
+            _retry_answer = await asyncio.wait_for(
+                _retry_bot.answer(orig_question, _retry_context, user_role, username),
+                timeout=120.0
+            )
+        except Exception as _re_err:
+            logger.error(f"[Retry] Execution failed: {_re_err}")
+            _retry_answer = None
+
+        if _retry_answer and len(_retry_answer.strip()) >= 10:
+            _retry_answer = _extract_clean_response(_retry_answer)
+            _retry_answer = _fmt_response(orig_question, _retry_answer)
+
+            # Only commits to the training file if this is an actual,
+            # meaningfully different, non-truncated correction, AND this
+            # question hasn't already been logged too many times globally
+            # (#1, #2, #3, #5). Writes negative+positive TOGETHER, or
+            # writes nothing at all — no orphan negatives left behind.
+            _saved, _reason = await asyncio.to_thread(
+                retry_handler.save_correction_pair,
+                orig_question, wrong_answer, _retry_answer, orig_bot_type, username, thread_id,
+                {"category": feedback_category, "hint": hint, "confidence": classifier_confidence},
+            )
+            if not _saved:
+                logger.info(f"[Retry] Not saved to training file ({_reason}): '{orig_question[:60]}'")
+
+            # Store with the ORIGINAL question as user_message (not the
+            # feedback phrase that triggered this) so a second round of
+            # feedback still finds the right original question to redo.
+            await asyncio.to_thread(
+                update_enhanced_memory,
+                username, orig_question, _retry_answer, orig_bot_type, user_role, thread_id
+            )
+
+            return {
+                "response":     _retry_answer,
+                "formatted":    await asyncio.to_thread(formatter_agent.format, orig_question, _retry_answer),
+                "bot_type":     orig_bot_type,
+                "thread_id":    thread_id,
+                "user_role":    user_role,
+                "download_url": None,
+                "retry":        True,
+            }
+
+        _fail_msg = (
+            "I searched again but still couldn't confidently find the right data. "
+            "Could you tell me more specifically what this should come from, or rephrase the question?"
+        )
+        # Intentionally NOT saved to the training file: there is no
+        # confirmed correction here (the retry itself failed), so writing
+        # a "negative" with no matching "positive" would just be another
+        # orphan half-pair cluttering the dataset.
+        return {
+            "response":     _fail_msg,
+            "formatted":    await asyncio.to_thread(formatter_agent.format, orig_question, _fail_msg),
+            "bot_type":     "retry_failed",
+            "thread_id":    thread_id,
+            "user_role":    user_role,
+            "download_url": None,
+            "retry":        True,
+        }
+
     async def process_request(self, username: str, user_role: str, question: str,
                             thread_id: str = None, is_existing_thread: bool = False,
                             login_dto: dict = None) -> Dict[str, str]:
@@ -2740,10 +2921,102 @@ For example: "Name: John, Role: developer" """
             return await self._handle_source_inquiry(username, question, thread_id, user_role)
         # -- End Source Inquiry --
 
-        # ── Inline Feedback Detection ─────────────────────────────────────────
+        # ── Feedback Understanding: "try again" OR anything else ──────────────
         # Check session state once here — reused by both feedback and agentic classifier below
         _in_session = await asyncio.to_thread(agentic_classifier.is_in_session, username)
 
+        # Guard 1 (previous turn exists) + Guard 2 (can_retry) + Guard 3 (fast
+        # literal-phrase lane) run first, cheaply. Anything not caught by
+        # Guard 3 goes to the 6-bucket LLM classifier (feedback_classifier.py).
+        # Replaces the old "store feedback + say thanks" block — this one
+        # actually RE-ANSWERS the question via self._execute_retry().
+        _fb_debug: Dict = {"engaged": False, "reason": "no_previous_turn_or_not_retryable"}
+
+        if not _in_session and thread_id and is_existing_thread:
+            _thread_for_fb = history_manager.get_thread(thread_id)
+            _last_fb_msg = _thread_for_fb.messages[-1] if _thread_for_fb and _thread_for_fb.messages else None
+
+            if not _last_fb_msg:
+                _fb_debug = {"engaged": False, "reason": "no_messages_in_thread_yet"}
+            elif not retry_handler.can_retry(_last_fb_msg.get("bot_type", "")):
+                _fb_debug = {
+                    "engaged": False,
+                    "reason": "previous_turn_not_retryable",
+                    "previous_bot_type": _last_fb_msg.get("bot_type", ""),
+                }
+
+            if _last_fb_msg and retry_handler.can_retry(_last_fb_msg.get("bot_type", "")):
+                _fb_prev_question = _last_fb_msg.get("user_message", "")
+                _fb_prev_bot_type  = _last_fb_msg.get("bot_type", "")
+                _fb_prev_answer    = _last_fb_msg.get("bot_response", "")
+
+                # Guard 3: narrow, hint-free literal phrases skip the LLM entirely
+                if retry_handler.is_retry_message(question):
+                    logger.info(f"[Guard3] Fast-lane retry: '{question}' -> '{_fb_prev_question[:80]}'")
+                    _fb_debug = {
+                        "engaged": True, "path": "fast_lane_literal_phrase",
+                        "reacting_to_question": _fb_prev_question, "reacting_to_bot_type": _fb_prev_bot_type,
+                    }
+                    _result = await self._execute_retry(
+                        username, user_role, thread_id, _fb_prev_question, _fb_prev_bot_type, _fb_prev_answer,
+                        feedback_category="fast_lane_literal",
+                    )
+                    _result["feedback_debug"] = _fb_debug
+                    return _result
+
+                _classification = await feedback_classifier.classify_feedback(
+                    self.response_llm, question, _fb_prev_question, _fb_prev_answer
+                )
+                _category = _classification["category"]
+                _fb_debug = {
+                    "engaged": True, "path": "llm_classifier",
+                    "reacting_to_question": _fb_prev_question, "reacting_to_bot_type": _fb_prev_bot_type,
+                    "classifier_category": _category,
+                    "classifier_confidence": _classification.get("confidence"),
+                    "classifier_hint": _classification.get("hint"),
+                }
+
+                if _category in ("WRONG_DATA_GENERIC", "WRONG_DATA_WITH_HINT"):
+                    _result = await self._execute_retry(
+                        username, user_role, thread_id, _fb_prev_question, _fb_prev_bot_type, _fb_prev_answer,
+                        hint=_classification.get("hint"),
+                        feedback_category=_category,
+                        classifier_confidence=_classification.get("confidence"),
+                    )
+                    _result["feedback_debug"] = _fb_debug
+                    return _result
+
+                if _category == "REFORMAT":
+                    _reformatted = await retry_handler.reformat_answer(
+                        self.response_llm, _fb_prev_answer,
+                        _classification["requested_columns"],
+                        _classification.get("format_preference", ""),
+                    )
+                    if _reformatted:
+                        await asyncio.to_thread(
+                            update_enhanced_memory,
+                            username, question, _reformatted, _fb_prev_bot_type, user_role, thread_id
+                        )
+                        return {
+                            "response":     _reformatted,
+                            "formatted":    await asyncio.to_thread(formatter_agent.format, question, _reformatted),
+                            "bot_type":     _fb_prev_bot_type,
+                            "thread_id":    thread_id,
+                            "user_role":    user_role,
+                            "download_url": None,
+                            "reformatted":  True,
+                            "feedback_debug": _fb_debug,
+                        }
+                    _fb_debug["reformat_fallthrough"] = "reformat_llm_call_failed"
+                # FOLLOWUP / NEW_QUESTION / failed REFORMAT: fall through to
+                # normal routing below, unchanged.
+        # ── End Feedback Understanding ─────────────────────────────────────────
+
+        # ── Inline Feedback Detection (legacy positive/correction logger) ─────
+        # Kept for the "thanks, noted" case when the classifier above decided
+        # this ISN'T a retry-worthy rejection (e.g. pure praise/correction
+        # text with no actionable re-answer needed). Session check reused
+        # from the block above.
         if not _in_session and thread_id:
             _fb_thread = history_manager.get_thread(thread_id)
             if _fb_thread and _fb_thread.messages:
@@ -2931,19 +3204,58 @@ For example: "Name: John, Role: developer" """
             context = build_conversational_context(username, question, thread_id, thread_isolation=False)
 
         # Detect retry / correction intent -- LLM-based, handles all phrasing
-        _is_retry = False
-        _original_retry_msg = question
-        if await detect_retry_intent(question, bool(thread_id)):
-            thread = history_manager.get_thread(thread_id)
+        _is_retry            = False
+        _original_retry_msg  = question   # what the user ACTUALLY typed
+        _retry_prev_question = ""         # the original question being replayed
+        _retry_prev_answer   = ""         # the wrong answer being corrected
+ 
+        _thread_for_retry = history_manager.get_thread(thread_id) if thread_id else None
+        _prev_q_for_retry = ""
+        _prev_a_for_retry = ""
+        if _thread_for_retry and _thread_for_retry.messages:
+            _prev_q_for_retry = _thread_for_retry.messages[-1].get("user_message", "")
+            _prev_a_for_retry = _thread_for_retry.messages[-1].get("bot_response", "")
+
+        if await detect_retry_intent(question, bool(thread_id), _prev_q_for_retry, _prev_a_for_retry):
+            thread = _thread_for_retry
             if thread and thread.messages:
                 last_msg = thread.messages[-1]
                 prev_question = last_msg.get("user_message", question)
-                prev_bot = last_msg.get("bot_type", "general")
-                logger.info("[RetryDetect] replaying: %s (original: %s)", prev_question[:60], _original_retry_msg[:60])
-                question = prev_question
-                _is_retry = True
-                context = build_conversational_context(username, question, thread_id, thread_isolation=True)
-                # Extract correction hint and inject into context
+                prev_answer   = last_msg.get("bot_response", "")
+                prev_bot      = last_msg.get("bot_type", "general")
+ 
+                logger.info(
+                    "[RetryDetect] replaying: %s (user typed: %s)",
+                    prev_question[:60], _original_retry_msg[:60]
+                )
+ 
+                # Store for later use in feedback saving
+                _retry_prev_question = prev_question
+                _retry_prev_answer   = prev_answer
+ 
+                # Save the BAD answer immediately as negative training example
+                if answer_learning_memory:
+                    try:
+                        await asyncio.to_thread(
+                            update_answer_learning_memory,
+                            username,
+                            prev_question,
+                            prev_answer,
+                            "",
+                            "bad_answer",
+                            1,
+                            f"User said: {_original_retry_msg}",
+                            prev_bot,
+                            user_role,
+                            thread_id,
+                            {},
+                        )
+                        logger.info("[RetryFeedback] Saved bad answer as negative training example")
+                    except Exception as _fbe:
+                        logger.warning(f"[RetryFeedback] Could not save bad answer: {_fbe}")
+ 
+                # ── Qdrant deep search ─────────────────────────────────────────
+                # Extract correction hint from what user typed
                 _hint_patterns = [
                     r"not (?:asking|about|for)\s+[\w\s]+",
                     r"(?:wrong|incorrect)\s+[\w\s]+",
@@ -2957,9 +3269,40 @@ For example: "Name: John, Role: developer" """
                     if _m:
                         _correction_hint = _m.group(0).strip()
                         break
-                if _correction_hint:
-                    context = "[User correction on previous answer: " + _correction_hint + "]\n\n" + context
-                    logger.info("[RetryCorrection] hint injected: %s", _correction_hint)
+ 
+                # Run deep search on the ORIGINAL question with the hint
+                logger.info("[RetryDeepSearch] Running deep search for: '%s'", prev_question[:60])
+                try:
+                    _deep_ctx, _deep_sources = kms_qdrant.deep_search_with_sources(
+                        prev_question,
+                        correction_hint=_correction_hint,
+                    )
+                    if _deep_ctx:
+                        context = (
+                            "[DEEP SEARCH — previous answer was wrong, use these results]\n\n"
+                            + _deep_ctx
+                        )
+                        if _correction_hint:
+                            context = "[User correction: " + _correction_hint + "]\n\n" + context
+                        logger.info("[RetryDeepSearch] Got %d chars", len(_deep_ctx))
+                    else:
+                        context = build_conversational_context(
+                            username, prev_question, thread_id, thread_isolation=True
+                        )
+                        if _correction_hint:
+                            context = "[User correction: " + _correction_hint + "]\n\n" + context
+                except Exception as _dse:
+                    logger.warning("[RetryDeepSearch] Deep search failed, using normal context: %s", _dse)
+                    context = build_conversational_context(
+                        username, prev_question, thread_id, thread_isolation=True
+                    )
+ 
+                # IMPORTANT: question becomes prev_question for bot routing
+                # but we keep _original_retry_msg to save to thread history
+                question  = prev_question
+                _is_retry = True
+                _thread_question = _original_retry_msg if _is_retry else question
+ 
 
         # If retry revealed the replayed question is a source inquiry, intercept before bot routing
         if _is_retry and await is_source_inquiry(question):
@@ -3087,7 +3430,7 @@ For example: "Name: John, Role: developer" """
                         answer = _extract_clean_response(answer)
                         answer = _fmt_response(question, answer)
                         _formatted = await asyncio.to_thread(formatter_agent.format, question, answer)
-                        await asyncio.to_thread(update_enhanced_memory, username, question, answer, bot_type, user_role, thread_id)
+                        await asyncio.to_thread(update_enhanced_memory, username, _thread_question, answer, bot_type, user_role, thread_id)
                         elapsed = time.time() - start_time
                         logger.info(f"âœ… Follow-up completed in {elapsed:.2f}s")
                         return {
@@ -3214,8 +3557,7 @@ For example: "Name: John, Role: developer" """
             answer = await self.generate_out_of_scope_response(question, user_role)
             bot_type = "out_of_scope"
         else:
-            logger.info(f"âš¡ Skipping redundant role adaptation - bot handled it in-situ")
-            # answer = await self.apply_role_perspective(answer, user_role, question)
+            logger.info(f"⚡ Skipping redundant role adaptation - bot handled it in-situ")
 
         # Clean up LLM response if wrapped in {'output': '...'} format
         answer = _extract_clean_response(answer)
@@ -3242,11 +3584,42 @@ For example: "Name: John, Role: developer" """
                     logger.info(f"[ExportEngine] Built {_export_fmt} export â†' {_export_id}")
         # â“€â“€ End export check â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€
 
-        logger.info("ðŸ'¾ Storing conversation...")
+        logger.info("💾 Storing conversation...")
+ 
+        # KEY FIX: when this was a retry, save _original_retry_msg
+        # (what the user actually typed, e.g. "try again") as the thread message
+        # NOT prev_question — because if we save prev_question again, the next
+        # message will look like a duplicate and detect_retry_intent fires again.
+        _thread_question = _original_retry_msg if _is_retry else question
         await asyncio.to_thread(
             update_enhanced_memory,
-            username, question, answer, bot_type, user_role, thread_id
+            username, _thread_question, answer, bot_type, user_role, thread_id
         )
+ 
+        # Save the GOOD answer as positive training example (only on retry)
+        if _is_retry and _retry_prev_answer and answer_learning_memory:
+            _ok2, _reason2 = retry_handler.is_meaningful_correction(_retry_prev_answer, answer)
+            if not _ok2:
+                logger.info(f"[RetryFeedback] Not logging as positive ({_reason2}): '{_retry_prev_question[:60]}'")
+            if _ok2:
+                try:
+                    await asyncio.to_thread(
+                        update_answer_learning_memory,
+                        username,
+                        _retry_prev_question,
+                        _retry_prev_answer,
+                        answer,
+                        "helpful",
+                        5,
+                        "Deep search after user dissatisfaction",
+                        bot_type,
+                        user_role,
+                        thread_id,
+                        {},
+                    )
+                    logger.info("[RetryFeedback] Saved better answer as positive training example")
+                except Exception as _fbe:
+                    logger.warning(f"[RetryFeedback] Could not save good answer: {_fbe}")
 
         # Generate ChatGPT-style title synchronously on first message so
         # the sidebar shows the correct title as soon as the response arrives
@@ -4930,5 +5303,3 @@ if __name__ == "__main__":
     logger.info(f"ðŸš€ Starting FIXED & ENHANCED server on port {port}")
     logger.info("="*80)
     uvicorn.run(app, host="0.0.0.0", port=port)
-
-    
