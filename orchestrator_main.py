@@ -3124,6 +3124,45 @@ For example: "Name: John, Role: developer" """
         # â“€â“€ End File Intelligence â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€â“€
 
         # â“€â“€ Agentic Classifier: personal + action intents â†' Chat Interface API â“€
+        # Handle only broad capability questions here. Feature-specific help
+        # (such as how to apply for leave) keeps using the normal routing below.
+        _help_question = question.lower().strip().rstrip("?!.")
+        _is_system_help = bool(re.search(
+            r"^(?:help(?:\s+me)?|help\s+please|can\s+you\s+help(?:\s+me)?|"
+            r"what\s+can\s+you\s+help(?:\s+me)?\s+with|"
+            r"tell\s+me\s+about\s+(?:this|the)\s+system|about\s+(?:this|the)\s+system)$|"
+            r"\b(?:what\s+(?:can|could)\s+you\s+do|what\s+do\s+you\s+(?:help\s+with|support)|"
+            r"what\s+(?:can|could)\s+you\s+help\s+me\s+with|"
+            r"what\s+does\s+(?:this|the)\s+system\s+do|"
+            r"what\s+features\s+(?:are\s+available|does\s+(?:this|the)\s+system\s+have)|"
+            r"list\s+(?:all\s+)?(?:the\s+)?(?:system\s+)?(?:features|capabilities)|"
+            r"show\s+me\s+(?:all\s+)?(?:the\s+)?(?:system\s+)?(?:features|capabilities)|"
+            r"(?:help|capabilities)\s+(?:menu|overview))\b",
+            _help_question,
+        ))
+        if _is_system_help and not _in_session:
+            _help_answer = (
+                "I can help you with:"
+                "\n\n• ERP questions and guidance about menus and modules"
+                "\n• Leave, permission, and attendance information or requests"
+                "\n• Reports, business data questions, and calculations"
+                "\n• Project and system schema questions"
+                "\n• Questions about files you upload, including supported exports"
+                "\n\nTell me what you’d like to do, and I’ll route it to the right feature."
+            )
+            await asyncio.to_thread(
+                update_enhanced_memory,
+                username, question, _help_answer, "help", user_role, thread_id
+            )
+            return {
+                "response": _help_answer,
+                "formatted": await asyncio.to_thread(formatter_agent.format, question, _help_answer),
+                "bot_type": "help",
+                "thread_id": thread_id,
+                "user_role": user_role,
+                "download_url": None,
+            }
+
         # _in_session already computed above in feedback block
 
         # Session escape: only an explicit exit intent or task completion ends the

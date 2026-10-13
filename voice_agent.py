@@ -40,7 +40,7 @@ VOICE_REQUEST_TIMEOUT = float(os.getenv("VOICE_REQUEST_TIMEOUT", "120"))
 _openai_client: Optional[OpenAI] = None
 _LIVE_SESSIONS: dict[str, dict] = {}
 
-
+ 
 def _parse_size(size_value: str) -> int:
     value = (size_value or "").strip().upper()
     if not value:
