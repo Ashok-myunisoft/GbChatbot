@@ -125,10 +125,13 @@ def _deterministic_classify(new_message: str, prev_question: str) -> Optional[Di
                 "hint": {"table": None, "column": None, "value": None, "condition": None, "topic": None},
                 "requested_columns": [], "format_preference": "", "confidence": 1.0,
                 "decided_by": "deterministic_fallback:new_question"}
-    return {"category": "WRONG_DATA_GENERIC", "raw_category": "AMBIGUOUS",
+    # Overlap alone does not mean the user rejected the previous answer. If
+    # feedback intent is unclear, let the message go through normal routing
+    # instead of replaying the previous question.
+    return {"category": "NEW_QUESTION", "raw_category": "AMBIGUOUS",
             "hint": {"table": None, "column": None, "value": None, "condition": None, "topic": None},
-            "requested_columns": [], "format_preference": "", "confidence": 0.3,
-            "decided_by": "deterministic_fallback:ambiguous_default"}
+            "requested_columns": [], "format_preference": "", "confidence": 0.0,
+            "decided_by": "deterministic_fallback:ambiguous_to_new_question"}
 
 
 CLASSIFY_PROMPT = """You are reading a follow-up message from a user talking to a database assistant.
@@ -225,7 +228,10 @@ async def classify_feedback(llm, new_message: str, prev_question: str, prev_answ
         if raw_category not in _VALID_CATEGORIES:
             raw_category = "AMBIGUOUS"
         confidence = float(parsed.get("confidence", 0.0) or 0.0)
-        category = "WRONG_DATA_GENERIC" if raw_category == "AMBIGUOUS" else raw_category
+        # Ambiguity must never trigger a retry. A retry replays the prior
+        # question, so false positives here make unrelated follow-up questions
+        # receive the previous answer again.
+        category = "NEW_QUESTION" if raw_category == "AMBIGUOUS" else raw_category
 
         hint_raw = parsed.get("hint") or {}
         hint = {
@@ -254,6 +260,16 @@ async def classify_feedback(llm, new_message: str, prev_question: str, prev_answ
             extra_hint = _extract_hint_from_text(new_message)
             hint = {k: (hint.get(k) or extra_hint.get(k)) for k in hint}
             category = "WRONG_DATA_WITH_HINT" if (hint["value"] or hint["column"] or hint["topic"]) else "WRONG_DATA_GENERIC"
+
+        # A shared topic word (for example, "leave" in "apply for leave"
+        # and "check leave balance") is not evidence of rejection. Only
+        # explicit rejection language should route into the retry handler.
+        if category in ("WRONG_DATA_GENERIC", "WRONG_DATA_WITH_HINT") and not has_rejection:
+            logger.info(
+                "[FeedbackClassifier] No rejection signal in '%s' -> forcing NEW_QUESTION",
+                new_message[:60],
+            )
+            category = "NEW_QUESTION"
 
         if category in ("WRONG_DATA_GENERIC", "WRONG_DATA_WITH_HINT"):
             if _looks_like_new_question or (not has_rejection and _msg_word_count >= 1 and overlap < 0.15):
