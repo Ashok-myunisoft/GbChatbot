@@ -555,6 +555,41 @@ async def detect_retry_intent(
         return t in _EXACT_RETRY_PHRASES
 
 
+async def detect_followup_intent(text: str, recent_turns: List[Dict]) -> bool:
+    """Use semantic classification to decide whether a message depends on prior turns."""
+    if not recent_turns:
+        return False
+
+    history = []
+    for turn in recent_turns[-3:]:
+        user_message = str(turn.get("user_message", "")).strip()
+        bot_response = str(turn.get("bot_response", "")).strip()
+        if user_message or bot_response:
+            history.append(f"User: {user_message[:500]}\nAssistant: {bot_response[:1000]}")
+
+    if not history:
+        return False
+
+    history_text = "\n\n".join(history)
+    try:
+        prompt = (
+            "You classify whether a user's new message is a follow-up that depends on the prior conversation.\n"
+            "Answer YES only when the message refers to, asks to expand/clarify/select from, or otherwise relies on earlier conversation.\n"
+            "Answer NO when it is a self-contained new request, even if it shares a topic with the prior conversation.\n"
+            "Examples YES: 'Could you explain the second option?', 'What about for managers?', 'Why is that needed?'\n"
+            "Examples NO: 'Explain the Finance module', 'How do I apply for leave?', 'Show payroll reports'.\n"
+            "Reply YES or NO only.\n\n"
+            f"Recent conversation:\n{history_text}\n\n"
+            f"New user message: {text}"
+        )
+        raw = await asyncio.to_thread(ai_resources.routing_llm.invoke, prompt)
+        answer = (raw.content if hasattr(raw, "content") else str(raw)).strip().upper()
+        return answer.startswith("YES")
+    except Exception as exc:
+        logger.warning("[FollowupDetect] Semantic classification failed: %s", exc)
+        return False
+
+
 async def is_session_exit(question: str) -> bool:
     """Intent-based session exit detection.
     Skips LLM for provably clear slot values (numbers, dates, simple confirmations).
@@ -3426,25 +3461,11 @@ For example: "Name: John, Role: developer" """
         # â“€â“€ Follow-up detection: short question referencing previous turn â“€â“€â“€â“€â“€â“€
         # Reuse last bot_type so "tell me more" / "show more" stay in the same bot
         # instead of falling through to AI routing (saves 5-15s per follow-up)
-        _FOLLOWUP_PHRASES = {
-            "more", "tell me more", "show more", "continue", "elaborate",
-            "explain more", "go on", "and then", "what about that",
-            "same", "again", "retry", "once more", "expand",
-            "those", "that one", "the first", "first one", "second one",
-            "last one", "which of", "which has", "which have", "of those",
-            "of them", "from those", "among those", "above", "listed",
-            # explicit back-references to previous result
-            "the above", "that record", "that item", "that entry",
-            # NOTE: "also", "too", "as well", "additionally", "and also" removed —
-            # these are additive conjunctions that appear in new-topic questions and
-            # caused the wrong bot to be reused (e.g. "also explain Finance module"
-            # was treated as a follow-up to whatever bot ran last).
-        }
-        _q_lower = question.lower().strip()
+        _followup_thread = history_manager.get_thread(thread_id) if thread_id else None
         _is_followup = (
-            thread_id and is_existing_thread
-            and len(_q_lower.split()) <= 14
-            and any(ph in _q_lower for ph in _FOLLOWUP_PHRASES)
+            bool(thread_id and is_existing_thread and _followup_thread and _followup_thread.messages)
+            and len(question.strip().split()) <= 14
+            and await detect_followup_intent(question, _followup_thread.messages)
         )
         if _is_followup:
             _thread = history_manager.get_thread(thread_id)
