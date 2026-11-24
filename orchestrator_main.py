@@ -3491,7 +3491,7 @@ For example: "Name: John, Role: developer" """
                         answer = _extract_clean_response(answer)
                         answer = _fmt_response(question, answer)
                         _formatted = await asyncio.to_thread(formatter_agent.format, question, answer)
-                        await asyncio.to_thread(update_enhanced_memory, username, _thread_question, answer, bot_type, user_role, thread_id)
+                        await asyncio.to_thread(update_enhanced_memory, username, _original_retry_msg if _is_retry else question, answer, bot_type, user_role, thread_id)
                         elapsed = time.time() - start_time
                         logger.info(f"âœ… Follow-up completed in {elapsed:.2f}s")
                         return {
